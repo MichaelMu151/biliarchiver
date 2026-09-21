@@ -14,15 +14,21 @@ if str(ROOT) not in sys.path:
 
 os.chdir(ROOT)
 
+from bili.runtime import prepare_process, probe_compute  # noqa: E402
+
+prepare_process()
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="BiliArchiver · B站数据采集工作台")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
+    gpu = probe_compute()
     import uvicorn
 
-    print(f"\n  BiliArchiver 已启动 → http://{args.host}:{args.port}\n")
+    print(f"\n  BiliArchiver 已启动 → http://{args.host}:{args.port}")
+    print(f"  {gpu['note']}\n")
     uvicorn.run("app.server:app", host=args.host, port=args.port, reload=False)
 
 

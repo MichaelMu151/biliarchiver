@@ -2,27 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
-import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
 from bili.client import BiliClient
+from bili.runtime import ffmpeg_candidates, run_quiet
 from bili.util import write_json
 
 
 def which_ffmpeg(explicit: str = "ffmpeg") -> str | None:
-    candidates = []
-    if explicit:
-        candidates.append(Path(explicit).expanduser())
-        found = shutil.which(explicit)
-        if found:
-            candidates.append(Path(found))
-    candidates.append(Path(__file__).resolve().parent.parent / "tools" / "bin" / "ffmpeg")
-    which_default = shutil.which("ffmpeg")
-    if which_default:
-        candidates.append(Path(which_default))
-    for path in candidates:
+    for path in ffmpeg_candidates(explicit):
         if path.is_file() and os.access(path, os.X_OK):
             return str(path)
     return None
@@ -62,7 +51,7 @@ def select_streams(play: dict[str, Any], qn: int) -> tuple[str, str]:
 
 
 async def _run_ffmpeg(cmd: list[str]) -> tuple[bool, str]:
-    proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
+    proc = await asyncio.to_thread(run_quiet, cmd)
     error = (proc.stderr or "")[-1200:]
     return proc.returncode == 0, error
 

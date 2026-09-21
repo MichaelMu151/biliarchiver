@@ -35,6 +35,23 @@ class PipelineTests(unittest.TestCase):
             )
 
 
+class RuntimeTests(unittest.TestCase):
+    def test_ffmpeg_candidates_include_windows_exe(self) -> None:
+        from bili.runtime import ffmpeg_candidates
+
+        names = [str(path) for path in ffmpeg_candidates("ffmpeg")]
+        self.assertTrue(any(item.endswith("ffmpeg") or item.endswith("ffmpeg.exe") for item in names))
+        self.assertTrue(any("tools" in item and "bin" in item for item in names))
+
+    def test_cpu_request_does_not_require_cuda(self) -> None:
+        from bili.runtime import resolve_whisper_backend
+
+        device, compute, note = resolve_whisper_backend("cpu", "auto")
+        self.assertEqual(device, "cpu")
+        self.assertEqual(compute, "int8")
+        self.assertTrue(note)
+
+
 class StorageTests(unittest.TestCase):
     def test_should_not_download_video_if_it_will_be_deleted(self) -> None:
         from bili.storage import should_fetch_media

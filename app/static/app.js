@@ -207,6 +207,8 @@ $("save-settings").addEventListener("click", async () => {
       comment_max_pages: Number($("comment-pages").value),
       whisper_model: $("whisper-model").value,
       whisper_language: $("whisper-language").value,
+      whisper_device: $("whisper-device").value,
+      whisper_compute_type: $("whisper-compute").value,
       ocr_min_confidence: Number($("ocr-confidence").value),
       video_quality: Number($("video-quality").value),
       rclone_remote: $("rclone-remote").value,
@@ -370,6 +372,8 @@ async function loadSettings() {
   $("comment-pages").value = s.comment_max_pages;
   $("whisper-model").value = s.whisper_model;
   $("whisper-language").value = s.whisper_language || "auto";
+  $("whisper-device").value = s.whisper_device || "auto";
+  $("whisper-compute").value = s.whisper_compute_type || "auto";
   $("ocr-confidence").value = s.ocr_min_confidence ?? 0.55;
   $("video-quality").value = String(s.video_quality);
   $("rclone-remote").value = s.rclone_remote || "gdrive";
@@ -385,6 +389,7 @@ async function loadCapabilities() {
     const items = [
       ["ffmpeg", "视频合并", capabilities.ffmpeg],
       ["whisper", "语音转文字", capabilities.whisper],
+      ["gpu", "NVIDIA GPU", capabilities.gpu || { ready: false, purpose: "未检测" }],
       ["ocr", "图片 OCR", capabilities.ocr],
       ["rclone", "Google Drive", capabilities.rclone || { ready: false, purpose: "上传后删除本地媒体" }],
     ];

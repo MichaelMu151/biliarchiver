@@ -470,6 +470,8 @@ class Crawler:
                     audio_path=audio_path,
                     whisper_model=self.settings.whisper_model,
                     whisper_language=self.settings.whisper_language,
+                    whisper_device=self.settings.whisper_device,
+                    whisper_compute_type=self.settings.whisper_compute_type,
                     should_cancel=self._is_cancelled,
                     on_log=self.on_log,
                 )

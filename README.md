@@ -28,6 +28,11 @@ python run.py
 
 浏览器打开 http://127.0.0.1:8765
 
+**Windows 游戏本（红米 G Pro 2024 / RTX 4060）请改用独立仓库和安装说明：**
+
+- 仓库：https://github.com/MichaelMu151/biliarchiver-windows
+- 步骤：[WINDOWS.md](WINDOWS.md)
+
 可选增强（语音识别、OCR、合成 MP4、上传 Google Drive）：
 
 ```bash

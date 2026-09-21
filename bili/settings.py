@@ -21,6 +21,8 @@ DEFAULTS: dict[str, Any] = {
     "ocr_enabled": True,
     "whisper_model": "small",
     "whisper_language": "auto",
+    "whisper_device": "auto",
+    "whisper_compute_type": "auto",
     "ocr_min_confidence": 0.55,
     "video_quality": 64,
     "ffmpeg_path": "ffmpeg",
@@ -45,6 +47,8 @@ class AppSettings:
     ocr_enabled: bool = True
     whisper_model: str = "small"
     whisper_language: str = "auto"
+    whisper_device: str = "auto"
+    whisper_compute_type: str = "auto"
     ocr_min_confidence: float = 0.55
     video_quality: int = 64
     ffmpeg_path: str = "ffmpeg"

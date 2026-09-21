@@ -401,6 +401,21 @@
                 <option value="ja">日本語</option>
               </select>
             </label>
+            <label>Whisper 设备
+              <select id="whisper-device">
+                <option value="auto" selected>自动（有 NVIDIA 就用 GPU）</option>
+                <option value="cuda">强制 CUDA</option>
+                <option value="cpu">仅 CPU</option>
+              </select>
+            </label>
+            <label>GPU 精度
+              <select id="whisper-compute">
+                <option value="auto" selected>自动</option>
+                <option value="float16">float16（4060 推荐）</option>
+                <option value="int8_float16">int8_float16（更省显存）</option>
+                <option value="int8">int8</option>
+              </select>
+            </label>
             <label>OCR 最低置信度
               <input type="number" min="0.1" max="0.95" step="0.05" id="ocr-confidence" />
             </label>

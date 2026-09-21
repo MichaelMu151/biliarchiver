@@ -7,11 +7,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from bili.client import BiliClient
+from bili.runtime import prepare_process, resolve_whisper_backend
 from bili.util import abs_url, write_json, write_text
 
 _MODEL = None
 _MODEL_KEY = ""
 _MODEL_LOCK = threading.Lock()
+prepare_process()
 
 
 def _fmt_ts(seconds: float) -> str:
@@ -98,22 +100,24 @@ def whisper_available() -> bool:
         return False
 
 
-def _get_whisper_model(model_size: str):
+def _get_whisper_model(model_size: str, device: str = "auto", compute_type: str = "auto"):
     global _MODEL, _MODEL_KEY
     from faster_whisper import WhisperModel
 
+    resolved_device, resolved_compute, note = resolve_whisper_backend(device, compute_type)
+    cache_key = f"{model_size}:{resolved_device}:{resolved_compute}"
     with _MODEL_LOCK:
-        if _MODEL is None or _MODEL_KEY != model_size:
-            device, compute_type = "cpu", "int8"
+        if _MODEL is None or _MODEL_KEY != cache_key:
             try:
-                import ctranslate2
-
-                if ctranslate2.get_cuda_device_count() > 0:
-                    device, compute_type = "cuda", "float16"
+                _MODEL = WhisperModel(model_size, device=resolved_device, compute_type=resolved_compute)
             except Exception:
-                pass
-            _MODEL = WhisperModel(model_size, device=device, compute_type=compute_type)
-            _MODEL_KEY = model_size
+                if resolved_device == "cpu":
+                    raise
+                resolved_device, resolved_compute, note = "cpu", "int8", "GPU 加载失败，已回退 CPU"
+                cache_key = f"{model_size}:cpu:int8"
+                _MODEL = WhisperModel(model_size, device="cpu", compute_type="int8")
+            _MODEL_KEY = cache_key
+            _MODEL._bili_backend = (resolved_device, resolved_compute, note)
         return _MODEL
 
 
@@ -122,8 +126,11 @@ def transcribe_local(
     model_size: str = "small",
     language: str = "auto",
     should_cancel: Callable[[], bool] | None = None,
+    device: str = "auto",
+    compute_type: str = "auto",
 ) -> dict[str, Any]:
-    model = _get_whisper_model(model_size)
+    model = _get_whisper_model(model_size, device, compute_type)
+    backend = getattr(model, "_bili_backend", ("auto", "auto", ""))
     raw_segments, info = model.transcribe(
         audio_path,
         language=None if language == "auto" else language,
@@ -148,7 +155,10 @@ def transcribe_local(
                 }
             )
     probability = float(getattr(info, "language_probability", 0) or 0)
-    source = f"faster-whisper {model_size} · {info.language} · p={probability:.2f}"
+    source = (
+        f"faster-whisper {model_size} · {backend[0]}/{backend[1]} · "
+        f"{info.language} · p={probability:.2f}"
+    )
     return {
         "source": source,
         "language": info.language,
@@ -203,6 +213,8 @@ async def build_transcript(
     audio_path: str,
     whisper_model: str,
     whisper_language: str = "auto",
+    whisper_device: str = "auto",
+    whisper_compute_type: str = "auto",
     should_cancel: Callable[[], bool] | None = None,
     on_log,
 ) -> dict[str, Any]:
@@ -226,6 +238,8 @@ async def build_transcript(
                     whisper_model,
                     whisper_language,
                     should_cancel,
+                    whisper_device,
+                    whisper_compute_type,
                 )
             except Exception as exc:
                 on_log("warn", f"Whisper 失败 {bvid}：{exc}")

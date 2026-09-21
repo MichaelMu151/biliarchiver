@@ -22,9 +22,12 @@ from bili.settings import AppSettings, load_settings, save_settings
 from bili.store import Store
 from bili.media import which_ffmpeg
 from bili.ocr import ocr_available
+from bili.runtime import prepare_process, probe_compute
 from bili.storage import KEEP_POLICIES, reclaim_library, which_rclone
 from bili.transcribe import whisper_available
 from bili.util import parse_uids
+
+prepare_process()
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 ensure_dirs()
@@ -48,6 +51,8 @@ class SettingsIn(BaseModel):
     ocr_enabled: bool | None = None
     whisper_model: str | None = None
     whisper_language: str | None = None
+    whisper_device: str | None = None
+    whisper_compute_type: str | None = None
     ocr_min_confidence: float | None = None
     video_quality: int | None = None
     ffmpeg_path: str | None = None
@@ -100,6 +105,7 @@ def public_settings(s: AppSettings) -> dict[str, Any]:
     data["whisper_installed"] = whisper_available()
     data["ocr_installed"] = ocr_available()
     data["ffmpeg_installed"] = bool(which_ffmpeg(s.ffmpeg_path))
+    data["gpu"] = probe_compute()
     data["library_dir"] = str(LIBRARY_DIR)
     return data
 
@@ -124,6 +130,10 @@ async def put_settings(body: SettingsIn) -> dict[str, Any]:
     current.max_retries = min(10, max(1, int(current.max_retries)))
     current.comment_max_pages = max(0, int(current.comment_max_pages))
     current.ocr_min_confidence = min(0.95, max(0.1, float(current.ocr_min_confidence)))
+    if current.whisper_device not in {"auto", "cpu", "cuda"}:
+        raise HTTPException(400, "Whisper 设备无效")
+    if current.whisper_compute_type not in {"auto", "float16", "int8_float16", "int8"}:
+        raise HTTPException(400, "Whisper 计算类型无效")
     save_settings(current)
     return public_settings(current)
 
@@ -132,6 +142,12 @@ async def put_settings(body: SettingsIn) -> dict[str, Any]:
 async def capabilities() -> dict[str, Any]:
     settings = load_settings()
     usage = shutil.disk_usage(DATA_DIR)
+    gpu = probe_compute()
+    pip_command = (
+        "pip install -r requirements-gpu-windows.txt"
+        if gpu["platform"].startswith("win")
+        else "pip install faster-whisper rapidocr onnxruntime"
+    )
     return {
         "ffmpeg": {
             "ready": bool(which_ffmpeg(settings.ffmpeg_path)),
@@ -145,6 +161,12 @@ async def capabilities() -> dict[str, Any]:
             "ready": ocr_available(),
             "purpose": "识别动态图片中的文字，并保留置信度与坐标",
         },
+        "gpu": {
+            "ready": gpu["cuda_devices"] > 0,
+            "purpose": gpu["note"],
+            "name": gpu.get("gpu_name") or "",
+            "device": gpu["device"],
+        },
         "rclone": {
             "ready": bool(which_rclone()),
             "purpose": "把媒体上传到 Google Drive 后再删除本地大文件",
@@ -153,7 +175,7 @@ async def capabilities() -> dict[str, Any]:
             "free_bytes": usage.free,
             "total_bytes": usage.total,
         },
-        "pip_command": "pip install faster-whisper rapidocr onnxruntime",
+        "pip_command": pip_command,
     }
 
 

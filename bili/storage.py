@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from bili.media import which_ffmpeg
+from bili.runtime import run_quiet
 from bili.util import now_iso, write_json
 
 KEEP_POLICIES = ("keep", "delete_after_text", "compress", "upload_then_delete")
@@ -136,11 +136,7 @@ def rclone_upload(
         if dry_run:
             uploaded.append(dest)
             continue
-        proc = subprocess.run(
-            [binary, "copyto", str(path), dest, "--retries", "5"],
-            capture_output=True,
-            text=True,
-        )
+        proc = run_quiet([binary, "copyto", str(path), dest, "--retries", "5"])
         if proc.returncode != 0:
             raise RuntimeError((proc.stderr or proc.stdout or "rclone 上传失败")[-400:])
         uploaded.append(dest)
@@ -162,7 +158,7 @@ def _compress_video(src: Path, ffmpeg: str, dry_run: bool) -> Path | None:
         "-movflags", "+faststart",
         str(dest),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = run_quiet(cmd)
     if proc.returncode != 0 or not dest.exists() or dest.stat().st_size == 0:
         dest.unlink(missing_ok=True)
         return None
