@@ -1,0 +1,481 @@
+const titles = {
+  guide: ["使用指南", "把 UID 变成可检索的档案、Markdown 和可续跑的任务。"],
+  task: ["新建任务", "选择账号、时间窗口和要采集的模块。"],
+  monitor: ["运行监控", "看进度、日志，必要时取消。"],
+  results: ["采集结果", "浏览账号快照、视频 Markdown 和动态 OCR。"],
+  settings: ["设置与登录", "扫码或粘贴 Cookie，调节间隔与转写。"],
+};
+
+let currentJobId = null;
+let eventSource = null;
+let selectedRange = "1y";
+let pollTimer = null;
+let capabilities = null;
+
+const $ = (id) => document.getElementById(id);
+
+document.querySelectorAll(".nav button").forEach((btn) => {
+  btn.addEventListener("click", () => showPage(btn.dataset.page));
+});
+
+function showPage(name) {
+  document.querySelectorAll(".nav button").forEach((b) => {
+    const active = b.dataset.page === name;
+    b.classList.toggle("active", active);
+    if (active) b.setAttribute("aria-current", "page");
+    else b.removeAttribute("aria-current");
+  });
+  document.querySelectorAll(".page").forEach((p) => {
+    const on = p.id === "page-" + name;
+    p.classList.toggle("active", on);
+    p.hidden = !on;
+  });
+  $("page-title").textContent = titles[name][0];
+  $("page-sub").textContent = titles[name][1];
+  if (name === "results") loadResults();
+  if (name === "settings") loadSettings();
+}
+
+document.querySelectorAll("#range-pills button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    selectedRange = btn.dataset.range;
+    document.querySelectorAll("#range-pills button").forEach((b) => b.classList.toggle("on", b === btn));
+  });
+});
+
+document.querySelectorAll(".choice-card input").forEach((input) => {
+  input.addEventListener("change", () => {
+    syncChoiceCards();
+    enforceCompatibleChoices(input.name);
+    updatePlanSummary();
+  });
+});
+
+document.querySelectorAll(".preset-card").forEach((button) => {
+  button.addEventListener("click", () => applyPreset(button.dataset.preset));
+});
+
+function radioValue(name) {
+  return document.querySelector(`input[name="${name}"]:checked`)?.value || "";
+}
+
+function setRadio(name, value) {
+  const input = document.querySelector(`input[name="${name}"][value="${value}"]`);
+  if (input) input.checked = true;
+  syncChoiceCards();
+}
+
+function syncChoiceCards() {
+  document.querySelectorAll(".choice-card").forEach((card) => {
+    card.classList.toggle("selected", Boolean(card.querySelector("input:checked")));
+  });
+}
+
+function applyPreset(preset) {
+  document.querySelectorAll(".preset-card").forEach((b) => b.classList.toggle("on", b.dataset.preset === preset));
+  if (preset === "light") {
+    setRadio("media-mode", "link");
+    setRadio("transcribe-mode", "official");
+    setRadio("media-keep", "delete_after_text");
+    $("m-ocr").checked = true;
+  } else if (preset === "text") {
+    setRadio("media-mode", "audio");
+    setRadio("transcribe-mode", "official_then_whisper");
+    setRadio("media-keep", "delete_after_text");
+    $("m-ocr").checked = true;
+  } else if (preset === "archive") {
+    setRadio("media-mode", "video");
+    setRadio("transcribe-mode", "official_then_whisper");
+    setRadio("media-keep", "compress");
+    $("m-ocr").checked = true;
+  }
+  updatePlanSummary();
+}
+
+function enforceCompatibleChoices(changedName) {
+  const media = radioValue("media-mode");
+  const transcript = radioValue("transcribe-mode");
+  const needsAudio = ["whisper", "official_then_whisper"].includes(transcript);
+  if (changedName === "transcribe-mode" && needsAudio && !["audio", "video"].includes(media)) {
+    setRadio("media-mode", "audio");
+    toast("已自动切换为“下载音频”，供 Whisper 使用");
+  } else if (changedName === "media-mode" && needsAudio && !["audio", "video"].includes(media)) {
+    setRadio("transcribe-mode", "official");
+    toast("未下载音频时，已改为只提取官方字幕");
+  }
+}
+
+function updatePlanSummary() {
+  const media = radioValue("media-mode");
+  const transcript = radioValue("transcribe-mode");
+  const keep = radioValue("media-keep");
+  const mediaText = {
+    none: "不处理媒体",
+    link: "仅保留永久页面链接",
+    audio: "断点续传音频",
+    video: "下载并合成完整视频",
+  }[media];
+  const transcriptText = {
+    none: "不提取文字",
+    url_only: "生成云端转写清单",
+    official: "提取官方/AI 字幕",
+    whisper: "全部使用本地 Whisper",
+    official_then_whisper: "官方字幕优先，Whisper 兜底",
+  }[transcript];
+  const keepText = {
+    keep: "原始媒体留在本机",
+    delete_after_text: "转写后删除媒体，只留链接",
+    compress: "压缩后保留",
+    upload_then_delete: "上传 Google Drive 后删除本地媒体",
+  }[keep];
+  $("plan-title").textContent = `${mediaText} · ${transcriptText}`;
+  $("plan-summary").textContent = `视频：${mediaText}；语音：${transcriptText}；空间：${keepText}；动态图片：${$("m-ocr").checked ? "下载并尝试 OCR" : "只下载，不 OCR"}。`;
+  const readiness = [];
+  if (["whisper", "official_then_whisper"].includes(transcript)) {
+    readiness.push(badge(capabilities?.whisper?.ready, "Whisper"));
+  }
+  if (media === "video" || keep === "compress") readiness.push(badge(capabilities?.ffmpeg?.ready, "ffmpeg"));
+  if ($("m-ocr").checked) readiness.push(badge(capabilities?.ocr?.ready, "OCR"));
+  if (keep === "upload_then_delete") readiness.push(badge(capabilities?.rclone?.ready, "rclone"));
+  $("task-readiness").innerHTML = readiness.join("") || '<span class="ready-badge ok">无需额外组件</span>';
+}
+
+function badge(ready, label) {
+  return `<span class="ready-badge ${ready ? "ok" : "warn"}">${label} ${ready ? "已就绪" : "将自动降级"}</span>`;
+}
+
+$("task-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = {
+    uids_text: $("uids").value,
+    time_range: selectedRange,
+    crawl_profile: $("m-profile").checked,
+    crawl_videos: $("m-videos").checked,
+    crawl_dynamics: $("m-dyn").checked,
+    crawl_comments: $("m-comments").checked,
+    crawl_danmaku: $("m-danmaku").checked,
+    ocr_enabled: $("m-ocr").checked,
+    resume: $("m-resume").checked,
+    media_mode: radioValue("media-mode"),
+    transcribe_mode: radioValue("transcribe-mode"),
+    media_keep: radioValue("media-keep"),
+  };
+  try {
+    const res = await api("/api/jobs", { method: "POST", body });
+    currentJobId = res.id;
+    $("job-id").textContent = "#" + res.id;
+    $("log-view").textContent = "";
+    showPage("monitor");
+    listenJob(res.id);
+    toast("任务已开始");
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+$("cancel-btn").addEventListener("click", async () => {
+  if (!currentJobId) return;
+  await api("/api/jobs/" + currentJobId + "/cancel", { method: "POST" });
+  toast("正在取消");
+});
+
+$("refresh-results").addEventListener("click", loadResults);
+$("refresh-capabilities").addEventListener("click", loadCapabilities);
+$("copy-install").addEventListener("click", async () => {
+  const command = capabilities?.pip_command || "pip install -r requirements-ai.txt";
+  try {
+    await navigator.clipboard.writeText(command);
+    toast("安装命令已复制");
+  } catch (_) {
+    toast(command);
+  }
+});
+$("qr-btn").addEventListener("click", startQr);
+$("save-cookie").addEventListener("click", async () => {
+  await api("/api/settings", { method: "PUT", body: { cookie: $("cookie-input").value } });
+  $("cookie-input").value = "";
+  toast("Cookie 已保存");
+  refreshNav();
+});
+$("save-settings").addEventListener("click", async () => {
+  await api("/api/settings", {
+    method: "PUT",
+    body: {
+      min_interval: Number($("min-interval").value),
+      max_interval: Number($("max-interval").value),
+      max_retries: Number($("max-retries").value),
+      comment_max_pages: Number($("comment-pages").value),
+      whisper_model: $("whisper-model").value,
+      whisper_language: $("whisper-language").value,
+      ocr_min_confidence: Number($("ocr-confidence").value),
+      video_quality: Number($("video-quality").value),
+      rclone_remote: $("rclone-remote").value,
+      rclone_root: $("rclone-root").value,
+    },
+  });
+  toast("设置已保存");
+});
+
+async function api(url, opts = {}) {
+  const res = await fetch(url, {
+    method: opts.method || "GET",
+    headers: opts.body ? { "Content-Type": "application/json" } : undefined,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || data.message || "请求失败");
+  return data;
+}
+
+function toast(text) {
+  const el = $("toast");
+  el.textContent = text;
+  el.style.display = "block";
+  setTimeout(() => (el.style.display = "none"), 2600);
+}
+
+function listenJob(id) {
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource("/api/jobs/" + id + "/events");
+  ["snapshot", "log", "progress", "status", "done"].forEach((type) => {
+    eventSource.addEventListener(type, (ev) => {
+      const data = JSON.parse(ev.data);
+      if (type === "log") appendLog(data);
+      if (type === "progress" || type === "snapshot") applyProgress(data.progress || data);
+      if (type === "snapshot" && data.logs) data.logs.forEach(appendLog);
+      if (type === "done") {
+        applyProgress(data.progress || {});
+        $("m-status").textContent = translateStatus(data.status);
+        $("status-text").textContent = data.status === "done" ? "采集完成" : translateStatus(data.status);
+        $("status-dot").className = `status-dot ${data.status === "error" ? "error" : data.status === "cancelled" ? "warn" : ""}`;
+        if (data.error) appendLog({ level: "error", message: data.error });
+        eventSource.close();
+      }
+    });
+  });
+}
+
+function appendLog(item) {
+  const line = document.createElement("div");
+  line.className = item.level || "info";
+  line.textContent = `[${item.level || "info"}] ${item.message}`;
+  $("log-view").appendChild(line);
+  $("log-view").scrollTop = $("log-view").scrollHeight;
+}
+
+function applyProgress(p) {
+  if (!p) return;
+  const total = p.uids_total || 1;
+  const done = p.uids_done || 0;
+  $("m-status").textContent = translateStatus(p.stage || "running");
+  $("m-uids").textContent = `${done} / ${total}`;
+  $("m-videos-n").textContent = p.videos_done || 0;
+  $("m-dyn-n").textContent = p.dynamics_done || 0;
+  $("m-current").textContent = p.current || "";
+  const percent = Math.min(100, (done / total) * 100);
+  $("progress-bar").style.width = percent + "%";
+  $("progress-wrap").setAttribute("aria-valuenow", String(Math.round(percent)));
+  $("status-text").textContent = translateStatus(p.stage || "running");
+}
+
+function translateStatus(status) {
+  return {
+    queued: "排队中",
+    running: "运行中",
+    bootstrap: "准备会话",
+    account: "读取账号",
+    done: "完成",
+    cancelled: "已取消",
+    cancelling: "正在取消",
+    error: "失败",
+  }[status] || status;
+}
+
+async function loadResults() {
+  const data = await api("/api/results");
+  const box = $("account-list");
+  box.innerHTML = "";
+  if (!data.accounts.length) {
+    box.innerHTML = '<p class="muted">还没有采集结果。</p>';
+    return;
+  }
+  data.accounts.forEach((acc) => {
+    const btn = document.createElement("button");
+    btn.className = "account-item";
+    btn.innerHTML = `<b>${escapeHtml(acc.name || acc.mid)}</b><span class="muted">UID ${escapeHtml(acc.mid)} · 粉丝 ${acc.follower ?? "-"}</span>`;
+    btn.onclick = () => {
+      document.querySelectorAll(".account-item").forEach((x) => x.classList.remove("on"));
+      btn.classList.add("on");
+      showAccount(acc.mid);
+    };
+    box.appendChild(btn);
+  });
+}
+
+async function showAccount(mid) {
+  const data = await api("/api/results/" + mid);
+  const acc = data.account || {};
+  const snaps = data.snapshots || [];
+  const latest = snaps[0] || {};
+  const videos = (data.videos || [])
+    .slice(0, 40)
+    .map((v) => {
+      const assets = [
+        v.local_video ? '<span class="asset-badge">视频</span>' : "",
+        v.local_audio ? '<span class="asset-badge">音频</span>' : "",
+        v.transcript_path ? '<span class="asset-badge text">文字</span>' : "",
+      ].join("");
+      return `<li class="result-row"><a href="#" data-file="${v.markdown_path || ""}">${escapeHtml(v.title || v.bvid)}</a><small>播放 ${v.view ?? "-"} ${assets}</small></li>`;
+    })
+    .join("");
+  const dyns = (data.dynamics || [])
+    .slice(0, 40)
+    .map((d) => `<li><a href="#" data-file="${d.markdown_path || ""}">${escapeHtml((d.text || d.dyn_id || "").slice(0, 48))}</a></li>`)
+    .join("");
+  $("result-detail").innerHTML = `
+    <h3>${escapeHtml(acc.name || mid)}</h3>
+    <p class="muted"><a href="${acc.space_url}" target="_blank">${acc.space_url}</a></p>
+    <div class="metrics">
+      <div><span>粉丝</span><b>${latest.follower ?? "-"}</b></div>
+      <div><span>关注</span><b>${latest.following ?? "-"}</b></div>
+      <div><span>投稿</span><b>${latest.archive_count ?? "-"}</b></div>
+      <div><span>获赞</span><b>${latest.likes ?? "-"}</b></div>
+    </div>
+    <p class="muted">快照 ${snaps.length} 次 · 详见 stats.csv / snapshots.jsonl</p>
+    <h3>视频</h3>
+    <ul>${videos || "<li class='muted'>无</li>"}</ul>
+    <h3>动态</h3>
+    <ul>${dyns || "<li class='muted'>无</li>"}</ul>
+    <pre class="code" id="file-preview"></pre>
+  `;
+  $("result-detail").querySelectorAll("a[data-file]").forEach((a) => {
+    a.addEventListener("click", async (ev) => {
+      ev.preventDefault();
+      if (!a.dataset.file) return;
+      const file = await api("/api/file?path=" + encodeURIComponent(a.dataset.file));
+      $("file-preview").textContent = file.content;
+    });
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function loadSettings() {
+  const s = await api("/api/settings");
+  $("min-interval").value = s.min_interval;
+  $("max-interval").value = s.max_interval;
+  $("max-retries").value = s.max_retries;
+  $("comment-pages").value = s.comment_max_pages;
+  $("whisper-model").value = s.whisper_model;
+  $("whisper-language").value = s.whisper_language || "auto";
+  $("ocr-confidence").value = s.ocr_min_confidence ?? 0.55;
+  $("video-quality").value = String(s.video_quality);
+  $("rclone-remote").value = s.rclone_remote || "gdrive";
+  $("rclone-root").value = s.rclone_root || "BiliArchiver";
+  $("cookie-preview").textContent = s.cookie_preview || "尚未登录";
+  $("dep-status").textContent = `Whisper ${s.whisper_installed ? "已安装" : "未安装"} · OCR ${s.ocr_installed ? "已安装" : "未安装"} · ffmpeg ${s.ffmpeg_installed ? "已安装" : "未安装"}`;
+  $("library-path").textContent = s.library_dir || "";
+}
+
+async function loadCapabilities() {
+  try {
+    capabilities = await api("/api/capabilities");
+    const items = [
+      ["ffmpeg", "视频合并", capabilities.ffmpeg],
+      ["whisper", "语音转文字", capabilities.whisper],
+      ["ocr", "图片 OCR", capabilities.ocr],
+      ["rclone", "Google Drive", capabilities.rclone || { ready: false, purpose: "上传后删除本地媒体" }],
+    ];
+    $("capability-grid").innerHTML = items
+      .map(([key, title, item]) => `
+        <div class="capability-card ${item.ready ? "ready" : "missing"}">
+          <span class="cap-dot"></span>
+          <div><b>${title}</b><small>${item.purpose}</small></div>
+          <em>${item.ready ? "可用" : "未安装"}</em>
+        </div>`)
+      .join("");
+    const free = capabilities.disk.free_bytes / 1024 / 1024 / 1024;
+    $("install-command").textContent = `可用磁盘 ${free.toFixed(1)} GB\n${capabilities.pip_command}`;
+    updatePlanSummary();
+  } catch (err) {
+    $("capability-grid").innerHTML = `<p class="muted">${escapeHtml(err.message)}</p>`;
+  }
+}
+
+async function startQr() {
+  const data = await api("/api/login/qr/start", { method: "POST" });
+  $("qr-image").src = data.image;
+  $("qr-image").hidden = false;
+  $("qr-msg").textContent = "请使用哔哩哔哩 App 扫码";
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    const st = await api("/api/login/qr/poll?key=" + encodeURIComponent(data.qrcode_key));
+    if (st.code === 0) {
+      clearInterval(pollTimer);
+      $("qr-msg").textContent = "登录成功";
+      toast("登录成功");
+      refreshNav();
+    } else if (st.code === 86038) {
+      clearInterval(pollTimer);
+      $("qr-msg").textContent = "二维码已过期";
+    } else {
+      $("qr-msg").textContent = st.message || "等待扫码";
+    }
+  }, 1600);
+}
+
+async function refreshNav() {
+  try {
+    const nav = await api("/api/nav");
+    const pill = $("login-pill");
+    if (nav.is_login) {
+      pill.textContent = "已登录 " + (nav.uname || "");
+      pill.classList.add("on");
+    } else {
+      pill.textContent = nav.settings?.has_cookie ? "Cookie 已保存 · 未确认登录" : "匿名模式";
+      pill.classList.remove("on");
+    }
+    if (nav.settings) $("library-path").textContent = nav.settings.library_dir || "";
+  } catch (e) {
+    $("login-pill").textContent = "离线 / 无法访问 B 站";
+  }
+}
+
+refreshNav();
+loadSettings();
+loadCapabilities();
+syncChoiceCards();
+updatePlanSummary();
+$("m-ocr").addEventListener("change", updatePlanSummary);
+$("reclaim-btn")?.addEventListener("click", async () => {
+  if (!confirm("将删除已经完成转写/OCR 的本地视频、音频和图片，只保留链接和文字。正在处理的条目会跳过。继续？")) return;
+  try {
+    const summary = await api("/api/library/reclaim", {
+      method: "POST",
+      body: { policy: "delete_after_text", dry_run: false },
+    });
+    const mb = ((summary.bytes_freed || 0) / 1024 / 1024).toFixed(1);
+    toast(`已处理 ${summary.folders || 0} 个目录，释放约 ${mb} MB`);
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+async function restoreLiveJob() {
+  try {
+    const data = await api("/api/jobs");
+    const job = (data.live || []).find((item) => ["queued", "running", "cancelling"].includes(item.status));
+    if (job) {
+      currentJobId = job.id;
+      $("job-id").textContent = "#" + job.id;
+      $("log-view").textContent = "";
+      (job.logs || []).forEach(appendLog);
+      applyProgress(job.progress || { stage: job.status });
+      listenJob(job.id);
+    }
+  } catch (_) {}
+}
+
+restoreLiveJob();

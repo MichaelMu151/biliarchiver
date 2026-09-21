@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BiliArchiver · B站数据采集工作台</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">B</div>
+        <div>
+          <div class="brand-name">BiliArchiver</div>
+          <div class="brand-sub">B站数据采集工作台</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <button data-page="guide" class="active">使用指南</button>
+        <button data-page="task">新建任务</button>
+        <button data-page="monitor">运行监控</button>
+        <button data-page="results">采集结果</button>
+        <button data-page="settings">设置与登录</button>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="pill" id="login-pill">检测登录中…</div>
+        <div class="muted tiny" id="library-path"></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="page-title">使用指南</h1>
+          <p class="muted" id="page-sub">把 UID 变成可检索的档案、Markdown 和可续跑的任务。</p>
+        </div>
+        <div class="top-actions">
+          <span class="status-dot" id="status-dot"></span>
+          <span id="status-text">就绪</span>
+        </div>
+      </header>
+
+      <section id="page-guide" class="page active">
+        <div class="hero">
+          <div>
+            <p class="eyebrow">从 UID 到完整档案</p>
+            <h2>一次配置，按时间窗口采集 UP 主的视频、动态、弹幕和转写。</h2>
+            <p>本工具走 B 站公开 Web 接口，带 WBI 签名、buvid3、风控退避和断点续爬。默认把结构化数据写入 SQLite，把给人读的内容写成 Markdown。</p>
+          </div>
+          <div class="hero-card">
+            <div class="stat"><b>1</b><span>填 UID</span></div>
+            <div class="stat"><b>2</b><span>选时间与模块</span></div>
+            <div class="stat"><b>3</b><span>开始并看着日志跑</span></div>
+            <div class="stat"><b>4</b><span>到「采集结果」阅读</span></div>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <article class="card">
+            <h3>你会得到什么</h3>
+            <ul class="checklist">
+              <li>视频：播放 / 点赞 / 投币 / 收藏 / 转发、简介、分P、评论、弹幕</li>
+              <li>语音：优先官方/AI 字幕；否则下载音频，可本地 Whisper 或导出云端清单</li>
+              <li>动态：正文、图片、OCR 文字、评论</li>
+              <li>账号：粉丝、关注、获赞、投稿数的<strong>时间序列快照</strong></li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>数据为什么这样存</h3>
+            <p>粉丝和关注每天都在变，不适合只写进一个 Markdown 再覆盖。因此：</p>
+            <ul>
+              <li><code>profile.md</code> 给人看当前画像</li>
+              <li><code>stats.csv</code> / <code>snapshots.jsonl</code> 追加每次快照，适合画涨粉曲线</li>
+              <li><code>app.db</code> 便于筛选和断点续跑</li>
+              <li>每个视频/动态一个文件夹，<code>video.md</code> 里嵌转录和 OCR</li>
+            </ul>
+          </article>
+        </div>
+
+        <article class="card">
+          <h3>操作步骤</h3>
+          <ol class="steps">
+            <li>
+              <strong>找到 UID</strong>
+              打开 UP 主页，地址形如 <code>https://space.bilibili.com/123456</code>，数字就是 UID。可一次粘贴多行。
+            </li>
+            <li>
+              <strong>可选登录</strong>
+              匿名也能采元数据。登录后评论更完整（含 IP 属地）、字幕更容易拿到、空间列表也不容易被截短。到「设置与登录」扫码或粘贴 Cookie。
+            </li>
+            <li>
+              <strong>选时间窗口</strong>
+              全部 / 3 年 / 2 年 / 1 年 / 9 个月 / 6 个月。列表按发布时间倒序，一旦早于窗口就停止翻页。
+            </li>
+            <li>
+              <strong>选媒体策略</strong>
+              「仅链接」最稳；「音频」适合转写；「完整视频」需要 ffmpeg，体积大。提取文字后可以删除本地媒体，只保留 BV 链接；也可以压缩或上传 Google Drive。
+            </li>
+            <li>
+              <strong>开始任务</strong>
+              到「运行监控」看进度。中断后用同一 UID 再跑并勾选续跑，已完成的视频/动态会跳过。
+            </li>
+          </ol>
+        </article>
+
+        <article class="card feature-guide">
+          <h3>音频、视频和文字提取是三件不同的事</h3>
+          <div class="flow-grid">
+            <div><b>① 只采资料</b><p>选择“保留页面链接”。最省空间，不请求会过期的播放直链。</p></div>
+            <div><b>② 获取官方字幕</b><p>选择“官方字幕优先”。无需下载音频；有字幕即可直接生成 Markdown、JSON、SRT 和 WebVTT。</p></div>
+            <div><b>③ 本地语音识别</b><p>媒体选“下载音频”，转写选“Whisper 兜底”或“全部重新识别”。没有官方字幕也能得到文字。</p></div>
+            <div><b>④ 完整视频归档</b><p>媒体选“下载完整视频”。音频和视频流可断点续传，有 ffmpeg 时自动合并 MP4。</p></div>
+            <div><b>⑤ 图片 OCR</b><p>开启“动态图片 OCR”。图片会先校正方向和尺寸，再输出正文、置信度和文字坐标。</p></div>
+            <div><b>⑥ 控制体积</b><p>转写/OCR 完成后可删除本地视频和图片，只留页面链接；或压缩；或 rclone 上传 Google Drive 后再删本地。</p></div>
+          </div>
+        </article>
+
+        <div class="grid-2">
+          <article class="card">
+            <h3>稳健采集（反爬应对）</h3>
+            <ul>
+              <li>WBI 签名 + <code>buvid3</code> + <code>bili_ticket</code></li>
+              <li>真实浏览器 UA / Referer，关闭系统代理干扰</li>
+              <li>请求间隔随机抖动；遇到 -412 / -352 指数退避</li>
+              <li>单账号串行，失败单项记错继续下一个</li>
+              <li>默认不要把间隔调到 0.2 秒以下</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>可选增强</h3>
+            <pre class="code">pip install faster-whisper rapidocr onnxruntime
+# 系统安装 ffmpeg 后才能把 DASH 音视频合成 mp4</pre>
+            <p class="muted">未安装时程序仍可运行：字幕走官方接口，图片会下载但不 OCR，视频保留分离分片或仅链接。</p>
+          </article>
+        </div>
+
+        <article class="card warn">
+          <h3>使用边界</h3>
+          <p>只采集你有权查看的公开内容，控制频率，不要用于骚扰或商业转售。Cookie 等同账号，只保存在本机 <code>data/settings.json</code>。视频版权归 UP 主与平台，本地缓存仅供个人研究与转写。</p>
+        </article>
+      </section>
+
+      <section id="page-task" class="page" hidden>
+        <form id="task-form" class="stack">
+          <article class="card">
+            <div class="section-heading">
+              <div>
+                <p class="step-kicker">快速开始</p>
+                <h3>选择一个工作方案</h3>
+                <p class="muted">方案只负责填好下面的选项，你仍可逐项调整。</p>
+              </div>
+            </div>
+            <div class="preset-grid" id="preset-grid">
+              <button type="button" class="preset-card on" data-preset="light">
+                <span class="preset-icon">↗</span>
+                <strong>轻量采集</strong>
+                <small>元数据、评论、弹幕、动态和永久页面链接；不下载媒体</small>
+              </button>
+              <button type="button" class="preset-card" data-preset="text">
+                <span class="preset-icon">Aa</span>
+                <strong>文字研究</strong>
+                <small>下载音频；官方字幕优先，缺失时本地 Whisper；完成后删除音频，只留文字和链接</small>
+              </button>
+              <button type="button" class="preset-card" data-preset="archive">
+                <span class="preset-icon">▣</span>
+                <strong>完整归档</strong>
+                <small>下载视频用于转写后压缩保留，同时生成字幕、OCR 和结构化数据</small>
+              </button>
+            </div>
+          </article>
+
+          <article class="card">
+            <p class="step-kicker">步骤 1</p>
+            <h3>目标账号与时间</h3>
+            <label for="uids">UID 或空间链接，每行一个</label>
+            <textarea id="uids" rows="5" placeholder="945267&#10;https://space.bilibili.com/208259"></textarea>
+            <label class="field-label">采集发布时间范围</label>
+            <div class="pills" id="range-pills">
+              <button type="button" data-range="3m">近 3 个月</button>
+              <button type="button" data-range="6m">近 6 个月</button>
+              <button type="button" data-range="9m">近 9 个月</button>
+              <button type="button" data-range="1y" class="on">近 1 年</button>
+              <button type="button" data-range="2y">近 2 年</button>
+              <button type="button" data-range="3y">近 3 年</button>
+              <button type="button" data-range="all">全部</button>
+            </div>
+          </article>
+
+          <article class="card">
+            <p class="step-kicker">步骤 2</p>
+            <h3>采集模块</h3>
+            <div class="checks">
+              <label><input type="checkbox" id="m-profile" checked /> 账号档案（粉丝 / 关注快照）</label>
+              <label><input type="checkbox" id="m-videos" checked /> 视频列表与互动数据</label>
+              <label><input type="checkbox" id="m-dyn" checked /> 动态</label>
+              <label><input type="checkbox" id="m-comments" checked /> 评论（含楼中楼）</label>
+              <label><input type="checkbox" id="m-danmaku" checked /> 弹幕</label>
+              <label><input type="checkbox" id="m-ocr" checked /> 动态图片 OCR</label>
+              <label><input type="checkbox" id="m-resume" checked /> 断点续跑</label>
+            </div>
+          </article>
+
+          <article class="card">
+            <p class="step-kicker">步骤 3</p>
+            <h3>媒体处理</h3>
+            <p class="muted">页面链接是长期入口；播放直链会过期，因此不会当成永久成果保存。</p>
+            <div class="choice-grid" id="media-choices">
+              <label class="choice-card">
+                <input type="radio" name="media-mode" value="none" />
+                <span><strong>不处理媒体</strong><small>不请求播放地址，只采结构化数据</small></span>
+                <em>最轻</em>
+              </label>
+              <label class="choice-card selected">
+                <input type="radio" name="media-mode" value="link" checked />
+                <span><strong>保留页面链接</strong><small>写入 BV 永久页面链接，不下载文件</small></span>
+                <em>推荐</em>
+              </label>
+              <label class="choice-card">
+                <input type="radio" name="media-mode" value="audio" />
+                <span><strong>下载音频</strong><small>断点续传并封装为 M4A，供 Whisper 使用</small></span>
+                <em>中等</em>
+              </label>
+              <label class="choice-card">
+                <input type="radio" name="media-mode" value="video" />
+                <span><strong>下载完整视频</strong><small>下载 DASH 音视频；有 ffmpeg 时自动合并 MP4</small></span>
+                <em>占空间</em>
+              </label>
+            </div>
+          </article>
+
+          <article class="card">
+            <p class="step-kicker">步骤 4</p>
+            <h3>转写完成后如何处理媒体</h3>
+            <p class="muted">视频和图片只为转写/OCR 服务。文字落盘后，大文件可以删掉、压小，或先传到 Google Drive。</p>
+            <div class="choice-grid" id="keep-choices">
+              <label class="choice-card selected">
+                <input type="radio" name="media-keep" value="delete_after_text" checked />
+                <span><strong>提取后删除</strong><small>保留 BV 链接、转写、评论、弹幕；删除本地视频/音频/图片</small></span>
+                <em>推荐</em>
+              </label>
+              <label class="choice-card">
+                <input type="radio" name="media-keep" value="compress" />
+                <span><strong>压缩后保留</strong><small>视频压到约 480p，图片转 JPEG；仍可本地预览</small></span>
+              </label>
+              <label class="choice-card">
+                <input type="radio" name="media-keep" value="upload_then_delete" />
+                <span><strong>上传云盘后删除</strong><small>rclone 传到 Google Drive，再删本地大文件</small></span>
+              </label>
+              <label class="choice-card">
+                <input type="radio" name="media-keep" value="keep" />
+                <span><strong>全部留在本机</strong><small>原始 MP4 / M4A / 图片都保留，最占磁盘</small></span>
+              </label>
+            </div>
+          </article>
+
+          <article class="card">
+            <p class="step-kicker">步骤 5</p>
+            <h3>语音转文字</h3>
+            <div class="choice-grid" id="transcribe-choices">
+              <label class="choice-card">
+                <input type="radio" name="transcribe-mode" value="none" />
+                <span><strong>关闭</strong><small>不提取字幕，也不运行语音识别</small></span>
+              </label>
+              <label class="choice-card selected">
+                <input type="radio" name="transcribe-mode" value="official" checked />
+                <span><strong>官方字幕优先</strong><small>无需下载音频；没有字幕时保留待处理状态</small></span>
+                <em>快速</em>
+              </label>
+              <label class="choice-card">
+                <input type="radio" name="transcribe-mode" value="official_then_whisper" />
+                <span><strong>官方字幕 + Whisper 兜底</strong><small>先取字幕，缺失时识别本地音频；需要下载音频</small></span>
+                <em>推荐</em>
+              </label>
+              <label class="choice-card">
+                <input type="radio" name="transcribe-mode" value="whisper" />
+                <span><strong>全部重新识别</strong><small>忽略官方字幕，统一用本地 Whisper；需要下载音频</small></span>
+              </label>
+              <label class="choice-card">
+                <input type="radio" name="transcribe-mode" value="url_only" />
+                <span><strong>交给云端</strong><small>生成 cloud_job.json 清单，本机不运行模型</small></span>
+              </label>
+            </div>
+            <div class="output-strip">
+              <b>转写成果</b>
+              <span>transcript.md</span><span>transcript.json</span><span>SRT</span><span>WebVTT</span>
+            </div>
+          </article>
+
+          <article class="card launch-card">
+            <div>
+              <p class="step-kicker">确认任务</p>
+              <h3 id="plan-title">轻量采集</h3>
+              <p class="muted" id="plan-summary">不下载媒体；尝试提取官方字幕；图片下载并在 OCR 可用时识别。</p>
+              <div class="readiness" id="task-readiness"></div>
+            </div>
+            <div class="actions">
+              <button type="submit" class="primary" id="start-btn">开始采集</button>
+              <span class="muted" id="task-hint">任务串行执行；应用重启后可从磁盘检查点续跑。</span>
+            </div>
+          </article>
+        </form>
+      </section>
+
+      <section id="page-monitor" class="page" hidden>
+        <article class="card">
+          <div class="row-between">
+            <h3>当前任务 <span id="job-id" class="muted"></span></h3>
+            <button type="button" class="ghost" id="cancel-btn">取消任务</button>
+          </div>
+            <div class="progress-wrap" id="progress-wrap" role="progressbar" aria-label="任务进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div class="progress" id="progress-bar"></div>
+          </div>
+          <div class="metrics">
+            <div><span>状态</span><b id="m-status">空闲</b></div>
+            <div><span>账号</span><b id="m-uids">0 / 0</b></div>
+            <div><span>视频</span><b id="m-videos-n">0</b></div>
+            <div><span>动态</span><b id="m-dyn-n">0</b></div>
+          </div>
+          <p class="muted" id="m-current">尚未开始</p>
+        </article>
+        <article class="card log-card">
+          <h3>实时日志</h3>
+            <pre id="log-view" class="log" role="log" aria-live="polite"></pre>
+        </article>
+      </section>
+
+      <section id="page-results" class="page" hidden>
+        <div class="split">
+          <article class="card list-pane">
+            <div class="row-between">
+              <h3>已采集账号</h3>
+              <button type="button" class="ghost" id="refresh-results">刷新</button>
+            </div>
+            <div id="account-list" class="account-list"></div>
+          </article>
+          <article class="card detail-pane">
+            <div id="result-detail">
+              <p class="muted">选择左侧账号查看档案、视频和动态。</p>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section id="page-settings" class="page" hidden>
+        <div class="grid-2">
+          <article class="card">
+            <h3>扫码登录</h3>
+            <p class="muted">用哔哩哔哩 App 扫描二维码。Cookie 只保存在本机。</p>
+            <div class="qr-box">
+              <img id="qr-image" alt="登录二维码" hidden />
+              <p id="qr-msg" class="muted">点击生成二维码</p>
+            </div>
+            <button type="button" class="primary" id="qr-btn">生成二维码</button>
+          </article>
+          <article class="card">
+            <h3>或粘贴 Cookie</h3>
+            <label>从浏览器开发者工具复制整段 Cookie，至少包含 SESSDATA</label>
+            <textarea id="cookie-input" rows="6" placeholder="SESSDATA=...; bili_jct=...; DedeUserID=..."></textarea>
+            <button type="button" class="ghost" id="save-cookie">保存 Cookie</button>
+            <p class="muted tiny" id="cookie-preview"></p>
+          </article>
+        </div>
+        <article class="card">
+          <div class="row-between">
+            <div>
+              <h3>文字提取能力</h3>
+              <p class="muted">绿色表示可直接使用；黄色表示功能会自动降级，不会阻断采集。</p>
+            </div>
+            <button type="button" class="ghost" id="refresh-capabilities">重新检测</button>
+          </div>
+          <div class="capability-grid" id="capability-grid"></div>
+          <div class="install-row">
+            <pre class="code install-command" id="install-command"></pre>
+            <button type="button" class="ghost" id="copy-install">复制安装命令</button>
+          </div>
+        </article>
+        <article class="card">
+          <h3>采集节奏</h3>
+          <div class="grid-3">
+            <label>最小间隔（秒）<input type="number" step="0.1" id="min-interval" /></label>
+            <label>最大间隔（秒）<input type="number" step="0.1" id="max-interval" /></label>
+            <label>失败重试次数<input type="number" id="max-retries" /></label>
+            <label>评论最大页数（0=全部）<input type="number" id="comment-pages" /></label>
+            <label>Whisper 模型
+              <select id="whisper-model">
+                <option>tiny</option>
+                <option selected>small</option>
+                <option>medium</option>
+                <option>large-v3</option>
+              </select>
+            </label>
+            <label>转写语言
+              <select id="whisper-language">
+                <option value="auto">自动检测（推荐）</option>
+                <option value="zh">中文</option>
+                <option value="en">English</option>
+                <option value="ja">日本語</option>
+              </select>
+            </label>
+            <label>OCR 最低置信度
+              <input type="number" min="0.1" max="0.95" step="0.05" id="ocr-confidence" />
+            </label>
+            <label>画质 qn
+              <select id="video-quality">
+                <option value="16">360P</option>
+                <option value="32">480P</option>
+                <option value="64" selected>720P</option>
+                <option value="80">1080P</option>
+              </select>
+            </label>
+            <label>rclone 远程名<input id="rclone-remote" placeholder="gdrive" /></label>
+            <label>Drive 目录<input id="rclone-root" placeholder="BiliArchiver" /></label>
+          </div>
+          <div class="actions">
+            <button type="button" class="primary" id="save-settings">保存设置</button>
+            <button type="button" class="ghost" id="reclaim-btn">回收已有媒体</button>
+            <span class="muted" id="dep-status"></span>
+          </div>
+          <p class="muted tiny">「回收已有媒体」会对已经完成转写/OCR 的目录套用「提取后删除」。正在转写的视频会跳过。</p>
+        </article>
+      </section>
+    </main>
+  </div>
+    <div id="toast" role="status" aria-live="polite"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
