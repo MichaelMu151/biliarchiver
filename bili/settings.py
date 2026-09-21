@@ -27,9 +27,14 @@ DEFAULTS: dict[str, Any] = {
     "video_quality": 64,
     "ffmpeg_path": "ffmpeg",
     "output_dir": "",
-    "media_keep": "delete_after_text",
+    "media_keep": "upload_then_delete",
     "rclone_remote": "gdrive",
     "rclone_root": "BiliArchiver",
+    "bark_enabled": True,
+    "bark_key": "",
+    "bark_title": "b站爬虫",
+    "bark_sound": "bell",
+    "bark_server": "https://api.day.app",
 }
 
 
@@ -53,16 +58,32 @@ class AppSettings:
     video_quality: int = 64
     ffmpeg_path: str = "ffmpeg"
     output_dir: str = ""
-    media_keep: str = "delete_after_text"
+    media_keep: str = "upload_then_delete"
     rclone_remote: str = "gdrive"
     rclone_root: str = "BiliArchiver"
+    bark_enabled: bool = True
+    bark_key: str = ""
+    bark_title: str = "b站爬虫"
+    bark_sound: str = "bell"
+    bark_server: str = "https://api.day.app"
 
     def to_public_dict(self) -> dict[str, Any]:
         data = asdict(self)
         cookie = data.pop("cookie") or ""
+        bark_key = data.pop("bark_key") or ""
         data["has_cookie"] = bool(cookie)
         data["cookie_preview"] = _mask_cookie(cookie)
+        data["has_bark_key"] = bool(bark_key)
+        data["bark_key_preview"] = _mask_secret(bark_key)
         return data
+
+
+def _mask_secret(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) < 8:
+        return "已保存"
+    return f"{value[:4]}****{value[-4:]}"
 
 
 def _mask_cookie(cookie: str) -> str:

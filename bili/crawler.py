@@ -91,10 +91,12 @@ class JobConfig:
     crawl_danmaku: bool = True
     media_mode: str = "link"
     transcribe_mode: str = "official"
-    media_keep: str = "delete_after_text"
+    media_keep: str = "upload_then_delete"
     ocr_enabled: bool = True
     resume: bool = True
     job_id: str = ""
+    rclone_remote: str = "gdrive"
+    rclone_root: str = "BiliArchiver"
 
 
 @dataclass
@@ -489,8 +491,8 @@ class Crawler:
                 or config.transcribe_mode in {"none", "url_only"},
                 ocr_ready=True,
                 ffmpeg_path=self.settings.ffmpeg_path,
-                rclone_remote=self.settings.rclone_remote,
-                rclone_root=self.settings.rclone_root,
+                rclone_remote=config.rclone_remote or self.settings.rclone_remote,
+                rclone_root=config.rclone_root or self.settings.rclone_root,
                 library_root=self.library,
                 on_log=self.on_log,
                 include_images=False,
@@ -648,8 +650,8 @@ class Crawler:
             transcript_ready=True,
             ocr_ready=True,
             ffmpeg_path=self.settings.ffmpeg_path,
-            rclone_remote=self.settings.rclone_remote,
-            rclone_root=self.settings.rclone_root,
+            rclone_remote=config.rclone_remote or self.settings.rclone_remote,
+            rclone_root=config.rclone_root or self.settings.rclone_root,
             library_root=self.library,
             on_log=self.on_log,
             include_images=True,

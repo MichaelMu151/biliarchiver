@@ -173,10 +173,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .preset-grid { grid-template-columns: repeat(3, 1fr); }
 .preset-card {
   display: flex;
-  min-height: 146px;
+  min-height: 0;
   flex-direction: column;
   align-items: flex-start;
-  gap: 7px;
+  gap: 8px;
   padding: 16px;
   text-align: left;
   color: var(--text);
@@ -187,6 +187,33 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 .preset-card:hover, .preset-card.on { border-color: rgba(251, 114, 153, .62); background: rgba(251, 114, 153, .07); }
 .preset-card small, .choice-card small, .capability-card small { color: var(--muted); line-height: 1.55; }
+.preset-lead {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.45;
+  font-weight: 500;
+}
+.preset-facts {
+  display: grid;
+  gap: 5px;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.preset-facts b {
+  display: inline-block;
+  min-width: 2.2em;
+  margin-right: 6px;
+  color: var(--pink-2);
+  font-weight: 650;
+}
+.preset-note {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
 .preset-icon {
   display: grid;
   min-width: 34px;

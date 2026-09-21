@@ -81,12 +81,12 @@ function applyPreset(preset) {
   } else if (preset === "text") {
     setRadio("media-mode", "audio");
     setRadio("transcribe-mode", "official_then_whisper");
-    setRadio("media-keep", "delete_after_text");
+    setRadio("media-keep", "upload_then_delete");
     $("m-ocr").checked = true;
   } else if (preset === "archive") {
     setRadio("media-mode", "video");
     setRadio("transcribe-mode", "official_then_whisper");
-    setRadio("media-keep", "compress");
+    setRadio("media-keep", "upload_then_delete");
     $("m-ocr").checked = true;
   }
   updatePlanSummary();
@@ -213,8 +213,16 @@ $("save-settings").addEventListener("click", async () => {
       video_quality: Number($("video-quality").value),
       rclone_remote: $("rclone-remote").value,
       rclone_root: $("rclone-root").value,
+      bark_enabled: $("bark-enabled").checked,
+      bark_title: $("bark-title").value,
+      bark_sound: $("bark-sound").value || "bell",
     },
   });
+  const barkKey = $("bark-key").value.trim();
+  if (barkKey) {
+    await api("/api/settings", { method: "PUT", body: { bark_key: barkKey } });
+    $("bark-key").value = "";
+  }
   toast("设置已保存");
 });
 
@@ -378,6 +386,10 @@ async function loadSettings() {
   $("video-quality").value = String(s.video_quality);
   $("rclone-remote").value = s.rclone_remote || "gdrive";
   $("rclone-root").value = s.rclone_root || "BiliArchiver";
+  $("bark-enabled").checked = s.bark_enabled !== false;
+  $("bark-title").value = s.bark_title || "b站爬虫";
+  $("bark-sound").value = s.bark_sound || "bell";
+  $("bark-preview").textContent = s.has_bark_key ? `已保存 ${s.bark_key_preview}` : "尚未填写 Bark Key";
   $("cookie-preview").textContent = s.cookie_preview || "尚未登录";
   $("dep-status").textContent = `Whisper ${s.whisper_installed ? "已安装" : "未安装"} · OCR ${s.ocr_installed ? "已安装" : "未安装"} · ffmpeg ${s.ffmpeg_installed ? "已安装" : "未安装"}`;
   $("library-path").textContent = s.library_dir || "";
@@ -393,6 +405,14 @@ async function loadCapabilities() {
       ["ocr", "图片 OCR", capabilities.ocr],
       ["rclone", "Google Drive", capabilities.rclone || { ready: false, purpose: "上传后删除本地媒体" }],
     ];
+    $("capability-grid").innerHTML = items
+      .map(([key, title, item]) => `
+        <div class="capability-card ${item.ready ? "ready" : "missing"}">
+          <span class="cap-dot"></span>
+          <div><b>${title}</b><small>${item.purpose}${item.remotes ? " · 远程 " + item.remotes.join(", ") : ""}</small></div>
+          <em>${item.ready ? "可用" : "未安装"}</em>
+        </div>`)
+      .join("");
     $("capability-grid").innerHTML = items
       .map(([key, title, item]) => `
         <div class="capability-card ${item.ready ? "ready" : "missing"}">
@@ -454,12 +474,23 @@ loadCapabilities();
 syncChoiceCards();
 updatePlanSummary();
 $("m-ocr").addEventListener("change", updatePlanSummary);
+$("bark-test")?.addEventListener("click", async () => {
+  try {
+    const key = $("bark-key").value.trim();
+    await api("/api/notify/test", { method: "POST", body: key ? { key } : {} });
+    $("bark-key").value = "";
+    toast("已发送测试推送，请看手机");
+    loadSettings();
+  } catch (err) {
+    toast(err.message);
+  }
+});
 $("reclaim-btn")?.addEventListener("click", async () => {
-  if (!confirm("将删除已经完成转写/OCR 的本地视频、音频和图片，只保留链接和文字。正在处理的条目会跳过。继续？")) return;
+  if (!confirm("将把已完成转写/OCR 的媒体上传到 Google Drive，然后删除本地视频/音频/图片。正在处理的条目会跳过。继续？")) return;
   try {
     const summary = await api("/api/library/reclaim", {
       method: "POST",
-      body: { policy: "delete_after_text", dry_run: false },
+      body: { policy: "upload_then_delete", dry_run: false },
     });
     const mb = ((summary.bytes_freed || 0) / 1024 / 1024).toFixed(1);
     toast(`已处理 ${summary.folders || 0} 个目录，释放约 ${mb} MB`);

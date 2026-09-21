@@ -151,26 +151,42 @@
               <div>
                 <p class="step-kicker">快速开始</p>
                 <h3>选择一个工作方案</h3>
-                <p class="muted">方案只负责填好下面的选项，你仍可逐项调整。</p>
+                <p class="muted">点一下会填好下面的媒体、转写和空间选项；仍可逐项改。</p>
               </div>
             </div>
             <div class="preset-grid" id="preset-grid">
               <button type="button" class="preset-card on" data-preset="light">
                 <span class="preset-icon">↗</span>
                 <strong>轻量采集</strong>
-                <small>元数据、评论、弹幕、动态和永久页面链接；不下载媒体</small>
+                <span class="preset-lead">只要资料索引，不碰音视频文件。</span>
+                <span class="preset-facts">
+                  <span><b>下载</b>不下音频、不下视频</span>
+                  <span><b>转写</b>有官方字幕就提取，没有则跳过</span>
+                  <span><b>之后</b>本机几乎不占空间，靠 BV 链接回看</span>
+                </span>
               </button>
               <button type="button" class="preset-card" data-preset="text">
                 <span class="preset-icon">Aa</span>
                 <strong>文字研究</strong>
-                <small>下载音频；官方字幕优先，缺失时本地 Whisper；完成后删除音频，只留文字和链接</small>
+                <span class="preset-lead">要口播稿，不要片子。适合做文本分析。</span>
+                <span class="preset-facts">
+                  <span><b>下载</b>只下音频，体积大约是视频的三分之一</span>
+                  <span><b>转写</b>官方字幕优先，没有再用 Whisper</span>
+                  <span><b>之后</b>音频上传 Drive 后删除本地；留下转写、评论、链接</span>
+                </span>
               </button>
               <button type="button" class="preset-card" data-preset="archive">
                 <span class="preset-icon">▣</span>
                 <strong>完整归档</strong>
-                <small>下载视频用于转写后压缩保留，同时生成字幕、OCR 和结构化数据</small>
+                <span class="preset-lead">要能回看原片，同时保留全部文字。</span>
+                <span class="preset-facts">
+                  <span><b>下载</b>完整视频（音视频合并成 MP4）</span>
+                  <span><b>转写</b>与文字研究相同：官方字幕 + Whisper</span>
+                  <span><b>之后</b>视频上传 Drive 后删除本地；云盘回看，本机留文字</span>
+                </span>
               </button>
             </div>
+            <p class="preset-note">后两个方案都会做转写和动态 OCR。真正的差别只有一项：文字研究只处理声音，完整归档会把视频放进 Google Drive。</p>
           </article>
 
           <article class="card">
@@ -237,18 +253,18 @@
             <h3>转写完成后如何处理媒体</h3>
             <p class="muted">视频和图片只为转写/OCR 服务。文字落盘后，大文件可以删掉、压小，或先传到 Google Drive。</p>
             <div class="choice-grid" id="keep-choices">
-              <label class="choice-card selected">
-                <input type="radio" name="media-keep" value="delete_after_text" checked />
+              <label class="choice-card">
+                <input type="radio" name="media-keep" value="delete_after_text" />
                 <span><strong>提取后删除</strong><small>保留 BV 链接、转写、评论、弹幕；删除本地视频/音频/图片</small></span>
-                <em>推荐</em>
               </label>
               <label class="choice-card">
                 <input type="radio" name="media-keep" value="compress" />
                 <span><strong>压缩后保留</strong><small>视频压到约 480p，图片转 JPEG；仍可本地预览</small></span>
               </label>
-              <label class="choice-card">
-                <input type="radio" name="media-keep" value="upload_then_delete" />
+              <label class="choice-card selected">
+                <input type="radio" name="media-keep" value="upload_then_delete" checked />
                 <span><strong>上传云盘后删除</strong><small>rclone 传到 Google Drive，再删本地大文件</small></span>
+                <em>推荐</em>
               </label>
               <label class="choice-card">
                 <input type="radio" name="media-keep" value="keep" />
@@ -430,12 +446,28 @@
             <label>rclone 远程名<input id="rclone-remote" placeholder="gdrive" /></label>
             <label>Drive 目录<input id="rclone-root" placeholder="BiliArchiver" /></label>
           </div>
+        </article>
+        <article class="card">
+          <h3>手机进度提醒（Bark）</h3>
+          <p class="muted">任务开始、每完成一条视频、账号结束、整次采集完成或失败时推送到 iPhone，铃声为 bell。</p>
+          <div class="grid-3">
+            <label class="checks" style="align-items:center">
+              <span><input type="checkbox" id="bark-enabled" checked /> 启用推送</span>
+            </label>
+            <label>标题<input id="bark-title" placeholder="b站爬虫" /></label>
+            <label>铃声<input id="bark-sound" placeholder="bell" /></label>
+            <label>Bark Key 或完整链接
+              <input id="bark-key" placeholder="粘贴 Key，或 https://api.day.app/你的Key/..." />
+            </label>
+          </div>
+          <p class="muted tiny" id="bark-preview"></p>
           <div class="actions">
             <button type="button" class="primary" id="save-settings">保存设置</button>
+            <button type="button" class="ghost" id="bark-test">发送测试</button>
             <button type="button" class="ghost" id="reclaim-btn">回收已有媒体</button>
             <span class="muted" id="dep-status"></span>
           </div>
-          <p class="muted tiny">「回收已有媒体」会对已经完成转写/OCR 的目录套用「提取后删除」。正在转写的视频会跳过。</p>
+          <p class="muted tiny">「回收已有媒体」会对已经完成转写/OCR 的目录上传到 Google Drive 再删除本地大文件。正在转写的视频会跳过。Drive API 未启用时会失败。</p>
         </article>
       </section>
     </main>

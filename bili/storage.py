@@ -40,8 +40,77 @@ LogFn = Callable[[str, str], None]
 
 
 def which_rclone(explicit: str = "rclone") -> str | None:
-    found = shutil.which(explicit or "rclone")
-    return found
+    names = [explicit or "rclone"]
+    if os.name == "nt" and not names[0].lower().endswith(".exe"):
+        names.append(names[0] + ".exe")
+    candidates: list[Path] = []
+    for name in names:
+        if name:
+            candidates.append(Path(name).expanduser())
+        found = shutil.which(name)
+        if found:
+            candidates.append(Path(found))
+    root = Path(__file__).resolve().parent.parent
+    extra = [
+        root / "tools" / "bin" / "rclone.exe",
+        root / "tools" / "bin" / "rclone",
+        Path("/usr/local/bin/rclone"),
+        Path("/opt/homebrew/bin/rclone"),
+        Path("/usr/local/opt/rclone/bin/rclone"),
+    ]
+    cellar = Path("/usr/local/Cellar/rclone")
+    if cellar.exists():
+        extra.extend(sorted(cellar.glob("*/bin/rclone"), reverse=True))
+    cellar = Path("/opt/homebrew/Cellar/rclone")
+    if cellar.exists():
+        extra.extend(sorted(cellar.glob("*/bin/rclone"), reverse=True))
+    candidates.extend(extra)
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return None
+
+
+def rclone_drive_ready(remote: str) -> tuple[bool, str]:
+    """Confirm the named remote can actually talk to Google Drive."""
+    binary = which_rclone()
+    if not binary:
+        return False, "未找到 rclone"
+    remotes = rclone_remote_names()
+    if remote not in remotes:
+        shown = "、".join(remotes) or "无"
+        return False, f"没有名为 {remote} 的远程。当前：{shown}"
+    proc = run_quiet([binary, "lsd", f"{remote}:", "--max-depth", "1"])
+    if proc.returncode == 0:
+        return True, "已连接 Google Drive"
+    text = proc.stderr or proc.stdout or ""
+    if "SERVICE_DISABLED" in text or "accessNotConfigured" in text:
+        return False, (
+            "Google Drive API 尚未启用。请打开 "
+            "https://console.cloud.google.com/apis/library/drive.googleapis.com "
+            "点“启用”，等一两分钟后再试"
+        )
+    return False, (text.strip() or "rclone 无法访问该远程")[-400:]
+
+
+def rclone_remote_names() -> list[str]:
+    binary = which_rclone()
+    if not binary:
+        return []
+    proc = run_quiet([binary, "listremotes"])
+    if proc.returncode != 0:
+        return []
+    names = []
+    for line in (proc.stdout or "").splitlines():
+        name = line.strip().rstrip(":")
+        if name:
+            names.append(name)
+    return names
 
 
 def should_fetch_media(

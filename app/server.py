@@ -21,9 +21,9 @@ from bili.paths import DATA_DIR, LIBRARY_DIR, ensure_dirs
 from bili.settings import AppSettings, load_settings, save_settings
 from bili.store import Store
 from bili.media import which_ffmpeg
-from bili.ocr import ocr_available
+from bili.notify import normalize_bark_key, progress_messages, send_bark
 from bili.runtime import prepare_process, probe_compute
-from bili.storage import KEEP_POLICIES, reclaim_library, which_rclone
+from bili.storage import KEEP_POLICIES, rclone_drive_ready, rclone_remote_names, reclaim_library, which_rclone
 from bili.transcribe import whisper_available
 from bili.util import parse_uids
 
@@ -58,6 +58,11 @@ class SettingsIn(BaseModel):
     ffmpeg_path: str | None = None
     rclone_remote: str | None = None
     rclone_root: str | None = None
+    bark_enabled: bool | None = None
+    bark_key: str | None = None
+    bark_title: str | None = None
+    bark_sound: str | None = None
+    bark_server: str | None = None
 
 
 class JobIn(BaseModel):
@@ -70,7 +75,7 @@ class JobIn(BaseModel):
     crawl_danmaku: bool = True
     media_mode: str = "link"
     transcribe_mode: str = "official"
-    media_keep: str = "delete_after_text"
+    media_keep: str = "upload_then_delete"
     ocr_enabled: bool = True
     resume: bool = True
 
@@ -123,7 +128,15 @@ async def get_settings() -> dict[str, Any]:
 @app.put("/api/settings")
 async def put_settings(body: SettingsIn) -> dict[str, Any]:
     current = load_settings()
-    for key, value in body.model_dump(exclude_none=True).items():
+    payload = body.model_dump(exclude_none=True)
+    raw_key = payload.get("bark_key")
+    if raw_key is not None:
+        cleaned = normalize_bark_key(str(raw_key))
+        if cleaned:
+            payload["bark_key"] = cleaned
+        else:
+            payload.pop("bark_key", None)
+    for key, value in payload.items():
         setattr(current, key, value)
     if current.min_interval < 0.2 or current.max_interval < current.min_interval:
         raise HTTPException(400, "请求间隔必须 ≥ 0.2 秒，且最大间隔不能小于最小间隔")
@@ -134,6 +147,10 @@ async def put_settings(body: SettingsIn) -> dict[str, Any]:
         raise HTTPException(400, "Whisper 设备无效")
     if current.whisper_compute_type not in {"auto", "float16", "int8_float16", "int8"}:
         raise HTTPException(400, "Whisper 计算类型无效")
+    if current.bark_sound == "":
+        current.bark_sound = "bell"
+    if current.bark_title == "":
+        current.bark_title = "b站爬虫"
     save_settings(current)
     return public_settings(current)
 
@@ -143,6 +160,7 @@ async def capabilities() -> dict[str, Any]:
     settings = load_settings()
     usage = shutil.disk_usage(DATA_DIR)
     gpu = probe_compute()
+    drive_ok, drive_note = rclone_drive_ready(settings.rclone_remote)
     pip_command = (
         "pip install -r requirements-gpu-windows.txt"
         if gpu["platform"].startswith("win")
@@ -168,8 +186,12 @@ async def capabilities() -> dict[str, Any]:
             "device": gpu["device"],
         },
         "rclone": {
-            "ready": bool(which_rclone()),
-            "purpose": "把媒体上传到 Google Drive 后再删除本地大文件",
+            "ready": drive_ok,
+            "purpose": drive_note,
+            "remotes": rclone_remote_names(),
+            "binary": which_rclone() or "",
+            "remote": settings.rclone_remote,
+            "root": settings.rclone_root,
         },
         "disk": {
             "free_bytes": usage.free,
@@ -237,6 +259,32 @@ async def nav_status() -> dict[str, Any]:
         await client.close()
 
 
+class BarkTestIn(BaseModel):
+    key: str | None = None
+
+
+@app.post("/api/notify/test")
+async def bark_test(body: BarkTestIn = BarkTestIn()) -> dict[str, Any]:
+    settings = load_settings()
+    key = normalize_bark_key(body.key or settings.bark_key)
+    if not key:
+        raise HTTPException(400, "请先填写 Bark Key")
+    result = await send_bark(
+        key=key,
+        body="测试推送：BiliArchiver 已连接 Bark，后续采集进度会发到这里。",
+        title=settings.bark_title or "b站爬虫",
+        sound=settings.bark_sound or "bell",
+        server=settings.bark_server or "https://api.day.app",
+    )
+    if not result.get("ok"):
+        raise HTTPException(400, str(result.get("error") or result.get("data") or "Bark 推送失败"))
+    if not settings.bark_key:
+        settings.bark_key = key
+        settings.bark_enabled = True
+        save_settings(settings)
+    return {"ok": True, "settings": public_settings(load_settings())}
+
+
 @app.post("/api/jobs")
 async def create_job(body: JobIn) -> dict[str, Any]:
     uids = parse_uids(body.uids_text)
@@ -252,11 +300,17 @@ async def create_job(body: JobIn) -> dict[str, Any]:
         raise HTTPException(400, "本地 Whisper 需要音频：请把媒体策略改为“下载音频”或“下载视频”")
     if body.media_keep not in KEEP_POLICIES:
         raise HTTPException(400, "空间策略无效")
-    if body.media_keep == "upload_then_delete" and not which_rclone():
-        raise HTTPException(400, "上传 Google Drive 需要先安装 rclone 并完成 rclone config")
+    if body.media_keep == "upload_then_delete":
+        settings_now = load_settings()
+        ok, message = rclone_drive_ready(settings_now.rclone_remote)
+        if not ok:
+            raise HTTPException(400, message)
     job_id = uuid.uuid4().hex[:12]
     config = body.model_dump()
+    settings = load_settings()
     config["uids"] = uids
+    config["rclone_remote"] = settings.rclone_remote
+    config["rclone_root"] = settings.rclone_root
     runtime = JobRuntime(job_id, config)
     JOBS[job_id] = runtime
     store.save_job(job_id, config, "queued", {})
@@ -408,17 +462,44 @@ async def _execute_job(job: JobRuntime) -> None:
         ocr_enabled=bool(job.config.get("ocr_enabled", True)),
         resume=bool(job.config.get("resume", True)),
         job_id=job.id,
+        rclone_remote=job.config.get("rclone_remote") or settings.rclone_remote,
+        rclone_root=job.config.get("rclone_root") or settings.rclone_root,
     )
 
+    async def bark(event: str, payload: dict[str, Any] | None = None) -> None:
+        if not settings.bark_enabled or not settings.bark_key:
+            return
+        result = await send_bark(
+            key=settings.bark_key,
+            body=progress_messages(event, payload),
+            title=settings.bark_title or "b站爬虫",
+            sound=settings.bark_sound or "bell",
+            server=settings.bark_server or "https://api.day.app",
+        )
+        if not result.get("ok") and not result.get("skipped"):
+            on_log("warn", f"Bark 推送失败：{result.get('error') or result.get('data') or result.get('status')}")
+
     async def on_progress(payload: dict[str, Any]) -> None:
+        nonlocal last_videos, last_uids
         if job.cancel:
             crawler.cancelled = True
         job.progress = payload
         job.emit("progress", payload)
         store.save_job(job.id, job.config, job.status, payload, job.error)
+        videos = int(payload.get("videos_done") or 0)
+        uids_done = int(payload.get("uids_done") or 0)
+        if videos > last_videos:
+            last_videos = videos
+            await bark("video", payload)
+        if uids_done > last_uids:
+            last_uids = uids_done
+            await bark("uid", payload)
 
+    last_videos = 0
+    last_uids = 0
     job.status = "running"
     on_log("info", f"任务启动 · {len(cfg.uids)} 个账号 · 范围 {cfg.time_range}")
+    await bark("start", {"uids_total": len(cfg.uids)})
     try:
         await crawler.run(cfg, on_progress=on_progress)
         job.status = "cancelled" if job.cancel else "done"
@@ -435,6 +516,9 @@ async def _execute_job(job: JobRuntime) -> None:
             job.error = str(exc)
             on_log("error", f"任务失败：{exc}")
     store.save_job(job.id, job.config, job.status, job.progress, job.error)
+    finish = dict(job.progress or {})
+    finish["error"] = job.error
+    await bark("cancelled" if job.status == "cancelled" else ("error" if job.status == "error" else "done"), finish)
     job.emit("done", {"status": job.status, "progress": job.progress, "error": job.error})
 
 
@@ -447,8 +531,11 @@ class ReclaimIn(BaseModel):
 async def reclaim_existing(body: ReclaimIn) -> dict[str, Any]:
     if body.policy not in KEEP_POLICIES:
         raise HTTPException(400, "空间策略无效")
-    if body.policy == "upload_then_delete" and not which_rclone():
-        raise HTTPException(400, "上传 Google Drive 需要先安装 rclone 并完成 rclone config")
+    if body.policy == "upload_then_delete":
+        settings = load_settings()
+        ok, message = rclone_drive_ready(settings.rclone_remote)
+        if not ok:
+            raise HTTPException(400, message)
     settings = load_settings()
     summary = await asyncio.to_thread(
         reclaim_library,
@@ -460,6 +547,11 @@ async def reclaim_existing(body: ReclaimIn) -> dict[str, Any]:
         dry_run=body.dry_run,
     )
     return summary
+
+
+@app.get("/")
+async def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

@@ -51,6 +51,27 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(compute, "int8")
         self.assertTrue(note)
 
+    def test_rclone_discovery_does_not_crash(self) -> None:
+        from bili.storage import rclone_remote_names, which_rclone
+
+        binary = which_rclone()
+        names = rclone_remote_names()
+        if binary:
+            self.assertTrue(Path(binary).exists())
+            self.assertIsInstance(names, list)
+
+
+class NotifyTests(unittest.TestCase):
+    def test_extracts_key_from_bark_url(self) -> None:
+        from bili.notify import normalize_bark_key, progress_messages
+
+        self.assertEqual(
+            normalize_bark_key("https://api.day.app/FakeKey1234567890/b站爬虫/hello?sound=bell"),
+            "FakeKey1234567890",
+        )
+        self.assertEqual(normalize_bark_key("FakeKey1234567890"), "FakeKey1234567890")
+        self.assertIn("视频完成 3 条", progress_messages("video", {"videos_done": 3, "current": "天选OMG / 标题"}))
+
 
 class StorageTests(unittest.TestCase):
     def test_should_not_download_video_if_it_will_be_deleted(self) -> None:
