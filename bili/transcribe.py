@@ -215,6 +215,9 @@ async def build_transcript(
     whisper_language: str = "auto",
     whisper_device: str = "auto",
     whisper_compute_type: str = "auto",
+    gpu_worker_url: str = "",
+    gpu_worker_token: str = "",
+    compute_backend: str = "local",
     should_cancel: Callable[[], bool] | None = None,
     on_log,
 ) -> dict[str, Any]:
@@ -229,7 +232,24 @@ async def build_transcript(
         except Exception as exc:
             on_log("warn", f"官方字幕失败 {bvid}：{exc}")
     if not result.get("markdown") and mode in {"whisper", "official_then_whisper"}:
-        if audio_path and Path(audio_path).exists() and whisper_available():
+        if compute_backend == "cloud":
+            if audio_path and Path(audio_path).exists() and gpu_worker_url:
+                try:
+                    from bili.gpu_remote import transcribe_remote
+
+                    result = await transcribe_remote(
+                        url=gpu_worker_url,
+                        token=gpu_worker_token,
+                        audio_path=audio_path,
+                        model=whisper_model,
+                        language=whisper_language,
+                        on_log=on_log,
+                    )
+                except Exception as exc:
+                    on_log("warn", f"云端 GPU 转写失败 {bvid}：{exc}")
+            else:
+                on_log("warn", f"云端 GPU 未激活或没有本地音频，已把 {bvid} 写入 cloud_job.json")
+        elif audio_path and Path(audio_path).exists() and whisper_available():
             on_log("info", f"本地 Whisper 转录 {bvid}，可能较慢")
             try:
                 result = await asyncio.to_thread(
@@ -243,7 +263,7 @@ async def build_transcript(
                 )
             except Exception as exc:
                 on_log("warn", f"Whisper 失败 {bvid}：{exc}")
-        elif mode == "whisper" or mode == "official_then_whisper":
+        else:
             on_log("warn", "未安装 faster-whisper 或没有本地音频，已把任务写入 cloud_job.json")
     if result.get("markdown"):
         result["status"] = "done"

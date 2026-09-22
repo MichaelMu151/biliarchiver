@@ -3,9 +3,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
+import secrets
 import shutil
+import threading
 import uuid
 from collections import deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -15,13 +19,19 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from bili.academic import AcademicConfig, AcademicCrawler, parse_academic_seeds
+from bili.autodl import SESSION as AUTODL_SESSION, connect_autodl
 from bili.client import BiliClient
+from bili.corpus import Corpus
 from bili.crawler import Crawler, JobConfig
+from bili.gpu_remote import gpu_worker_ready, needs_remote_models, normalize_worker_url, resolve_compute
+from bili.ingest import ingest_library
 from bili.paths import DATA_DIR, LIBRARY_DIR, ensure_dirs
 from bili.settings import AppSettings, load_settings, save_settings
 from bili.store import Store
 from bili.media import which_ffmpeg
 from bili.notify import normalize_bark_key, progress_messages, send_bark
+from bili.ocr import ocr_available
 from bili.runtime import prepare_process, probe_compute
 from bili.storage import KEEP_POLICIES, rclone_drive_ready, rclone_remote_names, reclaim_library, which_rclone
 from bili.transcribe import whisper_available
@@ -32,8 +42,52 @@ prepare_process()
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 ensure_dirs()
 store = Store()
-store.mark_interrupted_jobs()
-app = FastAPI(title="BiliArchiver", version="1.0.0")
+corpus = Corpus()
+BOOT_INTERRUPTED_JOBS = store.mark_interrupted_jobs()
+
+TRANSCRIBE_MODES = {
+    "none",
+    "url_only",
+    "official",
+    "whisper",
+    "official_then_whisper",
+    "cloud_gpu",
+    "official_then_cloud",
+}
+LOCAL_WHISPER = {"whisper", "official_then_whisper"}
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    settings = load_settings()
+    if BOOT_INTERRUPTED_JOBS and settings.bark_enabled and settings.bark_key:
+        n = len(BOOT_INTERRUPTED_JOBS)
+        progress = BOOT_INTERRUPTED_JOBS[0].get("progress") or {}
+        progress["error"] = f"{n} 个任务"
+        await send_bark(
+            key=settings.bark_key,
+            body=progress_messages("interrupted", progress),
+            title=settings.bark_title or "b站爬虫",
+            sound=settings.bark_sound or "bell",
+            server=settings.bark_server or "https://api.day.app",
+            level="timeSensitive",
+        )
+    yield
+    AUTODL_SESSION.close()
+    settings = load_settings()
+    running = [job for job in JOBS.values() if job.status in {"queued", "running", "cancelling"}]
+    if running and settings.bark_enabled and settings.bark_key:
+        await send_bark(
+            key=settings.bark_key,
+            body=progress_messages("interrupted", running[0].progress or {}),
+            title=settings.bark_title or "b站爬虫",
+            sound=settings.bark_sound or "bell",
+            server=settings.bark_server or "https://api.day.app",
+            level="timeSensitive",
+        )
+
+
+app = FastAPI(title="BiliArchiver", version="1.0.0", lifespan=lifespan)
 JOB_LOCK = asyncio.Lock()
 
 
@@ -63,6 +117,11 @@ class SettingsIn(BaseModel):
     bark_title: str | None = None
     bark_sound: str | None = None
     bark_server: str | None = None
+    gpu_worker_url: str | None = None
+    gpu_worker_token: str | None = None
+    compute_backend: str | None = None
+    autodl_ssh_command: str | None = None
+    autodl_ssh_password: str | None = None
 
 
 class JobIn(BaseModel):
@@ -78,6 +137,8 @@ class JobIn(BaseModel):
     media_keep: str = "upload_then_delete"
     ocr_enabled: bool = True
     resume: bool = True
+    compute_backend: str = "local"
+    kind: str = "archive"
 
 
 class JobRuntime:
@@ -112,6 +173,7 @@ def public_settings(s: AppSettings) -> dict[str, Any]:
     data["ffmpeg_installed"] = bool(which_ffmpeg(s.ffmpeg_path))
     data["gpu"] = probe_compute()
     data["library_dir"] = str(LIBRARY_DIR)
+    data["corpus_path"] = str(corpus.path)
     return data
 
 
@@ -136,6 +198,22 @@ async def put_settings(body: SettingsIn) -> dict[str, Any]:
             payload["bark_key"] = cleaned
         else:
             payload.pop("bark_key", None)
+    raw_gpu_token = payload.get("gpu_worker_token")
+    if raw_gpu_token is not None:
+        cleaned_token = str(raw_gpu_token).strip()
+        if cleaned_token:
+            payload["gpu_worker_token"] = cleaned_token
+        else:
+            payload.pop("gpu_worker_token", None)
+    if payload.get("gpu_worker_url") is not None:
+        payload["gpu_worker_url"] = normalize_worker_url(str(payload.get("gpu_worker_url") or ""))
+    raw_autodl_password = payload.get("autodl_ssh_password")
+    if raw_autodl_password is not None:
+        cleaned_password = str(raw_autodl_password).strip()
+        if cleaned_password:
+            payload["autodl_ssh_password"] = cleaned_password
+        else:
+            payload.pop("autodl_ssh_password", None)
     for key, value in payload.items():
         setattr(current, key, value)
     if current.min_interval < 0.2 or current.max_interval < current.min_interval:
@@ -147,6 +225,8 @@ async def put_settings(body: SettingsIn) -> dict[str, Any]:
         raise HTTPException(400, "Whisper 设备无效")
     if current.whisper_compute_type not in {"auto", "float16", "int8_float16", "int8"}:
         raise HTTPException(400, "Whisper 计算类型无效")
+    if current.compute_backend not in {"local", "cloud"}:
+        raise HTTPException(400, "计算后端无效")
     if current.bark_sound == "":
         current.bark_sound = "bell"
     if current.bark_title == "":
@@ -161,6 +241,9 @@ async def capabilities() -> dict[str, Any]:
     usage = shutil.disk_usage(DATA_DIR)
     gpu = probe_compute()
     drive_ok, drive_note = rclone_drive_ready(settings.rclone_remote)
+    worker_ok, worker_note = gpu_worker_ready(
+        settings.gpu_worker_url, settings.gpu_worker_token, timeout=2.5
+    )
     pip_command = (
         "pip install -r requirements-gpu-windows.txt"
         if gpu["platform"].startswith("win")
@@ -193,6 +276,12 @@ async def capabilities() -> dict[str, Any]:
             "remote": settings.rclone_remote,
             "root": settings.rclone_root,
         },
+        "gpu_worker": {
+            "ready": worker_ok,
+            "purpose": worker_note,
+            "url": settings.gpu_worker_url or "",
+        },
+        "autodl": AUTODL_SESSION.status(),
         "disk": {
             "free_bytes": usage.free,
             "total_bytes": usage.total,
@@ -285,6 +374,112 @@ async def bark_test(body: BarkTestIn = BarkTestIn()) -> dict[str, Any]:
     return {"ok": True, "settings": public_settings(load_settings())}
 
 
+class GpuTestIn(BaseModel):
+    url: str | None = None
+    token: str | None = None
+
+
+@app.post("/api/gpu/test")
+async def gpu_test(body: GpuTestIn = GpuTestIn()) -> dict[str, Any]:
+    settings = load_settings()
+    url = normalize_worker_url(body.url or settings.gpu_worker_url)
+    token = (body.token or settings.gpu_worker_token or "").strip()
+    if not url:
+        raise HTTPException(400, "请先填写 GPU 工作机地址")
+    ok, message = gpu_worker_ready(url, token)
+    if not ok:
+        raise HTTPException(400, message)
+    if body.url:
+        settings.gpu_worker_url = url
+    if body.token:
+        settings.gpu_worker_token = token
+    if body.url or body.token:
+        save_settings(settings)
+    return {"ok": True, "message": message, "settings": public_settings(load_settings())}
+
+
+class AutodlConnectIn(BaseModel):
+    ssh_command: str | None = None
+    password: str | None = None
+
+
+@app.get("/api/gpu/autodl/status")
+async def autodl_status() -> dict[str, Any]:
+    return AUTODL_SESSION.status()
+
+
+@app.post("/api/gpu/autodl/disconnect")
+async def autodl_disconnect() -> dict[str, Any]:
+    AUTODL_SESSION.close()
+    return {"ok": True, **AUTODL_SESSION.status()}
+
+
+@app.post("/api/gpu/autodl/connect")
+async def autodl_connect(body: AutodlConnectIn = AutodlConnectIn()) -> StreamingResponse:
+    settings = load_settings()
+    ssh_command = (body.ssh_command or settings.autodl_ssh_command or "").strip()
+    password = (body.password or settings.autodl_ssh_password or "").strip()
+    if not ssh_command:
+        raise HTTPException(400, "请粘贴 AutoDL 的 SSH 登录指令")
+    if not password:
+        raise HTTPException(400, "请填写 AutoDL SSH 密码")
+    token = (settings.gpu_worker_token or "").strip() or secrets.token_hex(16)
+    model = settings.whisper_model or "large-v3"
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    def emit(message: str, level: str = "info") -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, {"line": message, "level": level})
+
+    def worker() -> None:
+        try:
+            result = connect_autodl(
+                ssh_command=ssh_command,
+                password=password,
+                token=token,
+                model=model,
+                log=emit,
+            )
+            current = load_settings()
+            current.autodl_ssh_command = ssh_command
+            current.autodl_ssh_password = password
+            current.gpu_worker_token = token
+            current.gpu_worker_url = str(result["url"])
+            current.compute_backend = "cloud"
+            save_settings(current)
+            emit("接入完成。新建任务选文字研究或完整归档，步骤 6 选云端 GPU。", "ok")
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                {
+                    "done": True,
+                    "ok": True,
+                    "message": "AutoDL 已接入",
+                    "url": result["url"],
+                    "settings": public_settings(load_settings()),
+                },
+            )
+        except Exception as exc:
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                {"done": True, "ok": False, "error": str(exc), "level": "error"},
+            )
+
+    threading.Thread(target=worker, daemon=True, name="autodl-connect").start()
+
+    async def stream():
+        while True:
+            item = await queue.get()
+            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+            if item.get("done"):
+                break
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.post("/api/jobs")
 async def create_job(body: JobIn) -> dict[str, Any]:
     uids = parse_uids(body.uids_text)
@@ -294,10 +489,16 @@ async def create_job(body: JobIn) -> dict[str, Any]:
         raise HTTPException(400, "时间范围无效")
     if body.media_mode not in {"none", "link", "audio", "video"}:
         raise HTTPException(400, "媒体策略无效")
-    if body.transcribe_mode not in {"none", "url_only", "official", "whisper", "official_then_whisper"}:
+    if body.transcribe_mode not in TRANSCRIBE_MODES:
         raise HTTPException(400, "转写策略无效")
-    if body.transcribe_mode in {"whisper", "official_then_whisper"} and body.media_mode not in {"audio", "video"}:
-        raise HTTPException(400, "本地 Whisper 需要音频：请把媒体策略改为“下载音频”或“下载视频”")
+    transcribe_mode, compute_backend = resolve_compute(body.transcribe_mode, body.compute_backend)
+    if transcribe_mode in LOCAL_WHISPER and body.media_mode not in {"audio", "video"}:
+        raise HTTPException(400, "语音识别需要音频：请把媒体策略改为“下载音频”或“下载视频”")
+    if needs_remote_models(transcribe_mode, compute_backend, body.ocr_enabled):
+        settings_now = load_settings()
+        ok, message = gpu_worker_ready(settings_now.gpu_worker_url, settings_now.gpu_worker_token)
+        if not ok:
+            raise HTTPException(400, message)
     if body.media_keep not in KEEP_POLICIES:
         raise HTTPException(400, "空间策略无效")
     if body.media_keep == "upload_then_delete":
@@ -309,13 +510,109 @@ async def create_job(body: JobIn) -> dict[str, Any]:
     config = body.model_dump()
     settings = load_settings()
     config["uids"] = uids
+    config["transcribe_mode"] = transcribe_mode
+    config["compute_backend"] = compute_backend
     config["rclone_remote"] = settings.rclone_remote
     config["rclone_root"] = settings.rclone_root
+    config["kind"] = "archive"
     runtime = JobRuntime(job_id, config)
     JOBS[job_id] = runtime
     store.save_job(job_id, config, "queued", {})
     runtime.task = asyncio.create_task(_run_job(runtime))
     return {"id": job_id, "uids": uids, "status": "queued"}
+
+
+class AcademicJobIn(BaseModel):
+    seeds_text: str
+    max_depth: int = 2
+    max_nodes: int = 80
+    related_limit: int = 15
+    min_views: int = 10000
+    min_replies: int = 150
+    min_engagement: float = 0.003
+    category_allow: str = ""
+    category_deny: str = "游戏,动画,番剧,国创,音乐,舞蹈,影视,娱乐,鬼畜,运动,汽车,时尚,美食"
+    tag_terms: str = "就业,学历,失业,薪资,找工作,文凭,体制内,内卷,大厂,职场"
+    keyword: str = ""
+    time_range: str = "1y"
+    seeds_per_uid: int = 8
+    crawl_comments: bool = True
+    crawl_danmaku: bool = False
+    transcribe_mode: str = "none"
+    media_mode: str = "link"
+    media_keep: str = "delete_after_text"
+    resume: bool = True
+    compute_backend: str = "local"
+
+
+@app.post("/api/jobs/academic")
+async def create_academic_job(body: AcademicJobIn) -> dict[str, Any]:
+    bvids, uids = parse_academic_seeds(body.seeds_text)
+    if not bvids and not uids:
+        raise HTTPException(400, "请填写种子 BV 号，或 UP 主 UID / 空间链接")
+    if body.time_range not in {"all", "3y", "2y", "1y", "9m", "6m", "3m"}:
+        raise HTTPException(400, "时间范围无效")
+    if body.max_depth < 0 or body.max_depth > 4:
+        raise HTTPException(400, "深度请放在 0–4")
+    if body.max_nodes < 1 or body.max_nodes > 500:
+        raise HTTPException(400, "节点上限请放在 1–500")
+    transcribe_mode, compute_backend = resolve_compute(body.transcribe_mode, body.compute_backend)
+    job_id = uuid.uuid4().hex[:12]
+    config = body.model_dump()
+    config["kind"] = "academic"
+    config["seed_bvids"] = bvids
+    config["seed_uids"] = uids
+    config["transcribe_mode"] = transcribe_mode
+    config["compute_backend"] = compute_backend
+    runtime = JobRuntime(job_id, config)
+    JOBS[job_id] = runtime
+    store.save_job(job_id, config, "queued", {})
+    runtime.task = asyncio.create_task(_run_job(runtime))
+    return {"id": job_id, "bvids": bvids, "uids": uids, "status": "queued"}
+
+
+class CorpusQueryIn(BaseModel):
+    sql: str
+
+
+@app.get("/api/corpus")
+async def corpus_summary() -> dict[str, Any]:
+    runs = corpus.runs(20)
+    funnel: list[dict[str, Any]] = []
+    for run in runs:
+        rows = corpus.gate_funnel(run["run_id"])
+        if rows:
+            funnel = [{"run_id": run["run_id"], **row} for row in rows]
+            break
+    return {
+        "path": str(corpus.path),
+        "counts": corpus.table_counts(),
+        "runs": runs,
+        "funnel": funnel,
+    }
+
+
+@app.post("/api/corpus/query")
+async def corpus_query(body: CorpusQueryIn) -> dict[str, Any]:
+    try:
+        rows = corpus.query(body.sql)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(400, f"查询失败：{exc}") from exc
+    return {"rows": rows[:500], "count": len(rows)}
+
+
+@app.post("/api/corpus/export")
+async def corpus_export() -> dict[str, Any]:
+    return await asyncio.to_thread(corpus.export_bundle)
+
+
+@app.post("/api/corpus/ingest")
+async def corpus_ingest() -> dict[str, Any]:
+    run_id = "backfill-" + uuid.uuid4().hex[:8]
+    counts = await asyncio.to_thread(ingest_library, LIBRARY_DIR, corpus, run_id)
+    return {"ok": True, "run_id": run_id, "counts": counts}
 
 
 @app.get("/api/jobs")
@@ -440,6 +737,7 @@ async def _execute_job(job: JobRuntime) -> None:
         store=store,
         library=LIBRARY_DIR,
         should_cancel=lambda: job.cancel,
+        corpus=corpus,
     )
 
     def on_log(level: str, message: str) -> None:
@@ -449,7 +747,7 @@ async def _execute_job(job: JobRuntime) -> None:
 
     crawler.on_log = on_log
     cfg = JobConfig(
-        uids=job.config["uids"],
+        uids=job.config.get("uids") or [],
         time_range=job.config.get("time_range") or "1y",
         crawl_profile=job.config.get("crawl_profile", True),
         crawl_videos=job.config.get("crawl_videos", True),
@@ -464,19 +762,30 @@ async def _execute_job(job: JobRuntime) -> None:
         job_id=job.id,
         rclone_remote=job.config.get("rclone_remote") or settings.rclone_remote,
         rclone_root=job.config.get("rclone_root") or settings.rclone_root,
+        compute_backend=job.config.get("compute_backend") or settings.compute_backend,
     )
 
     async def bark(event: str, payload: dict[str, Any] | None = None) -> None:
-        if not settings.bark_enabled or not settings.bark_key:
+        current = load_settings()
+        if not current.bark_enabled or not current.bark_key:
+            if event in {"start", "done", "error", "cancelled"}:
+                on_log("warn", "未发送 Bark：请在设置里保存 Key 并保持启用")
             return
+        level = "timeSensitive" if event in {"done", "error", "cancelled", "interrupted"} else "active"
         result = await send_bark(
-            key=settings.bark_key,
+            key=current.bark_key,
             body=progress_messages(event, payload),
-            title=settings.bark_title or "b站爬虫",
-            sound=settings.bark_sound or "bell",
-            server=settings.bark_server or "https://api.day.app",
+            title=current.bark_title or "b站爬虫",
+            sound=current.bark_sound or "bell",
+            server=current.bark_server or "https://api.day.app",
+            level=level,
         )
-        if not result.get("ok") and not result.get("skipped"):
+        if event in {"start", "done", "error", "cancelled"}:
+            if result.get("ok"):
+                on_log("info", f"已发送 Bark（{event}）")
+            else:
+                on_log("warn", f"Bark 推送失败：{result.get('error') or result.get('data') or result.get('status')}")
+        elif not result.get("ok") and not result.get("skipped"):
             on_log("warn", f"Bark 推送失败：{result.get('error') or result.get('data') or result.get('status')}")
 
     async def on_progress(payload: dict[str, Any]) -> None:
@@ -498,7 +807,69 @@ async def _execute_job(job: JobRuntime) -> None:
     last_videos = 0
     last_uids = 0
     job.status = "running"
-    on_log("info", f"任务启动 · {len(cfg.uids)} 个账号 · 范围 {cfg.time_range}")
+    if job.config.get("kind") == "academic":
+        on_log(
+            "info",
+            f"滚雪球启动 · 种子视频 {len(job.config.get('seed_bvids') or [])} · "
+            f"账号 {len(job.config.get('seed_uids') or [])} · 深度 {job.config.get('max_depth')}",
+        )
+        await bark("start", {"uids_total": job.config.get("max_nodes") or 0})
+        academic = AcademicCrawler(
+            settings=settings,
+            store=store,
+            corpus=corpus,
+            crawler=crawler,
+            on_log=on_log,
+            should_cancel=lambda: job.cancel,
+        )
+        cfg_ac = AcademicConfig(
+            job_id=job.id,
+            seeds_text=job.config.get("seeds_text") or "",
+            seed_bvids=job.config.get("seed_bvids") or [],
+            seed_uids=job.config.get("seed_uids") or [],
+            max_depth=int(job.config.get("max_depth") or 2),
+            max_nodes=int(job.config.get("max_nodes") or 80),
+            related_limit=int(job.config.get("related_limit") or 15),
+            min_views=int(job.config.get("min_views") or 0),
+            min_replies=int(job.config.get("min_replies") or 0),
+            min_engagement=float(job.config.get("min_engagement") or 0),
+            category_allow=job.config.get("category_allow") or "",
+            category_deny=job.config.get("category_deny") or "",
+            tag_terms=job.config.get("tag_terms") or "",
+            keyword=job.config.get("keyword") or "",
+            time_range=job.config.get("time_range") or "1y",
+            seeds_per_uid=int(job.config.get("seeds_per_uid") or 8),
+            crawl_comments=bool(job.config.get("crawl_comments", True)),
+            crawl_danmaku=bool(job.config.get("crawl_danmaku", False)),
+            transcribe_mode=job.config.get("transcribe_mode") or "none",
+            media_mode=job.config.get("media_mode") or "link",
+            media_keep=job.config.get("media_keep") or "delete_after_text",
+            resume=bool(job.config.get("resume", True)),
+            compute_backend=job.config.get("compute_backend") or "local",
+        )
+        try:
+            await academic.run(cfg_ac, on_progress=on_progress)
+            job.status = "cancelled" if job.cancel or academic.cancelled else "done"
+            on_log("ok", "滚雪球结束" if job.status == "done" else "已取消")
+        except asyncio.CancelledError:
+            job.status = "cancelled"
+            on_log("warn", "任务已取消；队列和已采集节点已保留")
+        except Exception as exc:
+            if job.cancel:
+                job.status = "cancelled"
+                on_log("warn", "任务已取消；已完成步骤已保留")
+            else:
+                job.status = "error"
+                job.error = str(exc)
+                on_log("error", f"任务失败：{exc}")
+        store.save_job(job.id, job.config, job.status, job.progress, job.error)
+        finish = dict(job.progress or {})
+        finish["error"] = job.error
+        await bark("cancelled" if job.status == "cancelled" else ("error" if job.status == "error" else "done"), finish)
+        job.emit("done", {"status": job.status, "progress": job.progress, "error": job.error})
+        return
+
+    on_log("info", f"任务启动 · {len(cfg.uids)} 个账号 · 范围 {cfg.time_range} · 算力 {cfg.compute_backend}")
     await bark("start", {"uids_total": len(cfg.uids)})
     try:
         await crawler.run(cfg, on_progress=on_progress)

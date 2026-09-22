@@ -5,6 +5,7 @@ pydantic>=2.7.0
 qrcode>=7.4.2
 pillow>=10.0.0
 python-multipart>=0.0.9
+paramiko>=3.4.0
 
 # Optional extras (install when needed):
 # faster-whisper

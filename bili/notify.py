@@ -29,26 +29,31 @@ async def send_bark(
     sound: str = "bell",
     server: str = "https://api.day.app",
     group: str = "biliarchiver",
+    level: str = "active",
 ) -> dict[str, Any]:
     token = normalize_bark_key(key)
     if not token:
         return {"ok": False, "skipped": True, "error": "未配置 Bark Key"}
-    url = bark_endpoint(server, token)
+    base = (server or "https://api.day.app").rstrip("/")
     payload = {
         "title": title or "b站爬虫",
         "body": (body or "")[:500],
         "sound": sound or "bell",
         "group": group,
-        "level": "active",
+        "level": level or "active",
+        "device_key": token,
+        "badge": 1,
     }
+    url = bark_endpoint(server, token)
     try:
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
             response = await client.post(url, json=payload)
+            if response.status_code >= 400:
+                response = await client.post(f"{base}/push", json=payload)
             if response.status_code >= 400:
                 path = f"{url}/{quote(payload['title'], safe='')}/{quote(payload['body'], safe='')}"
                 response = await client.get(path, params={"sound": payload["sound"]})
             ok = response.status_code < 400
-            detail: Any
             try:
                 detail = response.json()
             except Exception:
@@ -77,4 +82,6 @@ def progress_messages(event: str, payload: dict[str, Any] | None = None) -> str:
         return f"任务已取消。已完成视频 {videos}，动态 {dyns}"
     if event == "error":
         return f"任务失败：{data.get('error') or '未知错误'}"
+    if event == "interrupted":
+        return f"采集因应用退出中断。已完成视频 {videos}，动态 {dyns}。勾选续跑再开即可。"
     return current or event

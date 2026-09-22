@@ -35,6 +35,11 @@ DEFAULTS: dict[str, Any] = {
     "bark_title": "b站爬虫",
     "bark_sound": "bell",
     "bark_server": "https://api.day.app",
+    "gpu_worker_url": "",
+    "gpu_worker_token": "",
+    "compute_backend": "local",
+    "autodl_ssh_command": "",
+    "autodl_ssh_password": "",
 }
 
 
@@ -66,15 +71,26 @@ class AppSettings:
     bark_title: str = "b站爬虫"
     bark_sound: str = "bell"
     bark_server: str = "https://api.day.app"
+    gpu_worker_url: str = ""
+    gpu_worker_token: str = ""
+    compute_backend: str = "local"
+    autodl_ssh_command: str = ""
+    autodl_ssh_password: str = ""
 
     def to_public_dict(self) -> dict[str, Any]:
         data = asdict(self)
         cookie = data.pop("cookie") or ""
         bark_key = data.pop("bark_key") or ""
+        gpu_token = data.pop("gpu_worker_token") or ""
+        autodl_password = data.pop("autodl_ssh_password") or ""
         data["has_cookie"] = bool(cookie)
         data["cookie_preview"] = _mask_cookie(cookie)
         data["has_bark_key"] = bool(bark_key)
         data["bark_key_preview"] = _mask_secret(bark_key)
+        data["has_gpu_worker_token"] = bool(gpu_token)
+        data["gpu_worker_token_preview"] = _mask_secret(gpu_token)
+        data["has_autodl_password"] = bool(autodl_password)
+        data["autodl_password_preview"] = _mask_secret(autodl_password)
         return data
 
 

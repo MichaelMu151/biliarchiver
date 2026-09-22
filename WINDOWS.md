@@ -74,7 +74,9 @@ python run.py
 | 依赖 | `requirements-ai.txt` | `requirements-gpu-windows.txt` |
 | 路径 | POSIX | 同样用 pathlib，中文目录可用 |
 
-采集逻辑、产物目录、空间策略（提取后删除 / 压缩 / 上传 Google Drive）两边一样。数据仍在本机 `data\library\`。
+采集逻辑、产物目录、空间策略（提取后删除 / 压缩 / 上传 Google Drive）两边一样。数据仍在本机 `data\library\`。界面里 UID、Cookie、Bark、rclone、AutoDL、学术采样门禁该填什么，见主 [README.md](README.md)「界面里该填什么」。
+
+学术采样默认不下载视频、不跑 Whisper；评论树和分析漏斗在 `data\corpus.db`。
 
 ## 采集结果去哪找
 

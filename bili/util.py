@@ -70,6 +70,17 @@ def parse_uids(raw: str) -> list[str]:
     return found
 
 
+def parse_bvids(raw: str) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in BV_RE.finditer(raw or ""):
+        bvid = match.group(0)
+        if bvid not in seen:
+            seen.add(bvid)
+            found.append(bvid)
+    return found
+
+
 def safe_name(text: str, limit: int = 60) -> str:
     cleaned = re.sub(r'[\\/:*?"<>|\n\r\t]+', "_", text).strip(" ._")
     return (cleaned or "untitled")[:limit]

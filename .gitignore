@@ -10,5 +10,6 @@ data/
 *.log
 .idea/
 .vscode/
+.cursor/
 .venv-py314.bak/
 tools/bin/

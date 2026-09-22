@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   level INTEGER,
   official TEXT,
   space_url TEXT,
+  sex TEXT,
+  school TEXT,
   updated_at TEXT
 );
 CREATE TABLE IF NOT EXISTS account_snapshots (
@@ -97,6 +99,17 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._add_missing_columns(conn)
+
+    @staticmethod
+    def _add_missing_columns(conn: sqlite3.Connection) -> None:
+        """Existing databases predate some columns; CREATE TABLE IF NOT EXISTS won't add them."""
+        wanted = {"accounts": {"sex": "TEXT", "school": "TEXT"}}
+        for table, columns in wanted.items():
+            have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for column, ddl in columns.items():
+                if column not in have:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -117,12 +130,13 @@ class Store:
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO accounts(mid,name,sign,face,level,official,space_url,updated_at)
-                VALUES(:mid,:name,:sign,:face,:level,:official,:space_url,:updated_at)
+                INSERT INTO accounts(mid,name,sign,face,level,official,space_url,sex,school,updated_at)
+                VALUES(:mid,:name,:sign,:face,:level,:official,:space_url,:sex,:school,:updated_at)
                 ON CONFLICT(mid) DO UPDATE SET
                   name=excluded.name, sign=excluded.sign, face=excluded.face,
                   level=excluded.level, official=excluded.official,
-                  space_url=excluded.space_url, updated_at=excluded.updated_at
+                  space_url=excluded.space_url, sex=excluded.sex,
+                  school=excluded.school, updated_at=excluded.updated_at
                 """,
                 payload,
             )
@@ -266,9 +280,15 @@ class Store:
             out.append(item)
         return out
 
-    def mark_interrupted_jobs(self) -> None:
+    def mark_interrupted_jobs(self) -> list[dict[str, Any]]:
         """A process restart cannot keep in-memory tasks alive; make that explicit."""
         with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, progress_json FROM jobs
+                WHERE status IN ('queued','running','cancelling')
+                """
+            ).fetchall()
             conn.execute(
                 """
                 UPDATE jobs
@@ -279,3 +299,12 @@ class Store:
                 """,
                 (now_iso(),),
             )
+        out = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["progress"] = json.loads(item.pop("progress_json") or "{}")
+            except json.JSONDecodeError:
+                item["progress"] = {}
+            out.append(item)
+        return out

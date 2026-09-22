@@ -57,6 +57,9 @@ def write_profile(acc_dir: Path, profile: dict[str, Any], snapshot: dict[str, An
 
 - UID：`{profile.get('mid')}`
 - 主页：{profile.get('space_url')}
+- 性别：{profile.get('sex') or '（未提供）'}
+- 学校：{profile.get('school') or '（未填写）'}
+- 生日：{profile.get('birthday') or '（未公开）'}
 - 签名：{profile.get('sign') or '（无）'}
 - 等级：{profile.get('level')}
 - 认证：{official.get('title') or official or '无'}

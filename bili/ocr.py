@@ -98,13 +98,16 @@ async def collect_images_and_ocr(
     enabled: bool,
     on_log,
     min_confidence: float = 0.55,
+    compute_backend: str = "local",
+    gpu_worker_url: str = "",
+    gpu_worker_token: str = "",
 ) -> list[dict[str, Any]]:
     image_dir = folder / "images"
     blocks: list[dict[str, Any]] = []
-    engine_ok = enabled and ocr_available()
+    use_remote = enabled and compute_backend == "cloud" and bool(gpu_worker_url)
+    engine_ok = enabled and (use_remote or ocr_available())
     if enabled and not engine_ok:
         on_log("warn", "未安装 RapidOCR，动态图片会下载但不会 OCR。可执行 pip install rapidocr onnxruntime")
-    downloads: list[tuple[Path, str]] = []
     semaphore = asyncio.Semaphore(3)
 
     async def download_one(idx: int, source_url: str) -> tuple[Path, str] | None:
@@ -136,7 +139,17 @@ async def collect_images_and_ocr(
         elapsed = None
         if engine_ok:
             try:
-                result = await asyncio.to_thread(_run_ocr, dest, min_confidence)
+                if use_remote:
+                    from bili.gpu_remote import ocr_remote
+
+                    result = await ocr_remote(
+                        url=gpu_worker_url,
+                        token=gpu_worker_token,
+                        image_path=str(dest),
+                        min_confidence=min_confidence,
+                    )
+                else:
+                    result = await asyncio.to_thread(_run_ocr, dest, min_confidence)
                 text = result["text"]
                 lines = result["lines"]
                 elapsed = result["elapsed_seconds"]
@@ -156,7 +169,7 @@ async def collect_images_and_ocr(
             folder / "ocr.json",
             {
                 "schema_version": 1,
-                "engine": "RapidOCR" if engine_ok else "not-installed",
+                "engine": "RapidOCR-cloud" if use_remote else ("RapidOCR" if engine_ok else "not-installed"),
                 "min_confidence": min_confidence,
                 "images": blocks,
             },

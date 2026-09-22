@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=20260922c" />
 </head>
 <body>
   <div class="app">
@@ -22,8 +22,10 @@
       <nav class="nav">
         <button data-page="guide" class="active">使用指南</button>
         <button data-page="task">新建任务</button>
+        <button data-page="academic">学术采样</button>
         <button data-page="monitor">运行监控</button>
         <button data-page="results">采集结果</button>
+        <button data-page="corpus">分析数据集</button>
         <button data-page="settings">设置与登录</button>
       </nav>
       <div class="sidebar-foot">
@@ -64,7 +66,7 @@
             <h3>你会得到什么</h3>
             <ul class="checklist">
               <li>视频：播放 / 点赞 / 投币 / 收藏 / 转发、简介、分P、评论、弹幕</li>
-              <li>语音：优先官方/AI 字幕；否则下载音频，可本地 Whisper 或导出云端清单</li>
+              <li>语音：优先官方/AI 字幕；否则本机 Whisper，或把音频送到你租的云端 GPU</li>
               <li>动态：正文、图片、OCR 文字、评论</li>
               <li>账号：粉丝、关注、获赞、投稿数的<strong>时间序列快照</strong></li>
             </ul>
@@ -115,7 +117,8 @@
             <div><b>③ 本地语音识别</b><p>媒体选“下载音频”，转写选“Whisper 兜底”或“全部重新识别”。没有官方字幕也能得到文字。</p></div>
             <div><b>④ 完整视频归档</b><p>媒体选“下载完整视频”。音频和视频流可断点续传，有 ffmpeg 时自动合并 MP4。</p></div>
             <div><b>⑤ 图片 OCR</b><p>开启“动态图片 OCR”。图片会先校正方向和尺寸，再输出正文、置信度和文字坐标。</p></div>
-            <div><b>⑥ 控制体积</b><p>转写/OCR 完成后可删除本地视频和图片，只留页面链接；或压缩；或 rclone 上传 Google Drive 后再删本地。</p></div>
+            <div><b>⑦ Whisper / OCR 算力</b><p>完整归档和文字研究可以选本机，或把音频和动态图片送到已激活的云端 GPU 工作机。这不是第四种档案类型。</p></div>
+            <div><b>⑧ 学术滚雪球</b><p>「学术采样」从种子视频沿相关推荐扩图。默认门禁：挡住游戏/影视等分区、播放 ≥ 1 万、评论 ≥ 150 或互动比 ≥ 0.003、标签命中就业/学历等。通过的才继续扩，评论写入 <code>data/corpus.db</code>。</p></div>
           </div>
         </article>
 
@@ -178,15 +181,15 @@
               <button type="button" class="preset-card" data-preset="archive">
                 <span class="preset-icon">▣</span>
                 <strong>完整归档</strong>
-                <span class="preset-lead">要能回看原片，同时保留全部文字。</span>
+                <span class="preset-lead">要能回看原片，同时保留全部文字。Whisper / OCR 可跑本机或云端 GPU。</span>
                 <span class="preset-facts">
                   <span><b>下载</b>完整视频（音视频合并成 MP4）</span>
-                  <span><b>转写</b>与文字研究相同：官方字幕 + Whisper</span>
-                  <span><b>之后</b>视频上传 Drive 后删除本地；云盘回看，本机留文字</span>
+                  <span><b>转写</b>官方字幕优先，没有再用 Whisper</span>
+                  <span><b>之后</b>视频上传 Drive 后删除本地；下面再选本机或云端 GPU</span>
                 </span>
               </button>
             </div>
-            <p class="preset-note">后两个方案都会做转写和动态 OCR。真正的差别只有一项：文字研究只处理声音，完整归档会把视频放进 Google Drive。</p>
+            <p class="preset-note">三个方案决定「要什么档案」。Whisper 和 OCR 跑在哪台机器，是完整归档 / 文字研究里的下一步，不是第四种方案。</p>
           </article>
 
           <article class="card">
@@ -194,6 +197,7 @@
             <h3>目标账号与时间</h3>
             <label for="uids">UID 或空间链接，每行一个</label>
             <textarea id="uids" rows="5" placeholder="945267&#10;https://space.bilibili.com/208259"></textarea>
+            <p class="hint">打开 UP 主页，地址栏形如 <code>https://space.bilibili.com/208259</code>，数字就是 UID。可直接整段粘贴链接。一次多个就换行。</p>
             <label class="field-label">采集发布时间范围</label>
             <div class="pills" id="range-pills">
               <button type="button" data-range="3m">近 3 个月</button>
@@ -288,22 +292,39 @@
               </label>
               <label class="choice-card">
                 <input type="radio" name="transcribe-mode" value="official_then_whisper" />
-                <span><strong>官方字幕 + Whisper 兜底</strong><small>先取字幕，缺失时识别本地音频；需要下载音频</small></span>
+                <span><strong>官方字幕 + Whisper 兜底</strong><small>先取字幕，缺失时用 Whisper；跑在本机还是云端 GPU，由下一步决定</small></span>
                 <em>推荐</em>
               </label>
               <label class="choice-card">
                 <input type="radio" name="transcribe-mode" value="whisper" />
-                <span><strong>全部重新识别</strong><small>忽略官方字幕，统一用本地 Whisper；需要下载音频</small></span>
+                <span><strong>全部重新识别</strong><small>忽略官方字幕，统一用 Whisper</small></span>
               </label>
               <label class="choice-card">
                 <input type="radio" name="transcribe-mode" value="url_only" />
-                <span><strong>交给云端</strong><small>生成 cloud_job.json 清单，本机不运行模型</small></span>
+                <span><strong>只写清单</strong><small>本机不识别，只生成 cloud_job.json，供稍后手动处理</small></span>
               </label>
             </div>
             <div class="output-strip">
               <b>转写成果</b>
               <span>transcript.md</span><span>transcript.json</span><span>SRT</span><span>WebVTT</span>
             </div>
+          </article>
+
+          <article class="card" id="compute-card">
+            <p class="step-kicker">步骤 6</p>
+            <h3>Whisper / OCR 跑在哪</h3>
+            <p class="muted">完整归档和文字研究共用这一步。本机 Intel Mac 会很慢；云端 GPU 要先在「设置」里测试连接成功。</p>
+            <div class="choice-grid" id="compute-choices">
+              <label class="choice-card selected">
+                <input type="radio" name="compute-backend" value="local" checked />
+                <span><strong>本机</strong><small>用这台电脑的 CPU，或本机已识别到的 NVIDIA</small></span>
+              </label>
+              <label class="choice-card">
+                <input type="radio" name="compute-backend" value="cloud" />
+                <span><strong>云端 GPU 工作机</strong><small>把音频和动态图片送到已激活的租用卡 / 家里的 4060</small></span>
+              </label>
+            </div>
+            <p class="muted tiny" id="compute-hint"></p>
           </article>
 
           <article class="card launch-card">
@@ -321,6 +342,54 @@
         </form>
       </section>
 
+      <section id="page-academic" class="page" hidden>
+        <article class="card">
+          <h3>滚雪球采样</h3>
+          <p>从<strong>你认为像研究对象的视频</strong>出发，顺着 B 站「相关推荐」一层层扩。只有同时通过分区、播放量、互动比、标签的视频才会继续往外滚，被剪掉的也会记原因，方便交代抽样偏差。</p>
+          <p class="hint">分析单位默认是<strong>评论树</strong>，不下载视频、不跑 Whisper。种子请用真正讨论就业/阶层的稿件，不要用搞笑切片。</p>
+          <label for="academic-seeds">种子（BV 号、视频链接、UID 或空间链接，可混排）</label>
+          <textarea id="academic-seeds" rows="5" placeholder="https://www.bilibili.com/video/BV1xxxxxxxx&#10;BV1yyyyyyyyyy&#10;https://space.bilibili.com/208259"></textarea>
+          <p class="hint">例：复制一条「打工人 / 学历 / 就业」讨论视频的浏览器地址，每行一个。填 UID 时，会取该 UP 时间窗口内最近若干条当种子。</p>
+          <div class="grid-3">
+            <label>最大深度<input id="ac-depth" type="number" min="0" max="4" value="2" /></label>
+            <label>通过门禁的节点上限<input id="ac-nodes" type="number" min="1" max="500" value="80" /></label>
+            <label>每个 UID 取几条当种子<input id="ac-per-uid" type="number" min="1" max="40" value="8" /></label>
+            <label>最低播放量<input id="ac-min-views" type="number" min="0" value="10000" /></label>
+            <label>最低评论数<input id="ac-min-replies" type="number" min="0" value="150" /></label>
+            <label>最低互动比<input id="ac-min-eng" type="number" min="0" step="0.001" value="0.003" /></label>
+            <label>相关推荐条数<input id="ac-related" type="number" min="1" max="40" value="15" /></label>
+            <label>时间窗口
+              <select id="ac-range">
+                <option value="3m">近 3 个月</option>
+                <option value="6m">近 6 个月</option>
+                <option value="9m">近 9 个月</option>
+                <option value="1y" selected>近 1 年</option>
+                <option value="2y">近 2 年</option>
+                <option value="3y">近 3 年</option>
+                <option value="all">全部</option>
+              </select>
+            </label>
+          </div>
+          <p class="hint">深度 2、节点 80 适合试跑。互动比 = 评论数 ÷ 播放量；评论 ≥ 150 <em>或</em> 互动比 ≥ 0.003 即过关。两项都填 0 则关掉这条门禁。</p>
+          <label>分区白名单（可空，空=不限制）<input id="ac-allow" placeholder="知识,资讯,生活" /></label>
+          <p class="hint">只保留这些分区名或 tid。例：<code>知识,资讯</code>。留空则只靠下面的黑名单。</p>
+          <label>分区黑名单<input id="ac-deny" value="游戏,动画,番剧,国创,音乐,舞蹈,影视,娱乐,鬼畜,运动,汽车,时尚,美食" /></label>
+          <p class="hint">标题分区名里出现这些词就剪枝。研究亚文化时务必保留，否则推荐流会滚进游戏和鬼畜。</p>
+          <label>标签/标题必须命中的词<input id="ac-tags" value="就业,学历,失业,薪资,找工作,文凭,体制内,内卷,大厂,职场" /></label>
+          <p class="hint">逗号分隔。视频标签、标题或简介命中其中任一即可。研究「躺平」可改成：<code>躺平,内卷,孔乙己,牛马,阶层</code>。留空则关掉标签门禁。</p>
+          <label>额外关键词（可空）<input id="ac-keyword" placeholder="例如：乡村振兴" /></label>
+          <p class="hint">再收窄标题/简介。一般留空，靠标签词即可。</p>
+          <div class="checks">
+            <label class="choice-card selected"><input type="checkbox" id="ac-comments" checked /> 采集评论树（热评 + 楼中楼）</label>
+            <label class="choice-card"><input type="checkbox" id="ac-danmaku" /> 采集弹幕</label>
+          </div>
+          <div class="actions">
+            <button type="button" class="primary" id="academic-start">开始滚雪球</button>
+            <span class="muted">请先在「设置」登录；匿名评论会被截短。连续风控 5 次会自动停，可续跑。</span>
+          </div>
+        </article>
+      </section>
+
       <section id="page-monitor" class="page" hidden>
         <article class="card">
           <div class="row-between">
@@ -332,9 +401,9 @@
           </div>
           <div class="metrics">
             <div><span>状态</span><b id="m-status">空闲</b></div>
-            <div><span>账号</span><b id="m-uids">0 / 0</b></div>
-            <div><span>视频</span><b id="m-videos-n">0</b></div>
-            <div><span>动态</span><b id="m-dyn-n">0</b></div>
+            <div><span id="m-uids-label">账号</span><b id="m-uids">0 / 0</b></div>
+            <div><span id="m-videos-label">视频</span><b id="m-videos-n">0</b></div>
+            <div><span id="m-dyn-label">动态</span><b id="m-dyn-n">0</b></div>
           </div>
           <p class="muted" id="m-current">尚未开始</p>
         </article>
@@ -361,6 +430,42 @@
         </div>
       </section>
 
+      <section id="page-corpus" class="page" hidden>
+        <article class="card">
+          <div class="row-between">
+            <div>
+              <h3>分析数据集</h3>
+              <p class="muted">SQLite 分析库：作者（性别/学校）、视频、评论 IP、滚雪球边、门禁漏斗。可导出 CSV 或回填已有档案。</p>
+            </div>
+            <div class="actions">
+              <button type="button" class="ghost" id="corpus-refresh">刷新</button>
+              <button type="button" class="ghost" id="corpus-ingest">回填现有档案</button>
+              <button type="button" class="primary" id="corpus-export">导出 CSV</button>
+            </div>
+          </div>
+          <div class="stat-grid" id="corpus-stats"></div>
+        </article>
+        <article class="card">
+          <h3>门禁漏斗</h3>
+          <div id="corpus-funnel" class="muted">暂无</div>
+        </article>
+        <article class="card">
+          <h3>查询</h3>
+          <label>只读 SQL（仅允许 SELECT / WITH）
+            <textarea id="corpus-sql" rows="5" placeholder="SELECT bvid, title, tname, view_count, pass_filter FROM v_video_corpus WHERE pass_filter=1 LIMIT 20"></textarea>
+          </label>
+          <p class="hint">例：一级长评 <code>SELECT content, like_count FROM v_comment_corpus WHERE hierarchy_level='root' AND text_length&gt;=20 LIMIT 50</code>。漏斗：<code>SELECT * FROM v_gate_funnel</code>。推荐边：<code>SELECT * FROM v_snowball_network LIMIT 50</code>。</p>
+          <div class="actions">
+            <button type="button" class="primary" id="corpus-query">执行</button>
+          </div>
+          <div class="table-wrap" id="corpus-query-out"></div>
+        </article>
+        <article class="card">
+          <h3>最近采样任务</h3>
+          <div class="table-wrap" id="corpus-runs"></div>
+        </article>
+      </section>
+
       <section id="page-settings" class="page" hidden>
         <div class="grid-2">
           <article class="card">
@@ -374,8 +479,10 @@
           </article>
           <article class="card">
             <h3>或粘贴 Cookie</h3>
-            <label>从浏览器开发者工具复制整段 Cookie，至少包含 SESSDATA</label>
-            <textarea id="cookie-input" rows="6" placeholder="SESSDATA=...; bili_jct=...; DedeUserID=..."></textarea>
+            <p class="hint">扫码更省事。若要手贴：Chrome 打开 <code>bilibili.com</code> → F12 → Application / 应用 → Cookies → 复制整行。至少要有 <code>SESSDATA</code>、<code>bili_jct</code>、<code>DedeUserID</code>。</p>
+            <label>Cookie 字符串</label>
+            <textarea id="cookie-input" rows="6" placeholder="SESSDATA=abc...; bili_jct=def...; DedeUserID=123456; buvid3=..."></textarea>
+            <p class="hint">例：<code>SESSDATA=12ab%2C1234567890%2Cxy...; bili_jct=1a2b3c; DedeUserID=208259</code>。不要发到网上，只保存在本机。</p>
             <button type="button" class="ghost" id="save-cookie">保存 Cookie</button>
             <p class="muted tiny" id="cookie-preview"></p>
           </article>
@@ -443,9 +550,49 @@
                 <option value="80">1080P</option>
               </select>
             </label>
-            <label>rclone 远程名<input id="rclone-remote" placeholder="gdrive" /></label>
+            <label>rclone 远程名<input id="rclone-remote" placeholder="googledrive" /></label>
             <label>Drive 目录<input id="rclone-root" placeholder="BiliArchiver" /></label>
           </div>
+          <p class="hint">远程名必须和你在终端 <code>rclone config</code> 里起的名字一致。本机若已配好 Google Drive，常见是 <code>gdrive</code> 或 <code>googledrive</code>。目录是网盘上的文件夹，例：<code>BiliArchiver</code>。</p>
+        </article>
+        <article class="card">
+          <h3>AutoDL 一键接入</h3>
+          <p class="muted">爬虫仍在本机。你只要把 AutoDL 实例页的 <strong>SSH 登录指令</strong>和<strong>密码</strong>贴进来。不要改端口、不要自己 ssh。</p>
+          <label>SSH 登录指令
+            <input id="autodl-ssh" placeholder="ssh -p 12345 root@region-9.seetacloud.com" autocomplete="off" />
+          </label>
+          <p class="hint">到 AutoDL 控制台 → 你的实例 → 复制「SSH 登录指令」整行。例：<code>ssh -p 38491 root@connect.bjb1.seetacloud.com</code>。端口因实例而异，不要填 22。</p>
+          <label>SSH 密码
+            <input id="autodl-password" type="password" placeholder="实例页显示的登录密码" autocomplete="off" />
+          </label>
+          <p class="hint">同一页上的「登录密码」，不是你的 AutoDL 账号密码。</p>
+          <p class="muted tiny" id="autodl-preview">尚未保存</p>
+          <div class="actions">
+            <button type="button" class="primary" id="autodl-connect">一键接入</button>
+            <button type="button" class="ghost" id="autodl-disconnect">断开隧道</button>
+          </div>
+          <pre id="autodl-log" class="log autodl-log" role="log" aria-live="polite"></pre>
+          <details class="manual-gpu">
+            <summary>高级：手动填写工作机 URL / Token</summary>
+            <p class="muted">一般不用打开。隧道通了会自动填好下面两项。</p>
+            <pre class="code" id="gpu-worker-command">python tools/gpu_worker.py --host 0.0.0.0 --port 6006 --token 请先生成Token --model large-v3</pre>
+            <div class="grid-3">
+              <label>工作机 URL
+                <input id="gpu-worker-url" placeholder="一键接入后自动变成 http://127.0.0.1:6006" />
+              </label>
+              <label>Token
+                <input id="gpu-worker-token" placeholder="可留空，接入时自动生成" />
+              </label>
+              <label class="checks" style="align-items:center">
+                <span id="gpu-worker-preview">尚未激活</span>
+              </label>
+            </div>
+            <div class="actions">
+              <button type="button" class="ghost" id="gpu-gen-token">生成 Token</button>
+              <button type="button" class="ghost" id="copy-gpu-command">复制启动命令</button>
+              <button type="button" class="ghost" id="gpu-test">测试连接</button>
+            </div>
+          </details>
         </article>
         <article class="card">
           <h3>手机进度提醒（Bark）</h3>
@@ -456,10 +603,11 @@
             </label>
             <label>标题<input id="bark-title" placeholder="b站爬虫" /></label>
             <label>铃声<input id="bark-sound" placeholder="bell" /></label>
-            <label>Bark Key 或完整链接
-              <input id="bark-key" placeholder="粘贴 Key，或 https://api.day.app/你的Key/..." />
+            <label>Bark Key 或完整推送链接
+              <input id="bark-key" placeholder="https://api.day.app/YourKeyHere/标题/内容" />
             </label>
           </div>
+          <p class="hint">iPhone 安装 Bark 后，App 里能看到一串 Key，或一条 <code>https://api.day.app/xxxx/</code> 链接。两种都可以整段粘贴。没有 iPhone 就留空并关掉「启用推送」。</p>
           <p class="muted tiny" id="bark-preview"></p>
           <div class="actions">
             <button type="button" class="primary" id="save-settings">保存设置</button>
@@ -473,6 +621,6 @@
     </main>
   </div>
     <div id="toast" role="status" aria-live="polite"></div>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20260922c"></script>
 </body>
 </html>

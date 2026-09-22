@@ -5,9 +5,10 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 
 from bili.client import BiliClient
+from bili.corpus import Corpus
 from bili.export import (
     account_dir,
     dynamic_dir,
@@ -34,6 +35,23 @@ ProgressFn = Callable[[dict[str, Any]], Awaitable[None] | None]
 def _line_count(path: Path) -> int:
     with path.open("rb") as fh:
         return sum(1 for line in fh if line.strip())
+
+
+def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
+    """Read a sidecar back row by row; corrupt lines are skipped, not fatal."""
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                yield row
 
 
 def extract_dynamic(item: dict[str, Any]) -> dict[str, Any]:
@@ -97,6 +115,7 @@ class JobConfig:
     job_id: str = ""
     rclone_remote: str = "gdrive"
     rclone_root: str = "BiliArchiver"
+    compute_backend: str = "local"
 
 
 @dataclass
@@ -107,11 +126,21 @@ class Crawler:
     on_log: LogFn = field(default=lambda *_a, **_k: None)
     should_cancel: Callable[[], bool] = field(default=lambda: False)
     cancelled: bool = False
+    corpus: Corpus | None = None
 
     def _is_cancelled(self) -> bool:
         if self.should_cancel():
             self.cancelled = True
         return self.cancelled
+
+    def _corpus_guard(self, label: str, action: Callable[[Corpus], Any]) -> None:
+        """Dataset writes must never be able to break the archive pipeline."""
+        if self.corpus is None:
+            return
+        try:
+            action(self.corpus)
+        except Exception as exc:
+            self.on_log("warn", f"数据集写入{label}失败（归档不受影响）：{exc}")
 
     async def _write_async_jsonl(
         self,
@@ -166,6 +195,22 @@ class Crawler:
                 if hasattr(maybe, "__await__"):
                     await maybe
 
+        if config.job_id:
+            self._corpus_guard(
+                "任务登记",
+                lambda c: c.start_run(
+                    config.job_id,
+                    "archive",
+                    {
+                        "uids": config.uids,
+                        "time_range": config.time_range,
+                        "transcribe_mode": config.transcribe_mode,
+                        "compute_backend": config.compute_backend,
+                    },
+                    label=f"UP 主归档 · {len(config.uids)} 个账号",
+                ),
+            )
+
         try:
             await client.bootstrap()
             for uid in config.uids:
@@ -181,6 +226,9 @@ class Crawler:
             await emit()
             return progress
         finally:
+            if config.job_id:
+                status = "cancelled" if self.cancelled else "done"
+                self._corpus_guard("任务收尾", lambda c: c.finish_run(config.job_id, status))
             await client.close()
 
     async def _crawl_uid(self, client: BiliClient, config: JobConfig, uid: str, progress: dict, emit) -> None:
@@ -199,7 +247,9 @@ class Crawler:
             "face": acc.get("face") or acc_info.get("face") or "",
             "level": (acc.get("level_info") or {}).get("current_level") or acc_info.get("level"),
             "official": acc.get("official") or acc_info.get("official") or {},
-            "sex": acc.get("sex") or acc_info.get("sex"),
+            "sex": acc.get("sex") or acc_info.get("sex") or "",
+            "school": (acc_info.get("school") or {}).get("name") or "",
+            "birthday": acc_info.get("birthday") or "",
             "space_url": f"https://space.bilibili.com/{uid}",
             "updated_at": now_iso(),
         }
@@ -214,6 +264,11 @@ class Crawler:
             "raw_json": json.dumps({"card": card, "relation": relation, "upstat": upstat, "navnum": navnum}, ensure_ascii=False),
         }
         acc_dir = account_dir(self.library, uid, name)
+        self._corpus_guard("账号资料", lambda c: c.upsert_author(profile))
+        self._corpus_guard(
+            "账号快照",
+            lambda c: c.add_author_snapshot(snapshot, run_id=config.job_id),
+        )
         if config.crawl_profile:
             self.store.upsert_account(profile)
             self.store.add_snapshot(snapshot)
@@ -301,7 +356,9 @@ class Crawler:
         listing: dict[str, Any],
     ) -> dict[str, Any]:
         bvid = listing["bvid"]
-        detail = await client.get_view_detail(bvid)
+        detail = listing.get("_detail") if isinstance(listing.get("_detail"), dict) else None
+        if not detail:
+            detail = await client.get_view_detail(bvid)
         view = detail.get("View") or {}
         stat = view.get("stat") or {}
         pages = view.get("pages") or [{"cid": view.get("cid"), "page": 1, "part": view.get("title"), "duration": view.get("duration")}]
@@ -401,7 +458,8 @@ class Crawler:
             part_folder.mkdir(parents=True, exist_ok=True)
             part_pipeline = PipelineState.load(part_folder)
             transcript_signature = (
-                f"v2:{config.transcribe_mode}:model={self.settings.whisper_model}:"
+                f"v2:{config.transcribe_mode}:backend={config.compute_backend}:"
+                f"model={self.settings.whisper_model}:"
                 f"lang={self.settings.whisper_language}:cid={cid}"
             )
             transcript_outputs = [part_folder / "transcript.md", part_folder / "transcript.json"]
@@ -474,6 +532,9 @@ class Crawler:
                     whisper_language=self.settings.whisper_language,
                     whisper_device=self.settings.whisper_device,
                     whisper_compute_type=self.settings.whisper_compute_type,
+                    gpu_worker_url=self.settings.gpu_worker_url,
+                    gpu_worker_token=self.settings.gpu_worker_token,
+                    compute_backend=config.compute_backend,
                     should_cancel=self._is_cancelled,
                     on_log=self.on_log,
                 )
@@ -607,8 +668,111 @@ class Crawler:
             "captured_at": captured,
         }
         self.store.upsert_video(row)
+        self._ingest_video_corpus(config, uid, folder, meta, part_results)
         self.on_log("ok", f"视频完成 {bvid} · 评 {comment_count} · 弹幕 {danmaku_count}")
         return row
+
+    def _ingest_video_corpus(
+        self,
+        config: JobConfig,
+        uid: str,
+        folder: Path,
+        meta: dict[str, Any],
+        part_results: list[dict[str, Any]],
+    ) -> None:
+        """Mirror one finished video into the relational dataset.
+
+        Reads the JSONL sidecars back rather than the in-memory slice, so a resumed
+        run that reused comments/danmaku still lands them in the corpus.
+        """
+        if self.corpus is None:
+            return
+        bvid = str(meta.get("bvid") or "")
+        if not bvid:
+            return
+        owner = meta.get("owner") or {}
+        stat = meta.get("stat") or {}
+        aid = None
+        try:
+            aid = int(meta.get("aid") or 0) or None
+        except (TypeError, ValueError):
+            aid = None
+
+        self._corpus_guard(
+            f"视频 {bvid}",
+            lambda c: c.upsert_video(
+                {
+                    "bvid": bvid,
+                    "aid": meta.get("aid"),
+                    "cid": meta.get("cid"),
+                    "mid": uid,
+                    "author_name": owner.get("name") or "",
+                    "title": meta.get("title"),
+                    "description": meta.get("desc"),
+                    "tid": meta.get("tid"),
+                    "tname": meta.get("tname"),
+                    "pubdate": meta.get("pubdate"),
+                    "duration": meta.get("duration"),
+                    "view_count": stat.get("view"),
+                    "like_count": stat.get("like"),
+                    "coin_count": stat.get("coin"),
+                    "favorite_count": stat.get("favorite"),
+                    "share_count": stat.get("share"),
+                    "reply_count": stat.get("reply"),
+                    "danmaku_count": stat.get("danmaku"),
+                    "tags": meta.get("tags") or [],
+                    "pages": meta.get("pages") or [],
+                    "page_count": len(meta.get("pages") or []) or 1,
+                    "page_url": meta.get("page_url"),
+                    "discovery": "space",
+                    "run_id": config.job_id,
+                    "captured_at": meta.get("captured_at"),
+                }
+            ),
+        )
+
+        comments_path = folder / "comments.jsonl"
+        if comments_path.exists():
+            self._corpus_guard(
+                f"评论 {bvid}",
+                lambda c: c.upsert_comments(
+                    iter_jsonl(comments_path),
+                    target_kind="video",
+                    target_id=bvid,
+                    bvid=bvid,
+                    aid=aid,
+                    run_id=config.job_id,
+                ),
+            )
+
+        danmaku_path = folder / "danmaku.jsonl"
+        if danmaku_path.exists():
+            self._corpus_guard(
+                f"弹幕 {bvid}",
+                lambda c: c.upsert_danmaku(iter_jsonl(danmaku_path), run_id=config.job_id),
+            )
+
+        for part in part_results:
+            part_folder = Path(part.get("folder") or folder)
+            transcript_json = part_folder / "transcript.json"
+            if not transcript_json.exists():
+                continue
+            try:
+                payload = json.loads(transcript_json.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict) or payload.get("multipart"):
+                continue
+            self._corpus_guard(
+                f"转写 {bvid}",
+                lambda c, p=payload, part=part: c.upsert_transcript(
+                    bvid=bvid,
+                    cid=int(part.get("cid") or 0),
+                    page=int(part.get("page") or 1),
+                    payload=p,
+                    run_id=config.job_id,
+                ),
+            )
 
     async def _crawl_dynamic(
         self,
@@ -624,7 +788,10 @@ class Crawler:
         write_json(folder / "meta.json", dyn)
         pipeline = PipelineState.load(folder)
         pipeline.mark("metadata", "v2", "done", captured_at=captured)
-        ocr_signature = f"v2:enabled={int(config.ocr_enabled)}:min={self.settings.ocr_min_confidence}"
+        ocr_signature = (
+            f"v2:enabled={int(config.ocr_enabled)}:min={self.settings.ocr_min_confidence}"
+            f":backend={config.compute_backend}"
+        )
         ocr_outputs = [folder / "ocr.json"] if dyn.get("pictures") else []
         if config.resume and pipeline.completed("ocr", ocr_signature, ocr_outputs):
             try:
@@ -641,6 +808,9 @@ class Crawler:
                 enabled=config.ocr_enabled,
                 on_log=self.on_log,
                 min_confidence=self.settings.ocr_min_confidence,
+                compute_backend=config.compute_backend,
+                gpu_worker_url=self.settings.gpu_worker_url,
+                gpu_worker_token=self.settings.gpu_worker_token,
             )
             pipeline.mark("ocr", ocr_signature, "done", images=len(ocr_blocks))
         reclaim_folder(
@@ -691,5 +861,22 @@ class Crawler:
             "captured_at": captured,
         }
         self.store.upsert_dynamic(row)
+        dyn_payload = dict(dyn)
+        dyn_payload["mid"] = uid
+        self._corpus_guard(
+            f"动态 {dyn['dyn_id']}",
+            lambda c: c.upsert_dynamic(dyn_payload, ocr_blocks, run_id=config.job_id),
+        )
+        comments_path = folder / "comments.jsonl"
+        if comments_path.exists():
+            self._corpus_guard(
+                f"动态评论 {dyn['dyn_id']}",
+                lambda c: c.upsert_comments(
+                    iter_jsonl(comments_path),
+                    target_kind="dynamic",
+                    target_id=str(dyn["dyn_id"]),
+                    run_id=config.job_id,
+                ),
+            )
         self.on_log("ok", f"动态完成 {dyn['dyn_id']}")
         return row

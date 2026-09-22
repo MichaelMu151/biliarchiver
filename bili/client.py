@@ -326,13 +326,28 @@ class BiliClient:
             pn += 1
 
     async def get_view_detail(self, bvid: str) -> dict[str, Any]:
+        """Prefer view/detail so Tags travel with View; fall back to view."""
         referer = f"https://www.bilibili.com/video/{bvid}"
         data = await self.get_json(
-            "https://api.bilibili.com/x/web-interface/wbi/view",
+            "https://api.bilibili.com/x/web-interface/wbi/view/detail",
             params={"bvid": bvid},
             wbi=True,
             referer=referer,
         )
+        if data.get("code") != 0:
+            data = await self.get_json(
+                "https://api.bilibili.com/x/web-interface/view/detail",
+                params={"bvid": bvid},
+                wbi=False,
+                referer=referer,
+            )
+        if data.get("code") != 0:
+            data = await self.get_json(
+                "https://api.bilibili.com/x/web-interface/wbi/view",
+                params={"bvid": bvid},
+                wbi=True,
+                referer=referer,
+            )
         if data.get("code") != 0:
             data = await self.get_json(
                 "https://api.bilibili.com/x/web-interface/view",
@@ -344,7 +359,7 @@ class BiliClient:
         payload = data.get("data") or {}
         if "View" in payload:
             return payload
-        return {"View": payload}
+        return {"View": payload, "Tags": payload.get("tag") or payload.get("Tags") or []}
 
     async def iter_comments(
         self,
@@ -417,7 +432,7 @@ class BiliClient:
             yield row
         children = reply.get("replies") or []
         for child in children:
-            crow = self._comment_row(child, oid, ctype, parent=rpid or "")
+            crow = self._comment_row(child, oid, ctype, parent=rpid or "", root=rpid or "")
             if crow.get("rpid") and crow["rpid"] not in seen:
                 seen.add(crow["rpid"])
                 yield crow
@@ -436,7 +451,7 @@ class BiliClient:
                 if not batch:
                     break
                 for child in batch:
-                    crow = self._comment_row(child, oid, ctype, parent=rpid)
+                    crow = self._comment_row(child, oid, ctype, parent=rpid, root=rpid)
                     if crow.get("rpid") and crow["rpid"] not in seen:
                         seen.add(crow["rpid"])
                         yield crow
@@ -446,23 +461,58 @@ class BiliClient:
                     break
                 pn += 1
 
-    def _comment_row(self, reply: dict[str, Any], oid: str, ctype: int, parent: str) -> dict[str, Any]:
+    def _comment_row(
+        self,
+        reply: dict[str, Any],
+        oid: str,
+        ctype: int,
+        parent: str,
+        root: str = "",
+    ) -> dict[str, Any]:
         member = reply.get("member") or {}
         content = reply.get("content") or {}
+        api_root = str(reply.get("root") or "")
+        api_parent = str(reply.get("parent") or "")
+        resolved_root = root or (api_root if api_root not in {"", "0"} else "")
+        resolved_parent = api_parent if api_parent not in {"", "0"} else parent
         return {
             "oid": str(oid),
             "type": ctype,
             "rpid": str(reply.get("rpid") or ""),
-            "parent_rpid": str(parent or reply.get("parent") or ""),
+            "root_rpid": resolved_root or "0",
+            "parent_rpid": str(resolved_parent or "0"),
+            "hierarchy_level": "root" if not resolved_root else "reply",
             "mid": str(member.get("mid") or ""),
             "uname": member.get("uname") or "",
             "level": pick(member, "level_info", "current_level"),
             "sex": member.get("sex") or "",
             "message": content.get("message") or "",
             "like": reply.get("like") or 0,
+            "rcount": reply.get("rcount") or 0,
             "ctime": reply.get("ctime") or 0,
             "ip_location": reply.get("reply_control", {}).get("location") or "",
         }
+
+    async def get_related(self, bvid: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Algorithmic recommendation neighbours; the edges of the snowball graph."""
+        data = await self.get_json(
+            "https://api.bilibili.com/x/web-interface/archive/related",
+            params={"bvid": bvid},
+            wbi=False,
+            referer=f"https://www.bilibili.com/video/{bvid}",
+        )
+        if data.get("code") != 0:
+            self.on_log("warn", f"相关推荐 {bvid} 失败：{data.get('message')}")
+            return []
+        items = data.get("data") or []
+        out: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict) or not item.get("bvid"):
+                continue
+            out.append(item)
+            if limit and len(out) >= limit:
+                break
+        return out
 
     async def get_danmaku(self, cid: int, duration: int, aid: int | None = None) -> list[dict[str, Any]]:
         segs = max(1, (int(duration) + 359) // 360)

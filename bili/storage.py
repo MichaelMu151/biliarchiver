@@ -127,7 +127,12 @@ def should_fetch_media(
     if (
         media_mode == "video"
         and media_keep == "delete_after_text"
-        and transcribe_mode in {"whisper", "official_then_whisper"}
+        and transcribe_mode in {
+            "whisper",
+            "official_then_whisper",
+            "cloud_gpu",
+            "official_then_cloud",
+        }
         and not transcript_done
     ):
         return "audio"

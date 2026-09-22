@@ -135,6 +135,8 @@ li { margin: 8px 0; color: #d5deec; }
 }
 
 label { display: block; color: #c5d0e0; font-size: 13px; margin-bottom: 10px; }
+.hint { color: var(--muted); font-size: 12px; line-height: 1.55; margin: 0 0 12px; }
+.hint code { font-size: 11px; }
 textarea, input, select {
   width: 100%; margin-top: 6px;
   background: #0e1420; color: var(--text);
@@ -171,6 +173,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   gap: 12px;
 }
 .preset-grid { grid-template-columns: repeat(3, 1fr); }
+.compact-steps { margin: 0 0 12px; padding-left: 1.2em; }
+.compact-steps li { margin: 0.35em 0; }
 .preset-card {
   display: flex;
   min-height: 0;
@@ -306,6 +310,41 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
 .metrics span { color: var(--muted); font-size: 12px; display: block; }
 .metrics b { font-size: 20px; }
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+.stat-chip {
+  background: #0e1420;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px;
+}
+.stat-chip b { display: block; font-size: 20px; }
+.stat-chip span { color: var(--muted); font-size: 12px; }
+.table-wrap { overflow: auto; margin-top: 12px; }
+.table-wrap table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.table-wrap th, .table-wrap td {
+  border-bottom: 1px solid var(--line);
+  padding: 8px 10px;
+  text-align: left;
+  white-space: nowrap;
+}
+.table-wrap th { color: var(--muted); font-weight: 600; }
+.funnel-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.funnel-chip {
+  display: inline-block;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: #0e1420;
+  border: 1px solid var(--line);
+  font-size: 13px;
+}
+.funnel-chip.ok { border-color: rgba(61, 214, 140, 0.4); color: var(--green); }
+.funnel-chip.warn { border-color: rgba(245, 193, 74, 0.4); color: var(--warn); }
 .log-card { margin-top: 16px; }
 .log {
   height: 360px; overflow: auto; background: #090d14; border-radius: 12px;
@@ -316,6 +355,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .log .warn { color: var(--warn); }
 .log .error { color: var(--err); }
 .log .info { color: var(--blue); }
+.autodl-log { height: 220px; margin-top: 12px; }
+.manual-gpu { margin-top: 16px; color: var(--muted); }
+.manual-gpu summary { cursor: pointer; margin-bottom: 10px; }
 
 .split { display: grid; grid-template-columns: 320px 1fr; gap: 16px; min-height: 620px; }
 .account-list { display: flex; flex-direction: column; gap: 8px; max-height: 640px; overflow: auto; }
