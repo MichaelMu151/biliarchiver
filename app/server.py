@@ -538,8 +538,8 @@ class AcademicJobIn(BaseModel):
     seeds_per_uid: int = 8
     crawl_comments: bool = True
     crawl_danmaku: bool = False
-    transcribe_mode: str = "none"
-    media_mode: str = "link"
+    transcribe_mode: str = "official_then_whisper"
+    media_mode: str = "audio"
     media_keep: str = "delete_after_text"
     resume: bool = True
     compute_backend: str = "local"
@@ -556,7 +556,25 @@ async def create_academic_job(body: AcademicJobIn) -> dict[str, Any]:
         raise HTTPException(400, "深度请放在 0–4")
     if body.max_nodes < 1 or body.max_nodes > 500:
         raise HTTPException(400, "节点上限请放在 1–500")
+    if body.media_mode not in {"none", "link", "audio", "video"}:
+        raise HTTPException(400, "媒体策略无效")
+    if body.transcribe_mode not in TRANSCRIBE_MODES:
+        raise HTTPException(400, "转写策略无效")
     transcribe_mode, compute_backend = resolve_compute(body.transcribe_mode, body.compute_backend)
+    if transcribe_mode in LOCAL_WHISPER and body.media_mode not in {"audio", "video"}:
+        raise HTTPException(400, "语音识别需要音频：请把媒体策略改为“下载音频”或“下载视频”")
+    if needs_remote_models(transcribe_mode, compute_backend, False):
+        settings_now = load_settings()
+        ok, message = gpu_worker_ready(settings_now.gpu_worker_url, settings_now.gpu_worker_token)
+        if not ok:
+            raise HTTPException(400, message)
+    if body.media_keep not in KEEP_POLICIES:
+        raise HTTPException(400, "空间策略无效")
+    if body.media_keep == "upload_then_delete":
+        settings_now = load_settings()
+        ok, message = rclone_drive_ready(settings_now.rclone_remote)
+        if not ok:
+            raise HTTPException(400, message)
     job_id = uuid.uuid4().hex[:12]
     config = body.model_dump()
     config["kind"] = "academic"
@@ -841,8 +859,8 @@ async def _execute_job(job: JobRuntime) -> None:
             seeds_per_uid=int(job.config.get("seeds_per_uid") or 8),
             crawl_comments=bool(job.config.get("crawl_comments", True)),
             crawl_danmaku=bool(job.config.get("crawl_danmaku", False)),
-            transcribe_mode=job.config.get("transcribe_mode") or "none",
-            media_mode=job.config.get("media_mode") or "link",
+            transcribe_mode=job.config.get("transcribe_mode") or "official_then_whisper",
+            media_mode=job.config.get("media_mode") or "audio",
             media_keep=job.config.get("media_keep") or "delete_after_text",
             resume=bool(job.config.get("resume", True)),
             compute_backend=job.config.get("compute_backend") or "local",

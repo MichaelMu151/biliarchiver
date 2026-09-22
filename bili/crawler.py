@@ -116,6 +116,7 @@ class JobConfig:
     rclone_remote: str = "gdrive"
     rclone_root: str = "BiliArchiver"
     compute_backend: str = "local"
+    discovery: str = "space"
 
 
 @dataclass
@@ -724,7 +725,7 @@ class Crawler:
                     "pages": meta.get("pages") or [],
                     "page_count": len(meta.get("pages") or []) or 1,
                     "page_url": meta.get("page_url"),
-                    "discovery": "space",
+                    "discovery": config.discovery or "space",
                     "run_id": config.job_id,
                     "captured_at": meta.get("captured_at"),
                 }

@@ -5,7 +5,7 @@
 仓库：https://github.com/MichaelMu151/biliarchiver-windows  
 （从 https://github.com/MichaelMu151/biliarchiver 分出，功能相同，安装路径按 Windows / CUDA 写。）
 
-Mac 请看主仓库 README。
+Mac 请看主仓库 README。装完 Windows 之后，登录、Bark、网盘、学术采样逐步操作全部跟主 [README.md](README.md) 从第 2 节往下做，两边界面相同。
 
 ## 这台机器上要改什么
 
@@ -74,9 +74,9 @@ python run.py
 | 依赖 | `requirements-ai.txt` | `requirements-gpu-windows.txt` |
 | 路径 | POSIX | 同样用 pathlib，中文目录可用 |
 
-采集逻辑、产物目录、空间策略（提取后删除 / 压缩 / 上传 Google Drive）两边一样。数据仍在本机 `data\library\`。界面里 UID、Cookie、Bark、rclone、AutoDL、学术采样门禁该填什么，见主 [README.md](README.md)「界面里该填什么」。
+采集逻辑、产物目录、空间策略（提取后删除 / 压缩 / 上传 Google Drive）两边一样。数据仍在本机 `data\library\`。界面里每一项设置是干什么的、该怎么填，见主 [README.md](README.md)。
 
-学术采样默认不下载视频、不跑 Whisper；评论树和分析漏斗在 `data\corpus.db`。
+学术采样默认同时采**视频转写**和**评论树**；分析库在 `data\corpus.db`。
 
 ## 采集结果去哪找
 

@@ -291,6 +291,14 @@ class AcademicCorpusTests(unittest.TestCase):
         _, reason, _ = evaluate_gate({**base, "title": "今日天气"}, config, 0, tags=["风景"])
         self.assertEqual(reason, "tags")
 
+    def test_academic_defaults_include_video_transcripts(self) -> None:
+        from bili.academic import AcademicConfig
+
+        config = AcademicConfig(job_id="t")
+        self.assertEqual(config.transcribe_mode, "official_then_whisper")
+        self.assertEqual(config.media_mode, "audio")
+        self.assertTrue(config.crawl_comments)
+
     def test_corpus_topology_does_not_wipe_stats(self) -> None:
         from bili.corpus import Corpus
 
@@ -313,6 +321,10 @@ class AcademicCorpusTests(unittest.TestCase):
             self.assertEqual(row["discovery"], "snowball")
             self.assertEqual(row["depth"], 1)
             self.assertEqual(row["pass_filter"], 1)
+            views = db.query("SELECT name FROM sqlite_master WHERE type='view'")
+            names = {row["name"] for row in views}
+            self.assertIn("v_transcript_corpus", names)
+            self.assertIn("v_comment_corpus", names)
             created = db.query("SELECT captured_at FROM videos LIMIT 1")
             self.assertTrue(created)
             with self.assertRaises(ValueError):

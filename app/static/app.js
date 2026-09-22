@@ -1,7 +1,7 @@
 const titles = {
   guide: ["使用指南", "把 UID 变成可检索的档案、Markdown 和可续跑的任务。"],
   task: ["新建任务", "选择账号、时间窗口和要采集的模块。"],
-  academic: ["学术采样", "从种子视频或账号滚雪球，门禁记录写入分析库。"],
+  academic: ["学术采样", "从种子视频滚雪球：视频转写、评论树和推荐图一起写入分析库。"],
   monitor: ["运行监控", "看进度、日志，必要时取消。"],
   results: ["采集结果", "浏览账号快照、视频 Markdown 和动态 OCR。"],
   corpus: ["分析数据集", "作者、视频、评论、推荐边和门禁漏斗，可导出 CSV。"],
@@ -50,7 +50,9 @@ document.querySelectorAll(".choice-card input").forEach((input) => {
   input.addEventListener("change", () => {
     syncChoiceCards();
     enforceCompatibleChoices(input.name);
+    enforceAcademicChoices(input.name);
     updatePlanSummary();
+    updateAcademicHints();
   });
 });
 
@@ -105,6 +107,41 @@ function enforceCompatibleChoices(changedName) {
   } else if (changedName === "media-mode" && needsAudio && !["audio", "video"].includes(media)) {
     setRadio("transcribe-mode", "official");
     toast("未下载音频时，已改为只提取官方字幕");
+  }
+}
+
+function enforceAcademicChoices(changedName) {
+  if (!$("academic-start")) return;
+  const wantTranscript = $("ac-transcript")?.checked !== false;
+  if ($("ac-transcribe-card")) $("ac-transcribe-card").hidden = !wantTranscript;
+  if (!wantTranscript) return;
+  const media = radioValue("ac-media-mode") || "audio";
+  const transcript = radioValue("ac-transcribe-mode") || "official_then_whisper";
+  const needsAudio = ["whisper", "official_then_whisper"].includes(transcript);
+  if (changedName === "ac-transcribe-mode" && needsAudio && !["audio", "video"].includes(media)) {
+    setRadio("ac-media-mode", "audio");
+    toast("学术采样已改为下载音频，才能跑 Whisper");
+  } else if (changedName === "ac-media-mode" && needsAudio && !["audio", "video"].includes(media)) {
+    setRadio("ac-transcribe-mode", "official");
+    toast("未下载音频时，学术采样改为只取官方字幕");
+  }
+}
+
+function updateAcademicHints() {
+  const hint = $("ac-compute-hint");
+  if (!hint) return;
+  const transcript = radioValue("ac-transcribe-mode") || "official_then_whisper";
+  const compute = radioValue("ac-compute-backend") || "local";
+  if (!["whisper", "official_then_whisper"].includes(transcript)) {
+    hint.textContent = "只取官方字幕时不需要 GPU。";
+    return;
+  }
+  if (compute === "cloud") {
+    hint.textContent = capabilities?.gpu_worker?.ready
+      ? capabilities.gpu_worker.purpose
+      : "尚未接入云端 GPU：到设置粘贴 AutoDL 的 SSH 指令和密码，点一键接入，测通后再选云端。";
+  } else {
+    hint.textContent = "本机没有 NVIDIA 时 Whisper 走 CPU，一条长视频可能要十几分钟。";
   }
 }
 
@@ -201,6 +238,12 @@ $("cancel-btn").addEventListener("click", async () => {
 
 $("academic-start")?.addEventListener("click", async () => {
   try {
+    const wantTranscript = $("ac-transcript")?.checked !== false;
+    let transcribe = wantTranscript ? (radioValue("ac-transcribe-mode") || "official_then_whisper") : "none";
+    let media = wantTranscript ? (radioValue("ac-media-mode") || "audio") : "link";
+    if (["whisper", "official_then_whisper"].includes(transcribe) && !["audio", "video"].includes(media)) {
+      media = "audio";
+    }
     const res = await api("/api/jobs/academic", {
       method: "POST",
       body: {
@@ -219,9 +262,10 @@ $("academic-start")?.addEventListener("click", async () => {
         seeds_per_uid: Number($("ac-per-uid").value),
         crawl_comments: $("ac-comments").checked,
         crawl_danmaku: $("ac-danmaku").checked,
-        transcribe_mode: "none",
-        media_mode: "link",
-        compute_backend: radioValue("compute-backend") || "local",
+        transcribe_mode: transcribe,
+        media_mode: media,
+        media_keep: radioValue("ac-media-keep") || "delete_after_text",
+        compute_backend: radioValue("ac-compute-backend") || "local",
       },
     });
     currentJobId = res.id;
@@ -501,6 +545,7 @@ async function loadCapabilities() {
     const free = capabilities.disk.free_bytes / 1024 / 1024 / 1024;
     $("install-command").textContent = `可用磁盘 ${free.toFixed(1)} GB\n${capabilities.pip_command}`;
     updatePlanSummary();
+    updateAcademicHints();
   } catch (err) {
     $("capability-grid").innerHTML = `<p class="muted">${escapeHtml(err.message)}</p>`;
   }
@@ -550,6 +595,7 @@ loadSettings();
 loadCapabilities();
 syncChoiceCards();
 updatePlanSummary();
+updateAcademicHints();
 $("m-ocr").addEventListener("change", updatePlanSummary);
 $("bark-test")?.addEventListener("click", async () => {
   try {

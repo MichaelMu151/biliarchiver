@@ -24,7 +24,7 @@ from typing import Any, Iterable, Iterator, Sequence
 from bili.paths import CORPUS_DB_PATH, ensure_dirs
 from bili.util import now_iso, ts_iso
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -331,6 +331,17 @@ CREATE VIEW v_gate_funnel AS
 SELECT run_id, passed, COALESCE(reason, 'pass') AS reason, COUNT(*) AS n
 FROM gate_decisions
 GROUP BY run_id, passed, COALESCE(reason, 'pass');
+
+DROP VIEW IF EXISTS v_transcript_corpus;
+CREATE VIEW v_transcript_corpus AS
+SELECT
+  t.bvid, t.cid, t.page, t.source, t.language,
+  t.segment_count, t.char_count, t.full_text, t.run_id,
+  v.title AS video_title, v.tname AS video_category, v.tid AS video_tid,
+  v.view_count AS video_view, v.depth AS snowball_depth,
+  v.pass_filter, v.seed_bvid, v.parent_bvid
+FROM transcripts t
+LEFT JOIN videos v ON v.bvid = t.bvid;
 """
 
 CORPUS_TABLES = (
@@ -351,7 +362,13 @@ CORPUS_TABLES = (
     "transcript_segments",
 )
 
-EXPORTABLE_VIEWS = ("v_video_corpus", "v_comment_corpus", "v_snowball_network", "v_gate_funnel")
+EXPORTABLE_VIEWS = (
+    "v_video_corpus",
+    "v_comment_corpus",
+    "v_transcript_corpus",
+    "v_snowball_network",
+    "v_gate_funnel",
+)
 
 
 def _text_length(value: Any) -> int:

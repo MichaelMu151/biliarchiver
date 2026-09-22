@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=20260922c" />
+  <link rel="stylesheet" href="/static/styles.css?v=20260922d" />
 </head>
 <body>
   <div class="app">
@@ -118,7 +118,7 @@
             <div><b>④ 完整视频归档</b><p>媒体选“下载完整视频”。音频和视频流可断点续传，有 ffmpeg 时自动合并 MP4。</p></div>
             <div><b>⑤ 图片 OCR</b><p>开启“动态图片 OCR”。图片会先校正方向和尺寸，再输出正文、置信度和文字坐标。</p></div>
             <div><b>⑦ Whisper / OCR 算力</b><p>完整归档和文字研究可以选本机，或把音频和动态图片送到已激活的云端 GPU 工作机。这不是第四种档案类型。</p></div>
-            <div><b>⑧ 学术滚雪球</b><p>「学术采样」从种子视频沿相关推荐扩图。默认门禁：挡住游戏/影视等分区、播放 ≥ 1 万、评论 ≥ 150 或互动比 ≥ 0.003、标签命中就业/学历等。通过的才继续扩，评论写入 <code>data/corpus.db</code>。</p></div>
+            <div><b>⑧ 学术滚雪球</b><p>「学术采样」从种子视频沿相关推荐扩图。通过门禁的视频会同时采<strong>视频转写</strong>（官方字幕，缺则 Whisper）和<strong>评论树</strong>，写入 <code>data/corpus.db</code>。默认门禁：挡住游戏/影视、播放 ≥ 1 万、评论 ≥ 150 或互动比 ≥ 0.003、标签命中就业/学历等。</p></div>
           </div>
         </article>
 
@@ -344,12 +344,28 @@
 
       <section id="page-academic" class="page" hidden>
         <article class="card">
-          <h3>滚雪球采样</h3>
-          <p>从<strong>你认为像研究对象的视频</strong>出发，顺着 B 站「相关推荐」一层层扩。只有同时通过分区、播放量、互动比、标签的视频才会继续往外滚，被剪掉的也会记原因，方便交代抽样偏差。</p>
-          <p class="hint">分析单位默认是<strong>评论树</strong>，不下载视频、不跑 Whisper。种子请用真正讨论就业/阶层的稿件，不要用搞笑切片。</p>
+          <p class="step-kicker">学术采样</p>
+          <h3>滚雪球：视频 + 评论一起进分析库</h3>
+          <p>从<strong>你认为像研究对象的视频</strong>出发，顺着 B 站「相关推荐」一层层扩。只有同时通过分区、播放量、互动、标签的视频才会继续往外滚。</p>
+          <p>通过门禁的每一条，都会采两层语料，缺一不可：</p>
+          <ul>
+            <li><strong>视频层</strong>：标题、分区、标签、播放/评论数，以及<strong>台词转写</strong>（官方字幕，没有就 Whisper）。写入 <code>videos</code> / <code>transcripts</code>。</li>
+            <li><strong>评论层</strong>：热评 + 楼中楼，保留父子指针。写入 <code>comments</code>。</li>
+          </ul>
+          <p class="hint">分析时不要把台词和评论混在一张表里：台词用 <code>v_transcript_corpus</code>，评论用 <code>v_comment_corpus</code>。种子请用真正讨论就业/阶层的稿件，不要用搞笑切片。</p>
+        </article>
+
+        <article class="card">
+          <p class="step-kicker">步骤 1</p>
+          <h3>种子</h3>
           <label for="academic-seeds">种子（BV 号、视频链接、UID 或空间链接，可混排）</label>
           <textarea id="academic-seeds" rows="5" placeholder="https://www.bilibili.com/video/BV1xxxxxxxx&#10;BV1yyyyyyyyyy&#10;https://space.bilibili.com/208259"></textarea>
-          <p class="hint">例：复制一条「打工人 / 学历 / 就业」讨论视频的浏览器地址，每行一个。填 UID 时，会取该 UP 时间窗口内最近若干条当种子。</p>
+          <p class="hint">例：复制一条「打工人 / 学历 / 就业」讨论视频的浏览器地址，每行一个。填 UID 时，会取该 UP 时间窗口内最近若干条当种子，再过一遍门禁。</p>
+        </article>
+
+        <article class="card">
+          <p class="step-kicker">步骤 2</p>
+          <h3>门禁（以后都可以改）</h3>
           <div class="grid-3">
             <label>最大深度<input id="ac-depth" type="number" min="0" max="4" value="2" /></label>
             <label>通过门禁的节点上限<input id="ac-nodes" type="number" min="1" max="500" value="80" /></label>
@@ -374,18 +390,95 @@
           <label>分区白名单（可空，空=不限制）<input id="ac-allow" placeholder="知识,资讯,生活" /></label>
           <p class="hint">只保留这些分区名或 tid。例：<code>知识,资讯</code>。留空则只靠下面的黑名单。</p>
           <label>分区黑名单<input id="ac-deny" value="游戏,动画,番剧,国创,音乐,舞蹈,影视,娱乐,鬼畜,运动,汽车,时尚,美食" /></label>
-          <p class="hint">标题分区名里出现这些词就剪枝。研究亚文化时务必保留，否则推荐流会滚进游戏和鬼畜。</p>
+          <p class="hint">分区名里出现这些词就剪枝。研究亚文化时务必保留，否则推荐流会滚进游戏和鬼畜。</p>
           <label>标签/标题必须命中的词<input id="ac-tags" value="就业,学历,失业,薪资,找工作,文凭,体制内,内卷,大厂,职场" /></label>
           <p class="hint">逗号分隔。视频标签、标题或简介命中其中任一即可。研究「躺平」可改成：<code>躺平,内卷,孔乙己,牛马,阶层</code>。留空则关掉标签门禁。</p>
           <label>额外关键词（可空）<input id="ac-keyword" placeholder="例如：乡村振兴" /></label>
           <p class="hint">再收窄标题/简介。一般留空，靠标签词即可。</p>
+        </article>
+
+        <article class="card">
+          <p class="step-kicker">步骤 3</p>
+          <h3>采什么</h3>
+          <p class="muted">视频元数据（标题、分区、标签、播放量）对通过门禁的节点<strong>总会写入</strong>。下面决定还要不要台词、评论、弹幕。</p>
           <div class="checks">
+            <label class="choice-card selected"><input type="checkbox" id="ac-transcript" checked /> 采集视频转写（台词 / 字幕）</label>
             <label class="choice-card selected"><input type="checkbox" id="ac-comments" checked /> 采集评论树（热评 + 楼中楼）</label>
             <label class="choice-card"><input type="checkbox" id="ac-danmaku" /> 采集弹幕</label>
           </div>
+          <p class="hint">学术分析至少勾选前两项。关掉转写就只剩元数据，没法做视频话语分析。</p>
+        </article>
+
+        <article class="card" id="ac-transcribe-card">
+          <p class="step-kicker">步骤 4</p>
+          <h3>视频怎么转成文字</h3>
+          <p class="muted">默认：先拿官方字幕；没有字幕再下载音频跑 Whisper。转写写入 <code>transcript.md</code>，并进分析库的 <code>transcripts</code> 表。</p>
+          <div class="choice-grid" id="ac-transcribe-choices">
+            <label class="choice-card">
+              <input type="radio" name="ac-transcribe-mode" value="official" />
+              <span><strong>只取官方字幕</strong><small>不下载音频。没有字幕的视频就空着，最快最省盘。</small></span>
+            </label>
+            <label class="choice-card selected">
+              <input type="radio" name="ac-transcribe-mode" value="official_then_whisper" checked />
+              <span><strong>官方字幕 + Whisper 兜底</strong><small>推荐。没有字幕的稿件也能进语料库。</small></span>
+              <em>推荐</em>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="ac-transcribe-mode" value="whisper" />
+              <span><strong>全部 Whisper</strong><small>忽略官方字幕，统一语音识别。更慢，口径一致。</small></span>
+            </label>
+          </div>
+          <div class="choice-grid" id="ac-media-choices">
+            <label class="choice-card">
+              <input type="radio" name="ac-media-mode" value="link" />
+              <span><strong>不下载媒体</strong><small>只能拿官方字幕，Whisper 跑不了。</small></span>
+            </label>
+            <label class="choice-card selected">
+              <input type="radio" name="ac-media-mode" value="audio" checked />
+              <span><strong>下载音频</strong><small>给 Whisper 用。转写完可删文件，只留文字。</small></span>
+              <em>推荐</em>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="ac-media-mode" value="video" />
+              <span><strong>下载完整视频</strong><small>占空间。只有你还想回看原片时才选。</small></span>
+            </label>
+          </div>
+          <div class="choice-grid" id="ac-keep-choices">
+            <label class="choice-card selected">
+              <input type="radio" name="ac-media-keep" value="delete_after_text" checked />
+              <span><strong>提取后删除音频/视频</strong><small>分析库里留下转写和评论，本机不堆媒体。</small></span>
+              <em>推荐</em>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="ac-media-keep" value="upload_then_delete" />
+              <span><strong>先传到 Google Drive 再删</strong><small>要先在设置里配好 rclone。适合还想留一份原片。</small></span>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="ac-media-keep" value="keep" />
+              <span><strong>媒体留在本机</strong><small>最占磁盘。</small></span>
+            </label>
+          </div>
+          <div class="choice-grid" id="ac-compute-choices">
+            <label class="choice-card selected">
+              <input type="radio" name="ac-compute-backend" value="local" checked />
+              <span><strong>Whisper 跑本机</strong><small>Intel Mac 会慢。本机有 NVIDIA 会自动用 GPU。</small></span>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="ac-compute-backend" value="cloud" />
+              <span><strong>Whisper 跑云端 GPU</strong><small>先到设置用 AutoDL 一键接入，测通后再选。</small></span>
+            </label>
+          </div>
+          <p class="muted tiny" id="ac-compute-hint"></p>
+        </article>
+
+        <article class="card launch-card">
+          <div>
+            <p class="step-kicker">确认任务</p>
+            <h3>开始滚雪球</h3>
+            <p class="muted">请先在「设置」登录；匿名评论会被截短。连续风控 5 次会自动停，可续跑。</p>
+          </div>
           <div class="actions">
             <button type="button" class="primary" id="academic-start">开始滚雪球</button>
-            <span class="muted">请先在「设置」登录；匿名评论会被截短。连续风控 5 次会自动停，可续跑。</span>
           </div>
         </article>
       </section>
@@ -435,7 +528,7 @@
           <div class="row-between">
             <div>
               <h3>分析数据集</h3>
-              <p class="muted">SQLite 分析库：作者（性别/学校）、视频、评论 IP、滚雪球边、门禁漏斗。可导出 CSV 或回填已有档案。</p>
+              <p class="muted">SQLite 分析库：视频（含转写）、评论树、弹幕、动态、推荐边、门禁漏斗。台词走 <code>v_transcript_corpus</code>，评论走 <code>v_comment_corpus</code>，不要混在一起主题建模。</p>
             </div>
             <div class="actions">
               <button type="button" class="ghost" id="corpus-refresh">刷新</button>
@@ -454,7 +547,7 @@
           <label>只读 SQL（仅允许 SELECT / WITH）
             <textarea id="corpus-sql" rows="5" placeholder="SELECT bvid, title, tname, view_count, pass_filter FROM v_video_corpus WHERE pass_filter=1 LIMIT 20"></textarea>
           </label>
-          <p class="hint">例：一级长评 <code>SELECT content, like_count FROM v_comment_corpus WHERE hierarchy_level='root' AND text_length&gt;=20 LIMIT 50</code>。漏斗：<code>SELECT * FROM v_gate_funnel</code>。推荐边：<code>SELECT * FROM v_snowball_network LIMIT 50</code>。</p>
+          <p class="hint">例：通过门禁的视频 <code>SELECT bvid, title, view_count FROM v_video_corpus WHERE pass_filter=1 LIMIT 20</code>。视频台词 <code>SELECT bvid, video_title, char_count, full_text FROM v_transcript_corpus LIMIT 20</code>。一级长评 <code>SELECT content, like_count FROM v_comment_corpus WHERE hierarchy_level='root' AND text_length&gt;=20 LIMIT 50</code>。漏斗：<code>SELECT * FROM v_gate_funnel</code>。</p>
           <div class="actions">
             <button type="button" class="primary" id="corpus-query">执行</button>
           </div>
@@ -470,7 +563,8 @@
         <div class="grid-2">
           <article class="card">
             <h3>扫码登录</h3>
-            <p class="muted">用哔哩哔哩 App 扫描二维码。Cookie 只保存在本机。</p>
+            <p class="muted"><strong>用来干什么：</strong>把你的 B 站账号会话交给本机采集器。匿名也能拉元数据，但评论会被截短、没有 IP 属地、字幕和空间列表更容易失败。学术采样和完整归档都建议先登录。</p>
+            <p class="hint">用哔哩哔哩 App 扫描二维码。Cookie 只保存在本机 <code>data/settings.json</code>，不会进 Git。</p>
             <div class="qr-box">
               <img id="qr-image" alt="登录二维码" hidden />
               <p id="qr-msg" class="muted">点击生成二维码</p>
@@ -479,7 +573,8 @@
           </article>
           <article class="card">
             <h3>或粘贴 Cookie</h3>
-            <p class="hint">扫码更省事。若要手贴：Chrome 打开 <code>bilibili.com</code> → F12 → Application / 应用 → Cookies → 复制整行。至少要有 <code>SESSDATA</code>、<code>bili_jct</code>、<code>DedeUserID</code>。</p>
+            <p class="muted"><strong>用来干什么：</strong>和扫码是同一件事，只是手动把浏览器里的登录状态贴进来。扫码失败、或你已经在 Chrome 登录过时用这个。</p>
+            <p class="hint">Chrome 打开 <code>bilibili.com</code> → F12 → Application / 应用 → Cookies → 复制整行。至少要有 <code>SESSDATA</code>、<code>bili_jct</code>、<code>DedeUserID</code>。</p>
             <label>Cookie 字符串</label>
             <textarea id="cookie-input" rows="6" placeholder="SESSDATA=abc...; bili_jct=def...; DedeUserID=123456; buvid3=..."></textarea>
             <p class="hint">例：<code>SESSDATA=12ab%2C1234567890%2Cxy...; bili_jct=1a2b3c; DedeUserID=208259</code>。不要发到网上，只保存在本机。</p>
@@ -503,6 +598,7 @@
         </article>
         <article class="card">
           <h3>采集节奏</h3>
+          <p class="muted"><strong>用来干什么：</strong>控制请求间隔、重试、Whisper 模型和画质。一般保持默认即可。调太快容易被 B 站 412 / -352 拦住。</p>
           <div class="grid-3">
             <label>最小间隔（秒）<input type="number" step="0.1" id="min-interval" /></label>
             <label>最大间隔（秒）<input type="number" step="0.1" id="max-interval" /></label>
@@ -550,14 +646,23 @@
                 <option value="80">1080P</option>
               </select>
             </label>
+          </div>
+          <p class="hint">间隔不要低于 0.2 秒。Whisper 模型：Intel Mac 用 <code>small</code>；Windows 4060 可用 <code>medium</code>。</p>
+        </article>
+        <article class="card">
+          <h3>Google Drive（rclone）</h3>
+          <p class="muted"><strong>用来干什么：</strong>Whisper / 完整归档会在本机留下很大的音频或 MP4。转写完成后，可以把原片传到 Google Drive，再删掉本地文件，硬盘不会被撑满。分析用的文字已经写进 SQLite / Markdown，不依赖这些大文件。</p>
+          <p class="hint">没装 rclone、或不想传网盘，就把任务里的「空间策略」改成「提取后删除」或「全部留在本机」，这里可以不填。</p>
+          <div class="grid-3">
             <label>rclone 远程名<input id="rclone-remote" placeholder="googledrive" /></label>
             <label>Drive 目录<input id="rclone-root" placeholder="BiliArchiver" /></label>
           </div>
-          <p class="hint">远程名必须和你在终端 <code>rclone config</code> 里起的名字一致。本机若已配好 Google Drive，常见是 <code>gdrive</code> 或 <code>googledrive</code>。目录是网盘上的文件夹，例：<code>BiliArchiver</code>。</p>
+          <p class="hint">远程名必须和终端 <code>rclone listremotes</code> 里的名字一致（常见 <code>gdrive</code> 或 <code>googledrive</code>，注意带不带冒号以界面提示为准）。目录是网盘上的文件夹，例：<code>BiliArchiver</code>。配置步骤见 README。</p>
         </article>
         <article class="card">
-          <h3>AutoDL 一键接入</h3>
-          <p class="muted">爬虫仍在本机。你只要把 AutoDL 实例页的 <strong>SSH 登录指令</strong>和<strong>密码</strong>贴进来。不要改端口、不要自己 ssh。</p>
+          <h3>AutoDL 云端 GPU</h3>
+          <p class="muted"><strong>用来干什么：</strong>Intel Mac 上 Whisper 一条 30 分钟视频可能要十几分钟。学术采样和「文字研究 / 完整归档」如果要对没有官方字幕的视频做语音识别，可以把音频送到租来的 GPU（例如 AutoDL 3090），识别完文字再回本机。爬虫、评论、门禁仍然在这台电脑上跑，云端只负责转写和 OCR。</p>
+          <p class="hint">用不到 Whisper 就跳过。要用时：到 AutoDL 实例页复制 <strong>SSH 登录指令</strong>整行和同一页的<strong>登录密码</strong>，点「一键接入」，保持这个页面开着。通了以后，任务步骤里把算力改成「云端 GPU」。</p>
           <label>SSH 登录指令
             <input id="autodl-ssh" placeholder="ssh -p 12345 root@region-9.seetacloud.com" autocomplete="off" />
           </label>
@@ -596,7 +701,8 @@
         </article>
         <article class="card">
           <h3>手机进度提醒（Bark）</h3>
-          <p class="muted">任务开始、每完成一条视频、账号结束、整次采集完成或失败时推送到 iPhone，铃声为 bell。</p>
+          <p class="muted"><strong>用来干什么：</strong>采集可能跑几小时。Bark 是 iPhone 上的推送 App，任务开始、每完成一条视频、某个账号结束、整次成功或失败时，手机会响一声，这样就不用一直盯着「运行监控」。</p>
+          <p class="hint">没有 iPhone 就关掉「启用推送」，不影响采集。Android 目前没有接等价通道。</p>
           <div class="grid-3">
             <label class="checks" style="align-items:center">
               <span><input type="checkbox" id="bark-enabled" checked /> 启用推送</span>
@@ -621,6 +727,6 @@
     </main>
   </div>
     <div id="toast" role="status" aria-live="polite"></div>
-  <script src="/static/app.js?v=20260922c"></script>
+  <script src="/static/app.js?v=20260922d"></script>
 </body>
 </html>

@@ -41,8 +41,8 @@ class AcademicConfig:
     seeds_per_uid: int = 8
     crawl_comments: bool = True
     crawl_danmaku: bool = False
-    transcribe_mode: str = "none"
-    media_mode: str = "link"
+    transcribe_mode: str = "official_then_whisper"
+    media_mode: str = "audio"
     media_keep: str = "delete_after_text"
     ocr_enabled: bool = False
     resume: bool = True
@@ -342,13 +342,14 @@ class AcademicCrawler:
             crawl_dynamics=False,
             crawl_comments=config.crawl_comments,
             crawl_danmaku=config.crawl_danmaku,
-            media_mode=config.media_mode or "link",
-            transcribe_mode=config.transcribe_mode or "none",
+            media_mode=config.media_mode or "audio",
+            transcribe_mode=config.transcribe_mode or "official_then_whisper",
             media_keep=config.media_keep,
             ocr_enabled=False,
             resume=config.resume,
             job_id=config.job_id,
             compute_backend=config.compute_backend,
+            discovery="seed" if item.depth == 0 else "snowball",
         )
         await self.crawler._crawl_video(
             client,
