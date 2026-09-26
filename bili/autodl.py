@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 import select
 import shlex
 import socket
@@ -14,14 +16,19 @@ from bili.paths import ROOT
 LogFn = Callable[[str, str], None]
 
 DEFAULT_REMOTE_DIR = "/root/autodl-tmp/biliarchiver"
+REMOTE_INBOX = f"{DEFAULT_REMOTE_DIR}/inbox"
 WORKER_PORT = 6006
+HF_MIRROR = "https://hf-mirror.com"
+HF_HOME_REMOTE = "/root/autodl-tmp/huggingface"
 SKIP_DIR_NAMES = {
     ".git",
     ".venv",
+    ".venv-py314.bak",
     "venv",
     "data",
     "__pycache__",
     ".cursor",
+    ".vscode",
     "node_modules",
     "canvases",
     ".pytest_cache",
@@ -103,6 +110,8 @@ def _should_skip(path: Path) -> bool:
     parts = set(path.parts)
     if parts & SKIP_DIR_NAMES:
         return True
+    if any(part.startswith(".venv") for part in path.parts):
+        return True
     if "tools" in path.parts and "bin" in path.parts:
         return True
     return False
@@ -130,15 +139,24 @@ class _TunnelHandler(socketserver.BaseRequestHandler):
         transport = self.ssh_transport
         if transport is None:
             return
-        try:
-            channel = transport.open_channel(
-                "direct-tcpip",
-                (self.chain_host, self.chain_port),
-                self.request.getpeername(),
-            )
-        except Exception:
-            return
+        channel = None
+        for _ in range(8):
+            try:
+                channel = transport.open_channel(
+                    "direct-tcpip",
+                    (self.chain_host, self.chain_port),
+                    self.request.getpeername(),
+                )
+            except Exception:
+                channel = None
+            if channel is not None:
+                break
+            time.sleep(0.25)
         if channel is None:
+            try:
+                self.request.close()
+            except Exception:
+                pass
             return
         try:
             while True:
@@ -234,6 +252,389 @@ class AutodlSession:
 SESSION = AutodlSession()
 
 
+def remote_inbox_path(local_path: Path | str) -> str:
+    path = Path(local_path)
+    suffix = path.suffix or ".m4a"
+    stem = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in path.stem)[:80]
+    return f"{REMOTE_INBOX}/bili_whisper_{stem or 'audio'}{suffix}"
+
+
+def session_alive() -> bool:
+    client = SESSION.client
+    transport = client.get_transport() if client else None
+    return bool(transport and transport.is_active())
+
+
+def _open_sftp(client: Any, timeout: float = 20.0):
+    box: dict[str, Any] = {}
+    done = threading.Event()
+
+    def worker() -> None:
+        try:
+            box["sftp"] = client.open_sftp()
+        except Exception as exc:
+            box["exc"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+    if not done.wait(timeout):
+        raise RuntimeError("打开 SFTP 超时")
+    if "exc" in box:
+        raise RuntimeError(f"打开 SFTP 失败：{box['exc']}") from box["exc"]
+    return box["sftp"]
+
+
+def put_via_client(
+    client: Any,
+    local_path: Path | str,
+    log: LogFn | None = None,
+    stall_sec: float = 45.0,
+) -> str:
+    """Copy a file over a live SSH client. Used by the exclusive GPU path."""
+    path = Path(local_path)
+    if not path.is_file():
+        raise RuntimeError(f"本地文件不存在：{path}")
+    if client is None:
+        raise RuntimeError("没有 SSH 连接")
+
+    def emit(message: str, level: str = "info") -> None:
+        if log:
+            log(message, level)
+
+    remote = remote_inbox_path(path)
+    total = path.stat().st_size
+    last_beat = [time.time()]
+    last_logged = [0]
+    box: dict[str, Any] = {}
+
+    def callback(sent: int, _tot: int) -> None:
+        last_beat[0] = time.time()
+        if sent - last_logged[0] >= 2 * 1024 * 1024 or sent >= total:
+            last_logged[0] = sent
+            emit(f"SFTP {sent // 1048576}/{max(total // 1048576, 1)} MB · {path.name}")
+
+    sftp = _open_sftp(client)
+    try:
+        _sftp_mkdirs(sftp, REMOTE_INBOX)
+        chan = sftp.get_channel()
+        chan.settimeout(max(stall_sec, 30.0))
+        done = threading.Event()
+
+        def worker() -> None:
+            try:
+                sftp.put(str(path), remote, callback=callback)
+            except Exception as exc:
+                box["exc"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=worker, daemon=True).start()
+        while not done.wait(1.0):
+            if time.time() - last_beat[0] > stall_sec:
+                try:
+                    chan.close()
+                except Exception:
+                    pass
+                raise RuntimeError(f"SFTP 卡住（{int(stall_sec)}s 无进度），已中止 {path.name}")
+        if "exc" in box:
+            raise RuntimeError(f"SFTP 失败：{box['exc']}") from box["exc"]
+        st = sftp.stat(remote)
+        if int(getattr(st, "st_size", 0) or 0) != total:
+            raise RuntimeError(f"远程文件大小不符：{getattr(st, 'st_size', 0)} != {total}")
+    finally:
+        try:
+            sftp.close()
+        except Exception:
+            pass
+    emit(f"SFTP 完成 {path.name} → {remote}（{total} 字节）", "ok")
+    return remote
+
+
+def put_via_session(
+    local_path: Path | str,
+    log: LogFn | None = None,
+    stall_sec: float = 45.0,
+) -> str:
+    """Copy a file over the already-open AutoDL SSH. Do not open a second login."""
+    if not session_alive():
+        raise RuntimeError("AutoDL 未接入，无法走已有 SSH 传文件")
+    return put_via_client(SESSION.client, local_path, log=log, stall_sec=stall_sec)
+
+
+def connect_exclusive(log: LogFn) -> Any:
+    """One SSH for GPU-side download + Whisper. Call after disconnecting the local tunnel."""
+    from bili.settings import load_settings
+
+    settings = load_settings()
+    ssh_command = (settings.autodl_ssh_command or "").strip()
+    password = (settings.autodl_ssh_password or "").strip()
+    if not ssh_command or not password:
+        raise RuntimeError("没有 AutoDL SSH")
+    target = parse_ssh_command(ssh_command)
+    return _connect_client(target, password, log)
+
+
+def ssh_alive(client: Any) -> bool:
+    try:
+        transport = client.get_transport() if client else None
+        return bool(transport and transport.is_active())
+    except Exception:
+        return False
+
+
+def ssh_nvidia_smi(client: Any) -> str:
+    try:
+        text = _run(
+            client,
+            "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits",
+            lambda *_a: None,
+            timeout=15,
+            check=False,
+            chatter=False,
+            get_pty=False,
+        )
+        return (text or "").strip().splitlines()[-1].strip()
+    except Exception:
+        return ""
+
+
+def ssh_transcribe_audio(
+    client: Any,
+    local_path: Path | str,
+    token: str,
+    model: str,
+    language: str,
+    log: LogFn | None = None,
+) -> dict[str, Any]:
+    """SFTP on this SSH, then curl the GPU worker on localhost so the tunnel is unused."""
+
+    def emit(message: str, level: str = "info") -> None:
+        if log:
+            log(message, level)
+
+    path = Path(local_path)
+    remote = put_via_client(client, path, log=log)
+    emit(f"GPU 本机开始转写 {path.name}", "info")
+    smi = ssh_nvidia_smi(client)
+    if smi:
+        emit(f"转写前 nvidia-smi {smi}", "info")
+    auth = (token or "").strip().replace("'", "")
+    cmd = (
+        "curl -sS --max-time 1200 "
+        f"-H 'Authorization: Bearer {auth}' "
+        f"-F 'path={remote}' -F 'model={model or 'large-v3'}' -F 'language={language or 'auto'}' "
+        f"http://127.0.0.1:{WORKER_PORT}/v1/transcribe_path"
+    )
+    out = _run(client, cmd, emit if log else (lambda *_a: None), timeout=1260, chatter=False, get_pty=False)
+    text = (out or "").strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < 0:
+        raise RuntimeError(f"远程转写没有返回 JSON：{text[:240]}")
+    data = json.loads(text[start : end + 1])
+    if data.get("detail") and not data.get("markdown"):
+        raise RuntimeError(str(data.get("detail")))
+    if not data.get("markdown"):
+        raise RuntimeError("云端转写没有返回文字")
+    smi_after = ssh_nvidia_smi(client)
+    if smi_after:
+        emit(f"转写后 nvidia-smi {smi_after}", "ok")
+    return data
+
+
+REMOTE_PULL_PY = r"""
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+
+job_path = sys.argv[1]
+with open(job_path, encoding="utf-8") as fh:
+    job = json.load(fh)
+dest = job["dest"]
+os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+raw = dest + ".part"
+err = "download failed"
+ok = False
+for url in job.get("urls") or []:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": job.get("ua") or "Mozilla/5.0",
+            "Referer": job.get("referer") or "https://www.bilibili.com/",
+            "Cookie": job.get("cookie") or "",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp, open(raw, "wb") as fh:
+            while True:
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
+        if os.path.isfile(raw) and os.path.getsize(raw) > 1000:
+            ok = True
+            break
+    except Exception as exc:
+        err = str(exc)
+        continue
+if not ok:
+    print(json.dumps({"ok": False, "error": err[:300]}))
+    raise SystemExit(2)
+ff = subprocess.run(
+    ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", raw, "-vn", "-c:a", "copy", dest],
+    capture_output=True,
+    text=True,
+)
+if ff.returncode != 0 or not os.path.isfile(dest) or os.path.getsize(dest) < 1000:
+    ff = subprocess.run(
+        ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", raw, "-vn", "-ac", "1", "-ar", "16000", dest],
+        capture_output=True,
+        text=True,
+    )
+if ff.returncode != 0:
+    print(json.dumps({"ok": False, "error": (ff.stderr or "ffmpeg failed")[-300:]}))
+    raise SystemExit(3)
+try:
+    os.remove(raw)
+except OSError:
+    pass
+model = job.get("model") or "large-v3"
+language = job.get("language") or "auto"
+curl = subprocess.run(
+    [
+        "curl", "-sS", "--max-time", "1200",
+        "-H", "Authorization: Bearer " + (job.get("token") or ""),
+        "-F", "path=" + dest,
+        "-F", "model=" + model,
+        "-F", "language=" + language,
+        "http://127.0.0.1:6006/v1/transcribe_path",
+    ],
+    capture_output=True,
+    text=True,
+)
+sys.stdout.write(curl.stdout or "")
+if curl.returncode != 0:
+    sys.stderr.write((curl.stderr or curl.stdout or "curl failed")[-400:])
+    raise SystemExit(curl.returncode or 4)
+"""
+
+
+def _put_text(client: Any, remote: str, text: str, timeout: int = 30) -> None:
+    cmd = f"mkdir -p $(dirname {shlex.quote(remote)}) && cat > {shlex.quote(remote)}"
+    stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout, get_pty=False)
+    try:
+        stdin.write(text)
+    except TypeError:
+        stdin.write(text.encode("utf-8"))
+    stdin.flush()
+    stdin.channel.shutdown_write()
+    code = stdout.channel.recv_exit_status()
+    if code != 0:
+        err = stderr.read().decode("utf-8", "replace")[:200]
+        raise RuntimeError("写入远程文件失败" + (f"：{err}" if err else ""))
+
+
+def _parse_remote_json(text: str) -> dict[str, Any]:
+    blob = (text or "").strip()
+    start = blob.find("{")
+    end = blob.rfind("}")
+    if start < 0 or end < 0:
+        raise RuntimeError(f"远程转写没有返回 JSON：{blob[:240]}")
+    data = json.loads(blob[start : end + 1])
+    if data.get("ok") is False:
+        raise RuntimeError(str(data.get("error") or "远程任务失败"))
+    if data.get("detail") and not data.get("markdown"):
+        raise RuntimeError(str(data.get("detail")))
+    if not data.get("markdown"):
+        raise RuntimeError("云端转写没有返回文字")
+    return data
+
+
+def ssh_fetch_and_transcribe(
+    client: Any,
+    *,
+    bvid: str,
+    urls: list[str],
+    referer: str,
+    cookie: str,
+    token: str,
+    model: str,
+    language: str,
+    log: LogFn | None = None,
+) -> dict[str, Any]:
+    """GPU box downloads audio from Bilibili, then Whisper locally. No Mac upload."""
+    from bili.client import UA
+
+    def emit(message: str, level: str = "info") -> None:
+        if log:
+            log(message, level)
+
+    clean_urls = [url for url in urls if url]
+    if not clean_urls:
+        raise RuntimeError("没有音频地址")
+    remote_audio = f"{REMOTE_INBOX}/bili_whisper_{bvid}.m4a"
+    job = {
+        "urls": clean_urls,
+        "referer": referer or f"https://www.bilibili.com/video/{bvid}",
+        "cookie": cookie or "",
+        "dest": remote_audio,
+        "ua": UA,
+        "token": token,
+        "model": model or "large-v3",
+        "language": language or "auto",
+    }
+    emit(f"GPU 从 B 站拉音频 {bvid}（{len(clean_urls)} 个地址）")
+    smi = ssh_nvidia_smi(client)
+    if smi:
+        emit(f"转写前 nvidia-smi {smi}")
+    _put_text(client, "/tmp/bili_pull_transcribe.py", REMOTE_PULL_PY)
+    _put_text(client, "/tmp/bili_pull_job.json", json.dumps(job, ensure_ascii=False))
+    python = _pick_python(client, emit if log else (lambda *_a: None))
+    out = _run(
+        client,
+        f"{shlex.quote(python)} -u /tmp/bili_pull_transcribe.py /tmp/bili_pull_job.json",
+        emit if log else (lambda *_a: None),
+        timeout=1500,
+        chatter=False,
+        get_pty=False,
+    )
+    data = _parse_remote_json(out)
+    smi_after = ssh_nvidia_smi(client)
+    if smi_after:
+        emit(f"转写后 nvidia-smi {smi_after}", "ok")
+    return data
+
+
+def fetch_and_transcribe_via_session(
+    *,
+    bvid: str,
+    urls: list[str],
+    referer: str,
+    cookie: str,
+    token: str,
+    model: str,
+    language: str,
+    log: LogFn | None = None,
+) -> dict[str, Any]:
+    """GPU pulls audio from Bilibili over the existing AutoDL SSH. No Mac SFTP."""
+    if not session_alive():
+        raise RuntimeError("AutoDL 未接入，无法让 GPU 直拉音频")
+    return ssh_fetch_and_transcribe(
+        SESSION.client,
+        bvid=bvid,
+        urls=urls,
+        referer=referer,
+        cookie=cookie,
+        token=token,
+        model=model,
+        language=language,
+        log=log,
+    )
+
+
 def _require_paramiko():
     try:
         import paramiko
@@ -266,7 +667,7 @@ def _connect_client(target: SshTarget, password: str, log: LogFn):
         raise RuntimeError(f"SSH 连不上：{message}") from exc
     transport = client.get_transport()
     if transport is not None:
-        transport.set_keepalive(30)
+        transport.set_keepalive(5)
     log("SSH 已接通。", "ok")
     return client
 
@@ -351,25 +752,195 @@ def _run(
 
 
 def _pick_python(client: Any, log: LogFn) -> str:
-    output = _run(
+    """AutoDL PyTorch images often hide python in conda, not a login PATH."""
+    lookup = r"""
+set +e
+candidates=""
+for cmd in python3 python; do
+  found=$(command -v "$cmd" 2>/dev/null || true)
+  if [ -n "$found" ]; then candidates="$candidates $found"; fi
+done
+for p in \
+  /root/miniconda3/bin/python \
+  /root/miniconda3/bin/python3 \
+  /opt/conda/bin/python \
+  /opt/conda/bin/python3 \
+  /usr/bin/python3 \
+  /usr/local/bin/python3 \
+  /root/anaconda3/bin/python \
+  /root/anaconda3/bin/python3
+do
+  if [ -x "$p" ]; then candidates="$candidates $p"; fi
+done
+if [ -d /root/miniconda3/envs ]; then
+  for p in /root/miniconda3/envs/*/bin/python /root/miniconda3/envs/*/bin/python3; do
+    if [ -x "$p" ]; then candidates="$candidates $p"; fi
+  done
+fi
+printf '%s\n' $candidates | awk 'NF && !seen[$0]++'
+"""
+    output = _run(client, lookup, log, timeout=30, check=False, chatter=False, get_pty=False)
+    binary = ""
+    for line in output.splitlines():
+        candidate = line.strip()
+        if candidate.startswith("/") and "python" in candidate.lower():
+            binary = candidate.split()[0]
+            break
+        if candidate in {"python3", "python"}:
+            binary = candidate
+            break
+    if not binary:
+        raise RuntimeError(
+            "这台 AutoDL 里找不到 python3。请在控制台选带 PyTorch / Miniconda 的官方镜像开机，"
+            "不要选空白 Ubuntu。也可以打开 JupyterLab 看终端里 python 在哪。"
+        )
+    log(f"远程 Python：{binary}", "ok")
+    return binary
+
+
+def parse_nvidia_smi_header(text: str) -> tuple[str, str]:
+    """Return (driver, max_cuda) from ``nvidia-smi`` header, e.g. ('570.124.04', '12.8')."""
+    driver = ""
+    cuda = ""
+    match = re.search(r"Driver Version:\s*([\d.]+)", text or "")
+    if match:
+        driver = match.group(1)
+    match = re.search(r"CUDA Version:\s*([\d.]+)", text or "")
+    if match:
+        cuda = match.group(1)
+    return driver, cuda
+
+
+def _cuda_tuple(raw: str) -> tuple[int, ...]:
+    parts = []
+    for item in (raw or "").split("."):
+        if not item.isdigit():
+            break
+        parts.append(int(item))
+    return tuple(parts) if parts else (0,)
+
+
+def _log_remote_cuda(client: Any, log: LogFn) -> None:
+    """Explain host driver vs image toolkit. AutoDL cards do not share one driver."""
+    smi = _run(client, "nvidia-smi", log, timeout=20, check=False, chatter=False, get_pty=False)
+    driver, max_cuda = parse_nvidia_smi_header(smi)
+    image = _run(
         client,
-        "command -v python3 || command -v python || true",
+        "readlink -f /usr/local/cuda 2>/dev/null || true; nvcc --version 2>/dev/null | tail -n 1 || true",
         log,
-        timeout=30,
+        timeout=20,
         check=False,
         chatter=False,
         get_pty=False,
     )
-    binary = ""
-    for line in output.splitlines():
-        candidate = line.strip()
-        if candidate.startswith("/") or candidate in {"python3", "python"}:
-            binary = candidate.split()[0]
-            break
-    if not binary:
-        raise RuntimeError("这台 AutoDL 里找不到 python3。请换一个 PyTorch 镜像。")
-    log(f"远程 Python：{binary}", "ok")
-    return binary
+    image_cuda = ""
+    found = re.search(r"cuda-(\d+\.\d+)", image, re.I)
+    if found:
+        image_cuda = found.group(1)
+    else:
+        found = re.search(r"release\s+(\d+\.\d+)", image, re.I)
+        if found:
+            image_cuda = found.group(1)
+    if driver and max_cuda:
+        log(f"宿主机驱动 {driver}，最高支持 CUDA {max_cuda}（由这张卡所在的物理机决定，换卡会变）。", "info")
+    if image_cuda:
+        log(f"容器镜像里的 CUDA toolkit 是 {image_cuda}。", "info")
+    if max_cuda and image_cuda and _cuda_tuple(image_cuda) > _cuda_tuple(max_cuda):
+        log(
+            f"镜像 CUDA {image_cuda} 高于驱动上限 {max_cuda}。请关机后换成 CUDA {max_cuda} 或更低的 PyTorch 官方镜像再开机。"
+            "例如驱动写 CUDA 12.8 时，不要选 CUDA 13.0 镜像。",
+            "warn",
+        )
+    elif max_cuda:
+        major = _cuda_tuple(max_cuda)[0]
+        if major >= 13:
+            log("这张卡可以选 CUDA 12 或 13 的 PyTorch 镜像。Whisper 仍会使用 CUDA 12 的 cublas。", "ok")
+        else:
+            log(f"这张卡请选 CUDA 12.x 的 PyTorch 镜像（不要选 13.0）。当前驱动上限是 {max_cuda}。", "ok")
+
+
+def _hf_exports() -> str:
+    """AutoDL cannot reach huggingface.co; faster-whisper must use the China mirror."""
+    return (
+        f"export HF_ENDPOINT={shlex.quote(HF_MIRROR)}; "
+        f"export HF_HOME={shlex.quote(HF_HOME_REMOTE)}; "
+        "export HF_HUB_ENABLE_HF_TRANSFER=0; "
+        "export HF_HUB_DISABLE_XET=1; "
+        "export HF_HUB_DISABLE_TELEMETRY=1"
+    )
+
+
+def _cuda12_probe_command(python: str) -> str:
+    return (
+        f"{shlex.quote(python)} -c "
+        + shlex.quote(
+            "import glob,os,sys\n"
+            "hits=glob.glob('/root/miniconda3/lib/python*/site-packages/nvidia/*/lib/libcublas.so.12*')"
+            "+glob.glob('/usr/local/cuda*/lib64/libcublas.so.12*')\n"
+            "print('CUBLAS12_OK' if hits else 'CUBLAS12_MISSING')\n"
+            "print('\\n'.join(hits[:8]))\n"
+        )
+    )
+
+
+def _ensure_cuda12_runtime(client: Any, python: str, log: LogFn) -> None:
+    """ctranslate2 wheels need libcublas.so.12 even on CUDA 13 AutoDL images."""
+    probe = _run(client, _cuda12_probe_command(python), log, timeout=30, check=False, chatter=False, get_pty=False)
+    if "CUBLAS12_OK" in probe:
+        log("已有 libcublas.so.12，跳过 CUDA 12 运行库安装。", "ok")
+        return
+    log("这台镜像是 CUDA 13。Whisper/ctranslate2 还要 libcublas.so.12，正在安装（约 300–500MB，只需一次）…", "info")
+    packages = "nvidia-cublas-cu12==12.4.5.8 nvidia-cuda-nvrtc-cu12==12.4.127"
+    try:
+        _run(client, f"{shlex.quote(python)} -m pip install {packages}", log, timeout=1800)
+    except Exception as exc:
+        log(f"指定版本安装失败，改装最新 CUDA 12 运行库：{exc}", "warn")
+        _run(
+            client,
+            f"{shlex.quote(python)} -m pip install nvidia-cublas-cu12 nvidia-cuda-nvrtc-cu12",
+            log,
+            timeout=1800,
+        )
+    again = _run(client, _cuda12_probe_command(python), log, timeout=30, check=False, chatter=False, get_pty=False)
+    if "CUBLAS12_OK" not in again:
+        raise RuntimeError(
+            "装完仍找不到 libcublas.so.12。请换 AutoDL 的 PyTorch 官方镜像（CUDA 12.1/12.4 或 13.0 均可），不要选空白 Ubuntu。"
+        )
+    log("CUDA 12 cublas 已就绪。", "ok")
+
+
+def _prefetch_whisper_model(client: Any, python: str, remote_dir: str, model: str, log: LogFn) -> None:
+    size = model or "large-v3"
+    log(f"正在用镜像 {HF_MIRROR} 预下载 Whisper {size}（约 3GB，只需一次）…", "info")
+    quoted_dir = shlex.quote(remote_dir)
+    command = (
+        f"{_hf_exports()}; mkdir -p {shlex.quote(HF_HOME_REMOTE)}; "
+        f"cd {quoted_dir} && {shlex.quote(python)} -c "
+        + shlex.quote(
+            f"from faster_whisper.utils import download_model; path = download_model({size!r}); print('MODEL_READY', path)"
+        )
+    )
+    output = _run(client, command, log, timeout=1800, get_pty=False)
+    if "MODEL_READY" not in output:
+        raise RuntimeError("Whisper 模型没有下载成功。远程输出：\n" + output[-600:])
+    log(f"Whisper {size} 已就绪。", "ok")
+
+
+def _worker_launch_command(python: str, remote_dir: str, token: str, model: str) -> str:
+    py = shlex.quote(python)
+    directory = shlex.quote(remote_dir)
+    token_q = shlex.quote(token.strip())
+    model_q = shlex.quote(model or "large-v3")
+    locator = py + " -c " + shlex.quote(
+        "from bili.runtime import cuda_library_dirs; print(':'.join(cuda_library_dirs()))"
+    )
+    return (
+        f"{_hf_exports()}; cd {directory} && "
+        f'export LD_LIBRARY_PATH="$({locator}):$LD_LIBRARY_PATH" && '
+        f"PYTHONUNBUFFERED=1 setsid nohup {py} tools/gpu_worker.py "
+        f"--host 0.0.0.0 --port {WORKER_PORT} --token {token_q} --model {model_q} "
+        f"</dev/null >/tmp/bili_gpu_worker.log 2>&1 & echo $!"
+    )
 
 
 def _pick_local_port(preferred: int = WORKER_PORT) -> int:
@@ -411,6 +982,7 @@ def connect_autodl(
         finally:
             sftp.close()
         python = _pick_python(client, emit)
+        _log_remote_cuda(client, emit)
         emit("正在安装 faster-whisper / OCR（第一次会几分钟）…", "info")
         quoted_dir = shlex.quote(remote_dir)
         _run(
@@ -419,6 +991,8 @@ def connect_autodl(
             emit,
             timeout=1800,
         )
+        emit("正在安装 CUDA 12 运行库（ctranslate2 需要 libcublas.so.12；CUDA 13 镜像也适用）…", "info")
+        _ensure_cuda12_runtime(client, python, emit)
         ffmpeg = _run(
             client,
             "command -v ffmpeg >/dev/null && echo ffmpeg_ok || echo ffmpeg_missing",
@@ -436,9 +1010,11 @@ def connect_autodl(
                 emit,
                 timeout=300,
             )
+        try:
+            _prefetch_whisper_model(client, python, remote_dir, model or "large-v3", emit)
+        except Exception as exc:
+            emit(f"预下载模型失败，工作机启动后第一次转写还会再试：{exc}", "warn")
         emit(f"正在启动 GPU 工作机（端口 6006，模型 {model or 'large-v3'}）…", "info")
-        token_q = shlex.quote(token.strip())
-        model_q = shlex.quote(model or "large-v3")
         _run(
             client,
             "pkill -f 'tools/gpu_worker.py' >/dev/null 2>&1 || true",
@@ -450,11 +1026,7 @@ def connect_autodl(
         )
         _run(
             client,
-            (
-                f"cd {quoted_dir} && PYTHONUNBUFFERED=1 setsid nohup {shlex.quote(python)} "
-                f"tools/gpu_worker.py --host 0.0.0.0 --port {WORKER_PORT} --token {token_q} "
-                f"--model {model_q} </dev/null >/tmp/bili_gpu_worker.log 2>&1 & echo $!"
-            ),
+            _worker_launch_command(python, remote_dir, token, model or "large-v3"),
             emit,
             timeout=30,
             get_pty=False,
@@ -494,7 +1066,18 @@ def connect_autodl(
         emit(f"本机隧道已打开：http://127.0.0.1:{local_port} → 远程 6006", "ok")
         from bili.gpu_remote import gpu_worker_ready
 
-        ok, message = gpu_worker_ready(f"http://127.0.0.1:{local_port}", token.strip(), timeout=8.0)
+        ok, message = False, ""
+        for attempt in range(1, 9):
+            time.sleep(0.4 if attempt == 1 else 1.0)
+            ok, message = gpu_worker_ready(
+                f"http://127.0.0.1:{local_port}", token.strip(), timeout=12.0
+            )
+            if ok:
+                break
+            if "reset" in message.lower() or "timed out" in message.lower() or "refused" in message.lower():
+                emit(f"隧道探测 {attempt}/8：{message}", "info")
+                continue
+            break
         if not ok:
             raise RuntimeError("隧道已开，但本机还访问不到工作机：" + message)
         emit(message, "ok")

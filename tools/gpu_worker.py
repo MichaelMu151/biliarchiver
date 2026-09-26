@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hmac
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -18,7 +20,7 @@ from fastapi.responses import JSONResponse
 
 from bili.ocr import _run_ocr, ocr_available
 from bili.runtime import probe_compute
-from bili.transcribe import transcribe_local, whisper_available
+from bili.transcribe import transcribe_local, warmup_whisper, whisper_available, whisper_loaded_key
 
 app = FastAPI(title="BiliArchiver GPU Worker", version="1.0.0")
 WORKER_TOKEN = ""
@@ -47,13 +49,49 @@ async def health(authorization: str | None = Header(default=None)) -> dict:
         "gpu_name": gpu.get("gpu_name") or "",
         "cuda_devices": gpu.get("cuda_devices") or 0,
         "model": DEFAULT_MODEL,
+        "loaded": whisper_loaded_key(),
     }
+
+
+def _nvidia_smi_line() -> str:
+    try:
+        text = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,utilization.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            timeout=8,
+        )
+        return (text or "").strip().splitlines()[0].strip()
+    except Exception:
+        return ""
+
+
+@app.post("/v1/warmup")
+async def warmup(
+    model: str = Form(""),
+    authorization: str | None = Header(default=None),
+):
+    _check_token(authorization)
+    if not whisper_available():
+        raise HTTPException(500, "工作机未安装 faster-whisper")
+    name = (model.strip() if model else "") or DEFAULT_MODEL
+    try:
+        result = await asyncio.to_thread(warmup_whisper, name, DEFAULT_DEVICE, DEFAULT_COMPUTE)
+    except Exception as exc:
+        raise HTTPException(500, str(exc)) from exc
+    result["nvidia_smi"] = _nvidia_smi_line()
+    gpu = probe_compute()
+    result["gpu_name"] = gpu.get("gpu_name") or ""
+    return JSONResponse(result)
 
 
 @app.post("/v1/transcribe")
 async def transcribe(
     file: UploadFile = File(...),
-    model: str = Form("small"),
+    model: str = Form(""),
     language: str = Form("auto"),
     authorization: str | None = Header(default=None),
 ):
@@ -69,12 +107,14 @@ async def transcribe(
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(payload)
             tmp_path = tmp.name
-        result = transcribe_local(
+        result = await asyncio.to_thread(
+            transcribe_local,
             tmp_path,
-            model_size=model or DEFAULT_MODEL,
-            language=language or "auto",
-            device=DEFAULT_DEVICE,
-            compute_type=DEFAULT_COMPUTE,
+            (model.strip() if model else "") or DEFAULT_MODEL,
+            language or "auto",
+            None,
+            DEFAULT_DEVICE,
+            DEFAULT_COMPUTE,
         )
         result["status"] = "done"
         return JSONResponse(result)
@@ -85,6 +125,41 @@ async def transcribe(
     finally:
         if tmp_path:
             Path(tmp_path).unlink(missing_ok=True)
+
+
+@app.post("/v1/transcribe_path")
+async def transcribe_path(
+    path: str = Form(...),
+    model: str = Form(""),
+    language: str = Form("auto"),
+    authorization: str | None = Header(default=None),
+):
+    """Transcribe a file already on this GPU box (SFTP first, then call this)."""
+    _check_token(authorization)
+    if not whisper_available():
+        raise HTTPException(500, "工作机未安装 faster-whisper")
+    audio = Path(path)
+    allowed = str(audio.resolve()).startswith(("/tmp/", "/root/autodl-tmp/"))
+    if not allowed or not audio.is_file():
+        raise HTTPException(400, "音频路径无效")
+    try:
+        result = await asyncio.to_thread(
+            transcribe_local,
+            str(audio),
+            (model.strip() if model else "") or DEFAULT_MODEL,
+            language or "auto",
+            None,
+            DEFAULT_DEVICE,
+            DEFAULT_COMPUTE,
+        )
+        result["status"] = "done"
+        return JSONResponse(result)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, str(exc)) from exc
+    finally:
+        audio.unlink(missing_ok=True)
 
 
 @app.post("/v1/ocr")

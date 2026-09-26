@@ -20,11 +20,17 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from bili.academic import AcademicConfig, AcademicCrawler, parse_academic_seeds
-from bili.autodl import SESSION as AUTODL_SESSION, connect_autodl
+from bili.autodl import SESSION as AUTODL_SESSION, connect_autodl, put_via_session, session_alive
 from bili.client import BiliClient
 from bili.corpus import Corpus
 from bili.crawler import Crawler, JobConfig
-from bili.gpu_remote import gpu_worker_ready, needs_remote_models, normalize_worker_url, resolve_compute
+from bili.gpu_remote import (
+    gpu_worker_ready,
+    needs_remote_models,
+    normalize_worker_url,
+    resolve_compute,
+    worker_headers,
+)
 from bili.ingest import ingest_library
 from bili.paths import DATA_DIR, LIBRARY_DIR, ensure_dirs
 from bili.settings import AppSettings, load_settings, save_settings
@@ -403,9 +409,71 @@ class AutodlConnectIn(BaseModel):
     password: str | None = None
 
 
+class AutodlPutIn(BaseModel):
+    path: str
+
+
+def _require_library_file(raw: str) -> Path:
+    local = Path(raw).expanduser()
+    try:
+        resolved = local.resolve()
+        resolved.relative_to(LIBRARY_DIR.resolve())
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, "只能上传资料库里的音频") from exc
+    if not resolved.is_file():
+        raise HTTPException(400, "本地文件不存在")
+    return resolved
+
+
 @app.get("/api/gpu/autodl/status")
 async def autodl_status() -> dict[str, Any]:
     return AUTODL_SESSION.status()
+
+
+@app.post("/api/gpu/autodl/put")
+async def autodl_put(body: AutodlPutIn) -> dict[str, Any]:
+    if not session_alive():
+        raise HTTPException(400, "AutoDL 未接入")
+    local = _require_library_file(body.path)
+    try:
+        remote = await asyncio.to_thread(put_via_session, local)
+    except Exception as exc:
+        raise HTTPException(500, str(exc).strip() or type(exc).__name__) from exc
+    return {"ok": True, "remote": remote, "bytes": local.stat().st_size}
+
+
+@app.post("/api/gpu/autodl/warmup")
+async def autodl_warmup() -> dict[str, Any]:
+    if not session_alive():
+        raise HTTPException(400, "AutoDL 未接入")
+    settings = load_settings()
+    url = normalize_worker_url(settings.gpu_worker_url)
+    token = (settings.gpu_worker_token or "").strip()
+    if not url:
+        raise HTTPException(400, "没有 GPU 工作机地址")
+    import httpx
+
+    timeout = httpx.Timeout(30.0, read=240.0, write=30.0, pool=30.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.post(
+                f"{url}/v1/warmup",
+                headers=worker_headers(token),
+                data={"model": "large-v3"},
+            )
+    except Exception as exc:
+        raise HTTPException(502, f"预热失败：{exc}") from exc
+    if response.status_code in {401, 403}:
+        raise HTTPException(400, "GPU 工作机 Token 不正确")
+    if response.status_code >= 400:
+        raise HTTPException(502, f"预热失败 HTTP {response.status_code} {(response.text or '')[:240]}")
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+    if not data.get("ok", True):
+        raise HTTPException(502, str(data.get("error") or "预热失败"))
+    return data
 
 
 @app.post("/api/gpu/autodl/disconnect")
@@ -424,7 +492,8 @@ async def autodl_connect(body: AutodlConnectIn = AutodlConnectIn()) -> Streaming
     if not password:
         raise HTTPException(400, "请填写 AutoDL SSH 密码")
     token = (settings.gpu_worker_token or "").strip() or secrets.token_hex(16)
-    model = settings.whisper_model or "large-v3"
+    # 本机 Intel Mac 默认 small；租 GPU 就是为了跑 large-v3，不要沿用本机模型档。
+    model = "large-v3"
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
@@ -447,7 +516,7 @@ async def autodl_connect(body: AutodlConnectIn = AutodlConnectIn()) -> Streaming
             current.gpu_worker_url = str(result["url"])
             current.compute_backend = "cloud"
             save_settings(current)
-            emit("接入完成。新建任务选文字研究或完整归档，步骤 6 选云端 GPU。", "ok")
+            emit("接入完成。按 UP 主采集选文字研究或完整归档，步骤 6 选云端 GPU。", "ok")
             loop.call_soon_threadsafe(
                 queue.put_nowait,
                 {
@@ -582,6 +651,9 @@ async def create_academic_job(body: AcademicJobIn) -> dict[str, Any]:
     config["seed_uids"] = uids
     config["transcribe_mode"] = transcribe_mode
     config["compute_backend"] = compute_backend
+    settings = load_settings()
+    config["rclone_remote"] = settings.rclone_remote
+    config["rclone_root"] = settings.rclone_root
     runtime = JobRuntime(job_id, config)
     JOBS[job_id] = runtime
     store.save_job(job_id, config, "queued", {})
@@ -589,7 +661,110 @@ async def create_academic_job(body: AcademicJobIn) -> dict[str, Any]:
     return {"id": job_id, "bvids": bvids, "uids": uids, "status": "queued"}
 
 
-class CorpusQueryIn(BaseModel):
+class TranscribeJobIn(BaseModel):
+    bvids_text: str
+    transcribe_mode: str = "official_then_whisper"
+    media_mode: str = "video"
+    media_keep: str = "upload_then_delete"
+    resume: bool = True
+    compute_backend: str = "cloud"
+    crawl_comments: bool = False
+    attach_run_id: str = ""
+
+
+@app.get("/api/jobs/transcribe/missing")
+async def missing_transcripts(run_id: str = "5ba1f9a96259") -> dict[str, Any]:
+    from bili.transcribe import folder_transcript_has_text
+
+    bvids = corpus.missing_transcript_bvids(run_id)
+    folders: dict[str, Path] = {}
+    for path in LIBRARY_DIR.rglob("*"):
+        if not path.is_dir() or "/videos/" not in str(path) or path.name in {"media", "parts"}:
+            continue
+        for part in path.name.split("_"):
+            if part.startswith("BV") and len(part) >= 12:
+                folders[part] = path
+                break
+    pending: list[str] = []
+    skipped_done = 0
+    for bvid in bvids:
+        folder = folders.get(bvid)
+        if folder and folder_transcript_has_text(folder):
+            skipped_done += 1
+            continue
+        pending.append(bvid)
+    return {
+        "run_id": run_id,
+        "pending": pending,
+        "count": len(pending),
+        "already_on_disk": skipped_done,
+        "text": "\n".join(pending),
+    }
+
+
+@app.post("/api/jobs/transcribe")
+async def create_transcribe_job(body: TranscribeJobIn) -> dict[str, Any]:
+    from bili.util import parse_bvids
+
+    bvids = parse_bvids(body.bvids_text)
+    if not bvids:
+        raise HTTPException(400, "请填写至少一个 BV 号或视频链接")
+    if body.media_mode not in {"none", "link", "audio", "video"}:
+        raise HTTPException(400, "媒体策略无效")
+    if body.transcribe_mode not in TRANSCRIBE_MODES:
+        raise HTTPException(400, "转写策略无效")
+    transcribe_mode, compute_backend = resolve_compute(body.transcribe_mode, body.compute_backend)
+    if transcribe_mode in LOCAL_WHISPER and body.media_mode not in {"audio", "video"}:
+        raise HTTPException(400, "语音识别需要音频：请把媒体策略改为“下载音频”或“下载视频”")
+    if needs_remote_models(transcribe_mode, compute_backend, True):
+        settings_now = load_settings()
+        ok, message = gpu_worker_ready(settings_now.gpu_worker_url, settings_now.gpu_worker_token)
+        if not ok:
+            raise HTTPException(400, "请先到设置里接入 AutoDL GPU。\n" + message)
+    if body.media_keep not in KEEP_POLICIES:
+        raise HTTPException(400, "空间策略无效")
+    if body.media_keep == "upload_then_delete":
+        settings_now = load_settings()
+        ok, message = rclone_drive_ready(settings_now.rclone_remote)
+        if not ok:
+            raise HTTPException(400, message)
+    job_id = uuid.uuid4().hex[:12]
+    settings = load_settings()
+    config = {
+        "kind": "transcribe",
+        "skip_gate": True,
+        "seeds_text": body.bvids_text,
+        "seed_bvids": bvids,
+        "seed_uids": [],
+        "max_depth": 0,
+        "max_nodes": len(bvids),
+        "related_limit": 0,
+        "min_views": 0,
+        "min_replies": 0,
+        "min_engagement": 0,
+        "category_allow": "",
+        "category_deny": "",
+        "tag_terms": "",
+        "keyword": "",
+        "time_range": "all",
+        "seeds_per_uid": 0,
+        "crawl_comments": bool(body.crawl_comments),
+        "crawl_danmaku": False,
+        "transcribe_mode": transcribe_mode,
+        "media_mode": body.media_mode,
+        "media_keep": body.media_keep,
+        "resume": bool(body.resume),
+        "compute_backend": compute_backend,
+        "ocr_enabled": True,
+        "attach_run_id": (body.attach_run_id or "").strip(),
+        "rclone_remote": settings.rclone_remote,
+        "rclone_root": settings.rclone_root,
+    }
+    runtime = JobRuntime(job_id, config)
+    JOBS[job_id] = runtime
+    store.save_job(job_id, config, "queued", {})
+    runtime.task = asyncio.create_task(_run_job(runtime))
+    return {"id": job_id, "bvids": bvids, "status": "queued"}
     sql: str
 
 
@@ -674,6 +849,28 @@ async def cancel_job(job_id: str) -> dict[str, str]:
     job.status = "cancelling"
     job.emit("status", {"status": "cancelling"})
     return {"id": job_id, "status": "cancelling"}
+
+
+@app.post("/api/jobs/{job_id}/resume")
+async def resume_job(job_id: str) -> dict[str, Any]:
+    busy = [item for item in JOBS.values() if item.status in {"queued", "running", "cancelling"}]
+    if busy:
+        raise HTTPException(400, "已有任务在跑。请先取消或等它结束，再续跑。")
+    live = JOBS.get(job_id)
+    recorded = store.get_job(job_id)
+    # Prefer on-disk config so manual limit bumps (e.g. max_nodes) take effect on resume.
+    config = ((recorded or {}).get("config") if recorded else None) or (live.config if live else None)
+    if not config:
+        raise HTTPException(404, "任务不存在，无法续跑")
+    if (config.get("kind") or "archive") not in {"academic", "transcribe", "archive"}:
+        raise HTTPException(400, "这种任务不能续跑")
+    config = dict(config)
+    config["resume"] = True
+    runtime = JobRuntime(job_id, config)
+    JOBS[job_id] = runtime
+    store.save_job(job_id, config, "queued", (recorded or {}).get("progress") or {})
+    runtime.task = asyncio.create_task(_run_job(runtime))
+    return {"id": job_id, "status": "queued", "kind": config.get("kind")}
 
 
 @app.get("/api/jobs/{job_id}/events")
@@ -825,11 +1022,17 @@ async def _execute_job(job: JobRuntime) -> None:
     last_videos = 0
     last_uids = 0
     job.status = "running"
-    if job.config.get("kind") == "academic":
+    if job.config.get("kind") in {"academic", "transcribe"}:
+        transcribe_job = job.config.get("kind") == "transcribe" or bool(job.config.get("skip_gate"))
         on_log(
             "info",
-            f"滚雪球启动 · 种子视频 {len(job.config.get('seed_bvids') or [])} · "
-            f"账号 {len(job.config.get('seed_uids') or [])} · 深度 {job.config.get('max_depth')}",
+            (
+                f"按视频号采集启动 · {len(job.config.get('seed_bvids') or [])} 条 · "
+                f"Whisper + 无声画面 OCR"
+                if transcribe_job
+                else f"学术滚雪球启动 · 种子视频 {len(job.config.get('seed_bvids') or [])} · "
+                f"账号 {len(job.config.get('seed_uids') or [])} · 深度 {job.config.get('max_depth')}"
+            ),
         )
         await bark("start", {"uids_total": job.config.get("max_nodes") or 0})
         academic = AcademicCrawler(
@@ -845,9 +1048,9 @@ async def _execute_job(job: JobRuntime) -> None:
             seeds_text=job.config.get("seeds_text") or "",
             seed_bvids=job.config.get("seed_bvids") or [],
             seed_uids=job.config.get("seed_uids") or [],
-            max_depth=int(job.config.get("max_depth") or 2),
+            max_depth=0 if transcribe_job else int(job.config.get("max_depth") or 2),
             max_nodes=int(job.config.get("max_nodes") or 80),
-            related_limit=int(job.config.get("related_limit") or 15),
+            related_limit=0 if transcribe_job else int(job.config.get("related_limit") or 15),
             min_views=int(job.config.get("min_views") or 0),
             min_replies=int(job.config.get("min_replies") or 0),
             min_engagement=float(job.config.get("min_engagement") or 0),
@@ -862,13 +1065,18 @@ async def _execute_job(job: JobRuntime) -> None:
             transcribe_mode=job.config.get("transcribe_mode") or "official_then_whisper",
             media_mode=job.config.get("media_mode") or "audio",
             media_keep=job.config.get("media_keep") or "delete_after_text",
+            ocr_enabled=bool(job.config.get("ocr_enabled", transcribe_job)),
             resume=bool(job.config.get("resume", True)),
             compute_backend=job.config.get("compute_backend") or "local",
+            rclone_remote=job.config.get("rclone_remote") or settings.rclone_remote,
+            rclone_root=job.config.get("rclone_root") or settings.rclone_root,
+            skip_gate=transcribe_job,
         )
         try:
             await academic.run(cfg_ac, on_progress=on_progress)
             job.status = "cancelled" if job.cancel or academic.cancelled else "done"
-            on_log("ok", "滚雪球结束" if job.status == "done" else "已取消")
+            done_msg = "按视频号采集结束" if transcribe_job else "学术滚雪球结束"
+            on_log("ok", done_msg if job.status == "done" else "已取消")
         except asyncio.CancelledError:
             job.status = "cancelled"
             on_log("warn", "任务已取消；队列和已采集节点已保留")

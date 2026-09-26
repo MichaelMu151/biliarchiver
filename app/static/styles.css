@@ -53,7 +53,16 @@ body {
 .brand-name { font-weight: 700; letter-spacing: 0.02em; }
 .brand-sub { color: var(--muted); font-size: 12px; }
 
-.nav { display: flex; flex-direction: column; gap: 6px; }
+.nav { display: flex; flex-direction: column; gap: 4px; }
+.nav-label {
+  margin: 14px 12px 2px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+.nav button { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+.nav-title { font-weight: 600; }
+.nav-hint { font-size: 11px; font-weight: 400; color: var(--muted); line-height: 1.35; }
 .nav button, .ghost, .primary, .pills button {
   font: inherit; cursor: pointer; border: 0;
 }
@@ -272,6 +281,27 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .launch-card { display: grid; grid-template-columns: 1fr auto; gap: 24px; align-items: end; }
 .launch-card .actions { flex-direction: column; align-items: flex-end; }
 .launch-card .primary { min-width: 180px; }
+.resume-box { margin-top: 14px; display: flex; flex-direction: column; gap: 6px; }
+.resume-box select, .job-history select {
+  font: inherit;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+}
+.job-history { display: flex; flex-direction: column; gap: 8px; }
+.job-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--bg);
+}
+.job-row b { font-weight: 600; }
+.job-row .muted { display: block; margin-top: 2px; }
 .flow-grid { grid-template-columns: repeat(3, 1fr); }
 .flow-grid div { padding: 14px; background: #111824; border-radius: 13px; border: 1px solid var(--line); }
 .flow-grid b { color: var(--blue); }

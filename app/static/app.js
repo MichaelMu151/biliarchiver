@@ -1,11 +1,28 @@
 const titles = {
-  guide: ["使用指南", "把 UID 变成可检索的档案、Markdown 和可续跑的任务。"],
-  task: ["新建任务", "选择账号、时间窗口和要采集的模块。"],
-  academic: ["学术采样", "从种子视频滚雪球：视频转写、评论树和推荐图一起写入分析库。"],
-  monitor: ["运行监控", "看进度、日志，必要时取消。"],
+  guide: ["使用指南", "三种采集分开用。每种都能从头开始，也能续跑中断的那一次。"],
+  task: ["按 UP 主采集", "指定账号，按时间窗口把投稿、动态和评论整库归档。"],
+  academic: ["学术滚雪球", "从种子视频沿相关推荐扩样本，过门禁的才写入分析库。"],
+  transcribe: ["按视频号采集", "只处理你列出的 BV：不扩散推荐，也不过门禁。"],
+  monitor: ["运行监控", "看进度和日志。中断的任务在这里续跑；换条件请回到采集页从头开始。"],
   results: ["采集结果", "浏览账号快照、视频 Markdown 和动态 OCR。"],
   corpus: ["分析数据集", "作者、视频、评论、推荐边和门禁漏斗，可导出 CSV。"],
   settings: ["设置与登录", "扫码或粘贴 Cookie，调节间隔与转写。"],
+};
+
+const KIND_LABEL = {
+  archive: "按 UP 主采集",
+  academic: "学术滚雪球",
+  transcribe: "按视频号采集",
+};
+
+const STATUS_LABEL = {
+  queued: "排队",
+  running: "进行中",
+  cancelling: "取消中",
+  cancelled: "已取消",
+  interrupted: "已中断",
+  done: "已完成",
+  error: "出错",
 };
 
 let currentJobId = null;
@@ -37,6 +54,13 @@ function showPage(name) {
   if (name === "results") loadResults();
   if (name === "corpus") loadCorpus();
   if (name === "settings") loadSettings();
+  if (name === "transcribe") {
+    loadMissingBvids();
+    fillResumePick("transcribe-resume-pick", "transcribe", "transcribe-resume-hint");
+  }
+  if (name === "task") fillResumePick("task-resume-pick", "archive", "task-resume-hint");
+  if (name === "academic") fillResumePick("academic-resume-pick", "academic", "academic-resume-hint");
+  if (name === "monitor") loadJobHistory();
 }
 
 document.querySelectorAll("#range-pills button").forEach((btn) => {
@@ -120,10 +144,10 @@ function enforceAcademicChoices(changedName) {
   const needsAudio = ["whisper", "official_then_whisper"].includes(transcript);
   if (changedName === "ac-transcribe-mode" && needsAudio && !["audio", "video"].includes(media)) {
     setRadio("ac-media-mode", "audio");
-    toast("学术采样已改为下载音频，才能跑 Whisper");
+    toast("学术滚雪球已改为下载音频，才能跑 Whisper");
   } else if (changedName === "ac-media-mode" && needsAudio && !["audio", "video"].includes(media)) {
     setRadio("ac-transcribe-mode", "official");
-    toast("未下载音频时，学术采样改为只取官方字幕");
+    toast("未下载音频时，学术滚雪球改为只取官方字幕");
   }
 }
 
@@ -211,7 +235,7 @@ $("task-form").addEventListener("submit", async (e) => {
     crawl_comments: $("m-comments").checked,
     crawl_danmaku: $("m-danmaku").checked,
     ocr_enabled: $("m-ocr").checked,
-    resume: $("m-resume").checked,
+    resume: false,
     media_mode: radioValue("media-mode"),
     transcribe_mode: radioValue("transcribe-mode"),
     media_keep: radioValue("media-keep"),
@@ -224,7 +248,7 @@ $("task-form").addEventListener("submit", async (e) => {
     $("log-view").textContent = "";
     showPage("monitor");
     listenJob(res.id);
-    toast("任务已开始");
+    toast("已从头开始一次按 UP 主采集");
   } catch (err) {
     toast(err.message);
   }
@@ -234,6 +258,105 @@ $("cancel-btn").addEventListener("click", async () => {
   if (!currentJobId) return;
   await api("/api/jobs/" + currentJobId + "/cancel", { method: "POST" });
   toast("正在取消");
+});
+
+function jobKind(job) {
+  return (job?.config || {}).kind || "archive";
+}
+
+function jobProgressText(job) {
+  const progress = job.progress || {};
+  const frontier = progress.frontier || {};
+  if (frontier.done != null && (progress.max_nodes || frontier.pending != null)) {
+    const max = progress.max_nodes || "";
+    return max ? `${frontier.done}/${max} 已完成` : `已完成 ${frontier.done}`;
+  }
+  if (progress.videos_done != null) return `视频 ${progress.videos_done}`;
+  return progress.stage || "";
+}
+
+function jobOptionLabel(job) {
+  const status = STATUS_LABEL[job.status] || job.status || "";
+  const when = (job.created_at || "").replace("T", " ").slice(0, 16);
+  return `#${job.id.slice(0, 8)} · ${status}${when ? " · " + when : ""} · ${jobProgressText(job)}`;
+}
+
+async function fetchJobs() {
+  return api("/api/jobs");
+}
+
+function jobsOfKind(data, kind) {
+  const seen = new Set();
+  const rows = [];
+  for (const job of [...(data.live || []), ...(data.history || [])]) {
+    if (jobKind(job) !== kind || seen.has(job.id)) continue;
+    seen.add(job.id);
+    rows.push(job);
+  }
+  return rows.slice(0, 20);
+}
+
+async function fillResumePick(selectId, kind, hintId) {
+  const select = $(selectId);
+  if (!select) return;
+  try {
+    const data = await fetchJobs();
+    const rows = jobsOfKind(data, kind).filter((job) => !["queued", "running", "cancelling"].includes(job.status));
+    select.innerHTML = rows.length
+      ? rows.map((job) => `<option value="${job.id}">${escapeHtml(jobOptionLabel(job))}</option>`).join("")
+      : `<option value="">还没有可续跑的${KIND_LABEL[kind] || "任务"}</option>`;
+    const hint = hintId ? $(hintId) : null;
+    if (hint && !rows.length) hint.textContent = "还没有保存过这类任务。先从头开始一次。";
+  } catch (err) {
+    select.innerHTML = `<option value="">读取任务失败</option>`;
+  }
+}
+
+async function resumeExistingJob(jobId) {
+  if (!jobId) {
+    toast("请先选择要续跑的任务");
+    return;
+  }
+  const res = await api("/api/jobs/" + jobId + "/resume", { method: "POST" });
+  currentJobId = res.id;
+  $("job-id").textContent = "#" + res.id;
+  $("log-view").textContent = "";
+  showPage("monitor");
+  listenJob(res.id);
+  toast("已从检查点续跑");
+}
+
+$("resume-btn")?.addEventListener("click", async () => {
+  if (!currentJobId) return;
+  try {
+    await resumeExistingJob(currentJobId);
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+$("task-resume")?.addEventListener("click", async () => {
+  try {
+    await resumeExistingJob($("task-resume-pick")?.value || "");
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+$("academic-resume")?.addEventListener("click", async () => {
+  try {
+    await resumeExistingJob($("academic-resume-pick")?.value || "");
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+$("transcribe-resume")?.addEventListener("click", async () => {
+  try {
+    await resumeExistingJob($("transcribe-resume-pick")?.value || "");
+  } catch (err) {
+    toast(err.message);
+  }
 });
 
 $("academic-start")?.addEventListener("click", async () => {
@@ -266,6 +389,7 @@ $("academic-start")?.addEventListener("click", async () => {
         media_mode: media,
         media_keep: radioValue("ac-media-keep") || "delete_after_text",
         compute_backend: radioValue("ac-compute-backend") || "local",
+        resume: false,
       },
     });
     currentJobId = res.id;
@@ -273,7 +397,56 @@ $("academic-start")?.addEventListener("click", async () => {
     $("log-view").textContent = "";
     showPage("monitor");
     listenJob(res.id);
-    toast("滚雪球已开始");
+    toast("已从头开始一次学术滚雪球");
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+async function loadMissingBvids() {
+  const hint = $("transcribe-missing-hint");
+  try {
+    const data = await api("/api/jobs/transcribe/missing?run_id=5ba1f9a96259");
+    if (hint) {
+      hint.textContent = data.count
+        ? `学术滚雪球里还有 ${data.count} 条过门但没台词。点按钮填入后，用「从头开始」新开一批。`
+        : "学术滚雪球里，过门视频都已有台词。仍可自己粘贴 BV，再从头开始。";
+    }
+    return data;
+  } catch (err) {
+    if (hint) hint.textContent = "读未完成列表失败：" + err.message;
+    return null;
+  }
+}
+
+$("transcribe-fill-missing")?.addEventListener("click", async () => {
+  const data = await loadMissingBvids();
+  if (!data) return;
+  $("transcribe-bvids").value = data.text || "";
+  toast(data.count ? `已填入 ${data.count} 个 BV` : "没有待补的 BV");
+});
+
+$("transcribe-start")?.addEventListener("click", async () => {
+  try {
+    const res = await api("/api/jobs/transcribe", {
+      method: "POST",
+      body: {
+        bvids_text: $("transcribe-bvids").value,
+        transcribe_mode: "official_then_whisper",
+        media_mode: "video",
+        media_keep: "upload_then_delete",
+        resume: Boolean($("tr-resume")?.checked),
+        compute_backend: radioValue("tr-compute-backend") || "cloud",
+        crawl_comments: false,
+        attach_run_id: "5ba1f9a96259",
+      },
+    });
+    currentJobId = res.id;
+    $("job-id").textContent = "#" + res.id;
+    $("log-view").textContent = "";
+    showPage("monitor");
+    listenJob(res.id);
+    toast("已从头开始一次按视频号采集");
   } catch (err) {
     toast(err.message);
   }
@@ -383,16 +556,18 @@ function appendLog(item) {
 
 function applyProgress(p) {
   if (!p) return;
-  const academic = p.kind === "academic" || Boolean(p.max_nodes);
-  const total = academic ? (p.max_nodes || 1) : (p.uids_total || 1);
-  const done = academic ? (p.nodes_done || p.videos_done || 0) : (p.uids_done || 0);
-  if ($("m-uids-label")) $("m-uids-label").textContent = academic ? "节点" : "账号";
-  if ($("m-videos-label")) $("m-videos-label").textContent = academic ? "通过" : "视频";
-  if ($("m-dyn-label")) $("m-dyn-label").textContent = academic ? "剪枝" : "动态";
+  const transcribe = p.kind === "transcribe";
+  const academic = p.kind === "academic" || (!transcribe && Boolean(p.max_nodes));
+  const listed = transcribe || academic;
+  const total = listed ? (p.max_nodes || 1) : (p.uids_total || 1);
+  const done = listed ? (p.nodes_done || p.videos_done || 0) : (p.uids_done || 0);
+  if ($("m-uids-label")) $("m-uids-label").textContent = transcribe ? "进度" : academic ? "节点" : "账号";
+  if ($("m-videos-label")) $("m-videos-label").textContent = transcribe ? "完成" : academic ? "通过" : "视频";
+  if ($("m-dyn-label")) $("m-dyn-label").textContent = transcribe ? "失败" : academic ? "剪枝" : "动态";
   $("m-status").textContent = translateStatus(p.stage || "running");
   $("m-uids").textContent = `${done} / ${total}`;
-  $("m-videos-n").textContent = academic ? (p.passed || p.videos_done || 0) : (p.videos_done || 0);
-  $("m-dyn-n").textContent = academic ? (p.pruned || 0) : (p.dynamics_done || 0);
+  $("m-videos-n").textContent = listed ? (p.passed || p.videos_done || 0) : (p.videos_done || 0);
+  $("m-dyn-n").textContent = listed ? (p.pruned || 0) : (p.dynamics_done || 0);
   $("m-current").textContent = p.current || "";
   const percent = Math.min(100, (done / total) * 100);
   $("progress-bar").style.width = percent + "%";
@@ -743,8 +918,60 @@ async function restoreLiveJob() {
       (job.logs || []).forEach(appendLog);
       applyProgress(job.progress || { stage: job.status });
       listenJob(job.id);
+      return;
     }
+    const paused = (data.history || []).find((item) =>
+      ["cancelled", "interrupted", "error"].includes(item.status)
+      && ["academic", "transcribe", "archive"].includes(jobKind(item))
+    );
+    if (paused) {
+      currentJobId = paused.id;
+      $("job-id").textContent = "#" + paused.id;
+      applyProgress(paused.progress || { stage: paused.status });
+      $("m-current").textContent = "已暂停。可点「续跑此任务」，或在上方任务记录里选别的一次。";
+    }
+    loadJobHistory(data);
   } catch (_) {}
+}
+
+async function loadJobHistory(preset) {
+  const box = $("job-history");
+  if (!box) return;
+  try {
+    const data = preset || await fetchJobs();
+    const seen = new Set();
+    const rows = [...(data.live || []), ...(data.history || [])].filter((job) => {
+      if (seen.has(job.id)) return false;
+      seen.add(job.id);
+      return ["archive", "academic", "transcribe"].includes(jobKind(job));
+    }).slice(0, 12);
+    if (!rows.length) {
+      box.innerHTML = '<p class="muted">还没有任务。到左侧三种采集里选一种，点「从头开始」。</p>';
+      return;
+    }
+    box.innerHTML = rows.map((job) => {
+      const busy = ["queued", "running", "cancelling"].includes(job.status);
+      const status = STATUS_LABEL[job.status] || job.status || "";
+      return `<div class="job-row">
+        <div>
+          <b>${escapeHtml(KIND_LABEL[jobKind(job)] || "任务")} · ${escapeHtml(status)}</b>
+          <span class="muted">#${escapeHtml(job.id)} · ${escapeHtml(jobProgressText(job))}</span>
+        </div>
+        <button type="button" class="ghost" data-resume="${escapeHtml(job.id)}" ${busy ? "disabled" : ""}>${busy ? "进行中" : "续跑"}</button>
+      </div>`;
+    }).join("");
+    box.querySelectorAll("[data-resume]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        try {
+          await resumeExistingJob(btn.dataset.resume);
+        } catch (err) {
+          toast(err.message);
+        }
+      });
+    });
+  } catch (err) {
+    box.innerHTML = `<p class="muted">读取任务失败：${escapeHtml(err.message)}</p>`;
+  }
 }
 
 restoreLiveJob();
@@ -793,7 +1020,7 @@ async function loadCorpus() {
     const funnel = data.funnel || [];
     const funnelEl = $("corpus-funnel");
     if (!funnel.length) {
-      funnelEl.innerHTML = '<p class="muted">还没有门禁记录。跑一次「学术采样」后会出现通过 / 剪枝原因。</p>';
+      funnelEl.innerHTML = '<p class="muted">还没有门禁记录。跑一次「学术滚雪球」后会出现通过 / 剪枝原因。</p>';
     } else {
       funnelEl.innerHTML = `<div class="funnel-row">${funnel.map((row) => {
         const passed = Number(row.passed) === 1;

@@ -87,11 +87,13 @@ def write_video_markdown(
     comment_count: int = 0,
     danmaku_count: int = 0,
 ) -> Path:
-    stat = meta.get("stat") or {}
-    owner = meta.get("owner") or {}
+    stat = meta.get("stat") if isinstance(meta.get("stat"), dict) else {}
+    owner = meta.get("owner") if isinstance(meta.get("owner"), dict) else {}
     pages = meta.get("pages") or []
     page_lines = "\n".join(
-        f"- P{p.get('page')}: {p.get('part')} · cid `{p.get('cid')}` · {p.get('duration')}s" for p in pages
+        f"- P{p.get('page')}: {p.get('part')} · cid `{p.get('cid')}` · {p.get('duration')}s"
+        for p in pages
+        if isinstance(p, dict)
     )
     media_parts = meta.get("media_parts") or []
     part_asset_lines = "\n".join(

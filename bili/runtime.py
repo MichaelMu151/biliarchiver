@@ -21,61 +21,135 @@ def prepare_process() -> None:
     register_cuda_dlls()
 
 
-def register_cuda_dlls() -> list[str]:
-    """Add pip-installed NVIDIA CUDA/cuDNN bins to the DLL search path.
-
-    faster-whisper on Windows often fails with missing cudnn_ops64_9.dll unless
-    these directories are registered. Safe to call repeatedly.
-    """
-    added: list[str] = []
+def _nvidia_package_roots() -> list[Path]:
+    """``nvidia`` is often a namespace package: ``__file__`` is None, ``__path__`` is set."""
+    roots: list[Path] = []
+    try:
+        import nvidia  # type: ignore
+    except Exception:
+        return roots
+    nvidia_file = getattr(nvidia, "__file__", None)
+    if isinstance(nvidia_file, (str, os.PathLike)):
+        roots.append(Path(nvidia_file).resolve().parent)
+    for item in getattr(nvidia, "__path__", []) or []:
+        try:
+            roots.append(Path(item))
+        except TypeError:
+            continue
+    unique: list[Path] = []
     seen: set[str] = set()
+    for root in roots:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return unique
 
-    def _add(path: Path) -> None:
-        resolved = str(path)
-        if resolved in seen or not path.is_dir():
-            return
-        seen.add(resolved)
-        os.environ["PATH"] = resolved + os.pathsep + os.environ.get("PATH", "")
-        if hasattr(os, "add_dll_directory"):
-            try:
-                os.add_dll_directory(resolved)
-            except OSError:
-                pass
-        added.append(resolved)
 
-    for env_key in ("CUDA_PATH", "CUDNN_PATH"):
+def cuda_library_dirs() -> list[str]:
+    """Directories that may contain libcublas / cuDNN. Used on PATH and LD_LIBRARY_PATH."""
+    dirs: list[Path] = []
+    for env_key in ("CUDA_PATH", "CUDNN_PATH", "CUDA_HOME"):
         root = os.environ.get(env_key)
         if root:
-            _add(Path(root) / "bin")
-            for child in (Path(root) / "bin").glob("*"):
-                if child.is_dir():
-                    _add(child)
-
+            dirs.append(Path(root) / "bin")
+            dirs.append(Path(root) / "lib")
+            dirs.append(Path(root) / "lib64")
+            bin_dir = Path(root) / "bin"
+            if bin_dir.is_dir():
+                dirs.extend(child for child in bin_dir.glob("*") if child.is_dir())
     program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
     cudnn_root = program_files / "NVIDIA" / "CUDNN"
     if cudnn_root.exists():
         for bin_dir in cudnn_root.glob("v*/bin"):
-            _add(bin_dir)
-            for child in bin_dir.glob("*"):
-                if child.is_dir():
-                    _add(child)
+            dirs.append(bin_dir)
+            dirs.extend(child for child in bin_dir.glob("*") if child.is_dir())
     cuda_root = program_files / "NVIDIA GPU Computing Toolkit" / "CUDA"
     if cuda_root.exists():
         for bin_dir in cuda_root.glob("v*/bin"):
-            _add(bin_dir)
+            dirs.append(bin_dir)
+    for system_cuda in (
+        Path("/usr/local/cuda"),
+        Path("/usr/local/cuda-12"),
+        Path("/usr/local/cuda-12.4"),
+        Path("/usr/local/cuda-12.1"),
+        Path("/usr/local/cuda-13"),
+        Path("/usr/local/cuda-13.0"),
+    ):
+        dirs.append(system_cuda / "lib64")
+        dirs.append(system_cuda / "lib")
+    for nvidia_root in _nvidia_package_roots():
+        dirs.extend(nvidia_root.glob("*/bin"))
+        dirs.extend(nvidia_root.glob("*/lib"))
+        dirs.extend(nvidia_root.glob("*/lib64"))
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for path in dirs:
+        if not path.is_dir():
+            continue
+        resolved = str(path.resolve()) if path.exists() else str(path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        ordered.append(resolved)
+    return ordered
 
-    try:
-        import nvidia  # type: ignore
-    except Exception:
-        nvidia = None
-    if nvidia is not None:
-        nvidia_root = Path(nvidia.__file__).resolve().parent
-        for bin_dir in nvidia_root.glob("*/bin"):
-            _add(bin_dir)
-        for lib_dir in nvidia_root.glob("*/lib"):
-            _add(lib_dir)
 
+def register_cuda_dlls() -> list[str]:
+    """Put CUDA/cuDNN dirs on PATH (Windows) and LD_LIBRARY_PATH (Linux).
+
+    faster-whisper on Windows often fails with missing cudnn_ops64_9.dll unless
+    these directories are registered. On AutoDL, pip ctranslate2 wants
+    libcublas.so.12 even when the image only shipped CUDA 13.
+    """
+    added = cuda_library_dirs()
+    if not added:
+        return added
+
+    def _prepend(env_key: str) -> None:
+        current = [part for part in os.environ.get(env_key, "").split(os.pathsep) if part]
+        extra = [folder for folder in added if folder not in current]
+        if extra:
+            os.environ[env_key] = os.pathsep.join(extra + current)
+
+    _prepend("PATH")
+    if os.name != "nt":
+        _prepend("LD_LIBRARY_PATH")
+    if hasattr(os, "add_dll_directory"):
+        for folder in added:
+            try:
+                os.add_dll_directory(folder)
+            except OSError:
+                pass
+    if os.name != "nt":
+        _preload_cuda_libs(added)
     return added
+
+
+def _preload_cuda_libs(dirs: list[str]) -> None:
+    """dlopen CUDA 12 libs now; changing LD_LIBRARY_PATH later is too late for ld.so."""
+    try:
+        import ctypes
+    except Exception:
+        return
+    names = (
+        "libcublas.so.12",
+        "libcublasLt.so.12",
+        "libcudart.so.12",
+        "libcudnn.so.9",
+        "libnvrtc.so.12",
+    )
+    for folder in dirs:
+        root = Path(folder)
+        for name in names:
+            candidate = root / name
+            if not candidate.exists():
+                continue
+            try:
+                ctypes.CDLL(str(candidate), mode=getattr(ctypes, "RTLD_GLOBAL", 256))
+            except OSError:
+                continue
 
 
 def ffmpeg_candidates(explicit: str = "ffmpeg") -> list[Path]:

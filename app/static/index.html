@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=20260922d" />
+  <link rel="stylesheet" href="/static/styles.css?v=20260926a" />
 </head>
 <body>
   <div class="app">
@@ -20,13 +20,16 @@
         </div>
       </div>
       <nav class="nav">
-        <button data-page="guide" class="active">使用指南</button>
-        <button data-page="task">新建任务</button>
-        <button data-page="academic">学术采样</button>
-        <button data-page="monitor">运行监控</button>
-        <button data-page="results">采集结果</button>
-        <button data-page="corpus">分析数据集</button>
-        <button data-page="settings">设置与登录</button>
+        <button data-page="guide" class="active"><span class="nav-title">使用指南</span></button>
+        <p class="nav-label">三种采集</p>
+        <button data-page="task"><span class="nav-title">按 UP 主采集</span><span class="nav-hint">指定账号，按时间整库归档</span></button>
+        <button data-page="academic"><span class="nav-title">学术滚雪球</span><span class="nav-hint">从种子沿相关推荐扩样本</span></button>
+        <button data-page="transcribe"><span class="nav-title">按视频号采集</span><span class="nav-hint">只处理你列出的 BV，不再扩散</span></button>
+        <p class="nav-label">查看与设置</p>
+        <button data-page="monitor"><span class="nav-title">运行监控</span><span class="nav-hint">进度、日志、续跑与取消</span></button>
+        <button data-page="results"><span class="nav-title">采集结果</span></button>
+        <button data-page="corpus"><span class="nav-title">分析数据集</span></button>
+        <button data-page="settings"><span class="nav-title">设置与登录</span></button>
       </nav>
       <div class="sidebar-foot">
         <div class="pill" id="login-pill">检测登录中…</div>
@@ -38,7 +41,7 @@
       <header class="topbar">
         <div>
           <h1 id="page-title">使用指南</h1>
-          <p class="muted" id="page-sub">把 UID 变成可检索的档案、Markdown 和可续跑的任务。</p>
+          <p class="muted" id="page-sub">三种采集分开用：按 UP 主、学术滚雪球、按视频号。每种都能从头开始，也能续跑中断的任务。</p>
         </div>
         <div class="top-actions">
           <span class="status-dot" id="status-dot"></span>
@@ -49,15 +52,15 @@
       <section id="page-guide" class="page active">
         <div class="hero">
           <div>
-            <p class="eyebrow">从 UID 到完整档案</p>
-            <h2>一次配置，按时间窗口采集 UP 主的视频、动态、弹幕和转写。</h2>
-            <p>本工具走 B 站公开 Web 接口，带 WBI 签名、buvid3、风控退避和断点续爬。默认把结构化数据写入 SQLite，把给人读的内容写成 Markdown。</p>
+            <p class="eyebrow">三种采集，用途不同</p>
+            <h2>按账号归档、按推荐滚雪球，或只补你点名的视频。</h2>
+            <p>本工具走 B 站公开 Web 接口，带 WBI 签名、buvid3 和风控退避。结构化数据进 SQLite，给人读的内容写成 Markdown。每种采集页都有「从头开始」和「续跑选中任务」：前者新建任务号，后者接着同一个任务和磁盘检查点。</p>
           </div>
           <div class="hero-card">
-            <div class="stat"><b>1</b><span>填 UID</span></div>
-            <div class="stat"><b>2</b><span>选时间与模块</span></div>
-            <div class="stat"><b>3</b><span>开始并看着日志跑</span></div>
-            <div class="stat"><b>4</b><span>到「采集结果」阅读</span></div>
+            <div class="stat"><b>UP</b><span>按账号归档</span></div>
+            <div class="stat"><b>雪球</b><span>沿推荐抽样</span></div>
+            <div class="stat"><b>BV</b><span>只采列出的视频</span></div>
+            <div class="stat"><b>续</b><span>中断后接着跑</span></div>
           </div>
         </div>
 
@@ -103,8 +106,8 @@
               「仅链接」最稳；「音频」适合转写；「完整视频」需要 ffmpeg，体积大。提取文字后可以删除本地媒体，只保留 BV 链接；也可以压缩或上传 Google Drive。
             </li>
             <li>
-              <strong>开始任务</strong>
-              到「运行监控」看进度。中断后用同一 UID 再跑并勾选续跑，已完成的视频/动态会跳过。
+              <strong>开始或续跑</strong>
+              新任务点「从头开始」。跑到一半断了，在同一页的下拉框里选那次任务，点「续跑选中任务」；运行监控里也能续跑。不要为了续跑再开一个新任务。
             </li>
           </ol>
         </article>
@@ -118,7 +121,7 @@
             <div><b>④ 完整视频归档</b><p>媒体选“下载完整视频”。音频和视频流可断点续传，有 ffmpeg 时自动合并 MP4。</p></div>
             <div><b>⑤ 图片 OCR</b><p>开启“动态图片 OCR”。图片会先校正方向和尺寸，再输出正文、置信度和文字坐标。</p></div>
             <div><b>⑦ Whisper / OCR 算力</b><p>完整归档和文字研究可以选本机，或把音频和动态图片送到已激活的云端 GPU 工作机。这不是第四种档案类型。</p></div>
-            <div><b>⑧ 学术滚雪球</b><p>「学术采样」从种子视频沿相关推荐扩图。通过门禁的视频会同时采<strong>视频转写</strong>（官方字幕，缺则 Whisper）和<strong>评论树</strong>，写入 <code>data/corpus.db</code>。默认门禁：挡住游戏/影视、播放 ≥ 1 万、评论 ≥ 150 或互动比 ≥ 0.003、标签命中就业/学历等。</p></div>
+            <div><b>⑧ 三种采集别混用</b><p><strong>按 UP 主</strong>：整库归档指定账号。<strong>学术滚雪球</strong>：从种子沿相关推荐扩，过门禁才写入 <code>corpus.db</code>。<strong>按视频号</strong>：只处理你粘贴的 BV，不扩散、不过门禁。中断后都用「续跑选中任务」，不要另开新任务号。</p></div>
           </div>
         </article>
 
@@ -220,8 +223,8 @@
               <label><input type="checkbox" id="m-comments" checked /> 评论（含楼中楼）</label>
               <label><input type="checkbox" id="m-danmaku" checked /> 弹幕</label>
               <label><input type="checkbox" id="m-ocr" checked /> 动态图片 OCR</label>
-              <label><input type="checkbox" id="m-resume" checked /> 断点续跑</label>
             </div>
+            <p class="hint">要接着上次没跑完的账号，不要在这里重开。用本页底部的「续跑选中任务」。</p>
           </article>
 
           <article class="card">
@@ -334,9 +337,14 @@
               <p class="muted" id="plan-summary">不下载媒体；尝试提取官方字幕；图片下载并在 OCR 可用时识别。</p>
               <div class="readiness" id="task-readiness"></div>
             </div>
+            <div class="resume-box">
+              <label for="task-resume-pick">续跑哪一次</label>
+              <select id="task-resume-pick"></select>
+              <p class="hint" id="task-resume-hint">列出本机保存的「按 UP 主」任务。选中断或取消的那条再续跑。</p>
+            </div>
             <div class="actions">
-              <button type="submit" class="primary" id="start-btn">开始采集</button>
-              <span class="muted" id="task-hint">任务串行执行；应用重启后可从磁盘检查点续跑。</span>
+              <button type="submit" class="primary" id="start-btn">从头开始</button>
+              <button type="button" class="ghost" id="task-resume">续跑选中任务</button>
             </div>
           </article>
         </form>
@@ -344,8 +352,8 @@
 
       <section id="page-academic" class="page" hidden>
         <article class="card">
-          <p class="step-kicker">学术采样</p>
-          <h3>滚雪球：视频 + 评论一起进分析库</h3>
+          <p class="step-kicker">学术滚雪球</p>
+          <h3>从种子沿相关推荐扩样本</h3>
           <p>从<strong>你认为像研究对象的视频</strong>出发，顺着 B 站「相关推荐」一层层扩。只有同时通过分区、播放量、互动、标签的视频才会继续往外滚。</p>
           <p>通过门禁的每一条，都会采两层语料，缺一不可：</p>
           <ul>
@@ -360,7 +368,7 @@
           <h3>种子</h3>
           <label for="academic-seeds">种子（BV 号、视频链接、UID 或空间链接，可混排）</label>
           <textarea id="academic-seeds" rows="5" placeholder="https://www.bilibili.com/video/BV1xxxxxxxx&#10;BV1yyyyyyyyyy&#10;https://space.bilibili.com/208259"></textarea>
-          <p class="hint">例：复制一条「打工人 / 学历 / 就业」讨论视频的浏览器地址，每行一个。填 UID 时，会取该 UP 时间窗口内最近若干条当种子，再过一遍门禁。</p>
+          <p class="hint">例：复制一条「打工人 / 学历 / 就业」讨论视频的浏览器地址，每行一个。若要从某 UP 最近投稿里取种子，请单独一行贴 <code>https://space.bilibili.com/数字UID</code>，不要只靠视频链接（链接里 <code>spm_id_from=333</code> 这类参数不是 UID）。</p>
         </article>
 
         <article class="card">
@@ -474,20 +482,84 @@
         <article class="card launch-card">
           <div>
             <p class="step-kicker">确认任务</p>
-            <h3>开始滚雪球</h3>
-            <p class="muted">请先在「设置」登录；匿名评论会被截短。连续风控 5 次会自动停，可续跑。</p>
+            <h3>开始或续跑这一次滚雪球</h3>
+            <p class="muted">请先在「设置」登录。连续风控 5 次会停在当前队列里；用下面的续跑接着同一任务号，不要再点「从头开始」。</p>
+            <div class="resume-box">
+              <label for="academic-resume-pick">续跑哪一次</label>
+              <select id="academic-resume-pick"></select>
+              <p class="hint" id="academic-resume-hint">续跑会沿用该任务已保存的门禁、深度和节点上限。</p>
+            </div>
           </div>
           <div class="actions">
-            <button type="button" class="primary" id="academic-start">开始滚雪球</button>
+            <button type="button" class="primary" id="academic-start">从头开始</button>
+            <button type="button" class="ghost" id="academic-resume">续跑选中任务</button>
+          </div>
+        </article>
+      </section>
+
+      <section id="page-transcribe" class="page" hidden>
+        <article class="card">
+          <p class="step-kicker">按视频号采集</p>
+          <h3>只处理你列出的 BV，不再扩散</h3>
+          <p>这不是按 UP 主整库，也不是滚雪球：不会扩相关推荐，也不过门禁。每一条 BV 下载视频、转写（官方字幕，没有再 Whisper），没有人声才 2 秒抽帧 OCR。适合补漏、重跑某一批视频。进度在「运行监控」。</p>
+          <p class="hint">先停掉旧卡、新开实例，到「设置与登录」一键接入 AutoDL，确认 GPU 工作机就绪后再点开始。</p>
+        </article>
+        <article class="card">
+          <div class="row-between">
+            <h3>BV 列表</h3>
+            <button type="button" class="ghost" id="transcribe-fill-missing">填入上次未转完的 BV</button>
+          </div>
+          <label for="transcribe-bvids">BV 号或视频链接，一行一个也可混排</label>
+          <textarea id="transcribe-bvids" rows="10" placeholder="BV1xxxxxxxx&#10;https://www.bilibili.com/video/BV1yyyyyyyyyy"></textarea>
+          <p class="hint" id="transcribe-missing-hint">上方按钮会填入学术滚雪球里过门但还没有台词的视频。这是新开一批 BV，不是续跑旧任务。</p>
+        </article>
+        <article class="card">
+          <h3>怎么转</h3>
+          <div class="choice-grid">
+            <label class="choice-card selected">
+              <input type="radio" name="tr-transcribe-mode" value="official_then_whisper" checked />
+              <span><strong>官方字幕 + Whisper + 画面 OCR</strong><small>默认。无声 PPT/录屏会抽帧识别并去掉重复幻灯片。</small></span>
+              <em>推荐</em>
+            </label>
+          </div>
+          <div class="choice-grid" style="margin-top:12px">
+            <label class="choice-card selected">
+              <input type="radio" name="tr-compute-backend" value="cloud" checked />
+              <span><strong>云端 GPU</strong><small>large-v3。必须先接入 AutoDL。</small></span>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="tr-compute-backend" value="local" />
+              <span><strong>本机</strong><small>Intel Mac 会很慢，只作应急。</small></span>
+            </label>
+          </div>
+          <div class="checks" style="margin-top:12px">
+            <label class="choice-card"><input type="checkbox" id="tr-resume" /> 从头开始时，跳过已有口播转写的 BV</label>
+          </div>
+          <div class="resume-box">
+            <label for="transcribe-resume-pick">续跑哪一次</label>
+            <select id="transcribe-resume-pick"></select>
+            <p class="hint" id="transcribe-resume-hint">续跑沿用那次任务里保存的 BV 列表，已完成的检查点会跳过。</p>
+          </div>
+          <div class="actions">
+            <button type="button" class="primary" id="transcribe-start">从头开始</button>
+            <button type="button" class="ghost" id="transcribe-resume">续跑选中任务</button>
           </div>
         </article>
       </section>
 
       <section id="page-monitor" class="page" hidden>
         <article class="card">
+          <h3>任务记录</h3>
+          <p class="muted">三种采集的最近任务都在这里。中断或取消后点「续跑」；要换种子、换 UID 或换 BV 列表，回到对应采集页点「从头开始」。</p>
+          <div id="job-history" class="job-history"></div>
+        </article>
+        <article class="card">
           <div class="row-between">
             <h3>当前任务 <span id="job-id" class="muted"></span></h3>
-            <button type="button" class="ghost" id="cancel-btn">取消任务</button>
+            <div class="actions">
+              <button type="button" class="ghost" id="resume-btn">续跑此任务</button>
+              <button type="button" class="ghost" id="cancel-btn">取消任务</button>
+            </div>
           </div>
             <div class="progress-wrap" id="progress-wrap" role="progressbar" aria-label="任务进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
             <div class="progress" id="progress-bar"></div>
@@ -563,7 +635,7 @@
         <div class="grid-2">
           <article class="card">
             <h3>扫码登录</h3>
-            <p class="muted"><strong>用来干什么：</strong>把你的 B 站账号会话交给本机采集器。匿名也能拉元数据，但评论会被截短、没有 IP 属地、字幕和空间列表更容易失败。学术采样和完整归档都建议先登录。</p>
+            <p class="muted"><strong>用来干什么：</strong>把你的 B 站账号会话交给本机采集器。匿名也能拉元数据，但评论会被截短、没有 IP 属地、字幕和空间列表更容易失败。学术滚雪球和完整归档都建议先登录。</p>
             <p class="hint">用哔哩哔哩 App 扫描二维码。Cookie 只保存在本机 <code>data/settings.json</code>，不会进 Git。</p>
             <div class="qr-box">
               <img id="qr-image" alt="登录二维码" hidden />
@@ -661,8 +733,8 @@
         </article>
         <article class="card">
           <h3>AutoDL 云端 GPU</h3>
-          <p class="muted"><strong>用来干什么：</strong>Intel Mac 上 Whisper 一条 30 分钟视频可能要十几分钟。学术采样和「文字研究 / 完整归档」如果要对没有官方字幕的视频做语音识别，可以把音频送到租来的 GPU（例如 AutoDL 3090），识别完文字再回本机。爬虫、评论、门禁仍然在这台电脑上跑，云端只负责转写和 OCR。</p>
-          <p class="hint">用不到 Whisper 就跳过。要用时：到 AutoDL 实例页复制 <strong>SSH 登录指令</strong>整行和同一页的<strong>登录密码</strong>，点「一键接入」，保持这个页面开着。通了以后，任务步骤里把算力改成「云端 GPU」。</p>
+          <p class="muted"><strong>用来干什么：</strong>Intel Mac 上 Whisper 一条 30 分钟视频可能要十几分钟。学术滚雪球、按视频号采集，以及「文字研究 / 完整归档」如果要对没有官方字幕的视频做语音识别，可以把音频送到租来的 GPU（例如 AutoDL 3090），识别完文字再回本机。爬虫、评论、门禁仍然在这台电脑上跑，云端只负责转写和 OCR。</p>
+          <p class="hint">用不到 Whisper 就跳过。要用时：到 AutoDL 实例页复制 <strong>SSH 登录指令</strong>整行和同一页的<strong>登录密码</strong>，点「一键接入」，保持这个页面开着。通了以后，任务步骤里把算力改成「云端 GPU」。云端工作机固定用 <code>large-v3</code>，和设置里本机 Whisper 选 <code>small</code> 无关。镜像选带 PyTorch 的官方镜像，<strong>不要选空白 Ubuntu</strong>。控制台「驱动/CUDA」是这张卡所在机器的驱动上限：写 <code>12.8</code> 就选 CUDA 12.x 镜像；写 <code>13.2</code> 则 12 或 13 都行。一键接入时会对照驱动和镜像，并补装 Whisper 需要的 <code>libcublas.so.12</code>。</p>
           <label>SSH 登录指令
             <input id="autodl-ssh" placeholder="ssh -p 12345 root@region-9.seetacloud.com" autocomplete="off" />
           </label>
@@ -727,6 +799,6 @@
     </main>
   </div>
     <div id="toast" role="status" aria-live="polite"></div>
-  <script src="/static/app.js?v=20260922d"></script>
+  <script src="/static/app.js?v=20260926a"></script>
 </body>
 </html>

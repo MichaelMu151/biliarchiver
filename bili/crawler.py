@@ -18,14 +18,22 @@ from bili.export import (
     write_profile,
     write_video_markdown,
 )
+from bili.gpu_remote import whisper_model_for_backend
 from bili.media import fetch_media
-from bili.ocr import collect_images_and_ocr
+from bili.ocr import OCR_FRAME_INTERVAL, collect_images_and_ocr, transcribe_video_ocr
 from bili.paths import LIBRARY_DIR, ensure_dirs
 from bili.pipeline import PipelineState
 from bili.settings import AppSettings
 from bili.storage import reclaim_folder, should_fetch_media
 from bili.store import Store
-from bili.transcribe import _write_transcript_outputs, build_transcript, fetch_official_transcript
+from bili.transcribe import (
+    _write_transcript_outputs,
+    build_transcript,
+    fetch_official_transcript,
+    folder_has_spoken_transcript,
+    folder_whisper_ran_empty,
+    transcript_has_text,
+)
 from bili.util import cutoff_ts, now_iso, pick, safe_name, write_json, write_text
 
 LogFn = Callable[[str, str], None]
@@ -113,7 +121,7 @@ class JobConfig:
     ocr_enabled: bool = True
     resume: bool = True
     job_id: str = ""
-    rclone_remote: str = "gdrive"
+    rclone_remote: str = ""
     rclone_root: str = "BiliArchiver"
     compute_backend: str = "local"
     discovery: str = "space"
@@ -360,11 +368,20 @@ class Crawler:
         detail = listing.get("_detail") if isinstance(listing.get("_detail"), dict) else None
         if not detail:
             detail = await client.get_view_detail(bvid)
-        view = detail.get("View") or {}
-        stat = view.get("stat") or {}
+        view = detail.get("View") if isinstance(detail.get("View"), dict) else {}
+        owner = view.get("owner") if isinstance(view.get("owner"), dict) else {}
+        stat = view.get("stat") if isinstance(view.get("stat"), dict) else {}
         pages = view.get("pages") or [{"cid": view.get("cid"), "page": 1, "part": view.get("title"), "duration": view.get("duration")}]
+        if not isinstance(pages, list):
+            pages = [{"cid": view.get("cid"), "page": 1, "part": view.get("title"), "duration": view.get("duration")}]
         folder = video_dir(acc_dir, int(view.get("pubdate") or listing.get("created") or 0), bvid, view.get("title") or listing.get("title") or bvid)
         captured = now_iso()
+        tags = []
+        for tag in detail.get("Tags") or []:
+            if isinstance(tag, dict):
+                name = str(tag.get("tag_name") or tag.get("name") or "").strip()
+                if name:
+                    tags.append(name)
         meta = {
             "bvid": bvid,
             "aid": view.get("aid"),
@@ -374,10 +391,14 @@ class Crawler:
             "duration": view.get("duration"),
             "desc": view.get("desc"),
             "tname": view.get("tname"),
-            "owner": view.get("owner"),
+            "owner": owner,
             "stat": stat,
-            "pages": [{"cid": p.get("cid"), "page": p.get("page"), "part": p.get("part"), "duration": p.get("duration")} for p in pages],
-            "tags": [t.get("tag_name") for t in (detail.get("Tags") or []) if t.get("tag_name")],
+            "pages": [
+                {"cid": p.get("cid"), "page": p.get("page"), "part": p.get("part"), "duration": p.get("duration")}
+                for p in pages
+                if isinstance(p, dict)
+            ],
+            "tags": tags,
             "page_url": f"https://www.bilibili.com/video/{bvid}",
             "captured_at": captured,
         }
@@ -458,14 +479,19 @@ class Crawler:
             )
             part_folder.mkdir(parents=True, exist_ok=True)
             part_pipeline = PipelineState.load(part_folder)
+            whisper_model = whisper_model_for_backend(self.settings.whisper_model, config.compute_backend)
             transcript_signature = (
                 f"v2:{config.transcribe_mode}:backend={config.compute_backend}:"
-                f"model={self.settings.whisper_model}:"
+                f"model={whisper_model}:"
                 f"lang={self.settings.whisper_language}:cid={cid}"
             )
             transcript_outputs = [part_folder / "transcript.md", part_folder / "transcript.json"]
             part_transcript: dict[str, Any] = {"status": "pending", "source": "", "markdown": ""}
-            if config.resume and part_pipeline.completed("transcript", transcript_signature, transcript_outputs):
+            if (
+                config.resume
+                and part_pipeline.completed("transcript", transcript_signature, transcript_outputs)
+                and folder_has_spoken_transcript(part_folder)
+            ):
                 part_transcript = {
                     "status": "done",
                     "markdown": (part_folder / "transcript.md").read_text(encoding="utf-8"),
@@ -519,26 +545,66 @@ class Crawler:
             )
             if part_transcript.get("status") != "done":
                 part_pipeline.mark("transcript", transcript_signature, "running")
-                audio_path = media_info.get("local_audio") or media_info.get("local_video") or ""
-                part_transcript = await build_transcript(
-                    client,
-                    bvid=bvid,
-                    cid=cid,
-                    aid=int(view.get("aid") or 0) or None,
-                    up_mid=uid,
-                    folder=part_folder,
-                    mode=config.transcribe_mode,
-                    audio_path=audio_path,
-                    whisper_model=self.settings.whisper_model,
-                    whisper_language=self.settings.whisper_language,
-                    whisper_device=self.settings.whisper_device,
-                    whisper_compute_type=self.settings.whisper_compute_type,
-                    gpu_worker_url=self.settings.gpu_worker_url,
-                    gpu_worker_token=self.settings.gpu_worker_token,
-                    compute_backend=config.compute_backend,
-                    should_cancel=self._is_cancelled,
-                    on_log=self.on_log,
-                )
+                skip_whisper = folder_whisper_ran_empty(part_folder)
+                if not skip_whisper:
+                    audio_path = media_info.get("local_audio") or media_info.get("local_video") or ""
+                    part_transcript = await build_transcript(
+                        client,
+                        bvid=bvid,
+                        cid=cid,
+                        aid=int(view.get("aid") or 0) or None,
+                        up_mid=uid,
+                        folder=part_folder,
+                        mode=config.transcribe_mode,
+                        audio_path=audio_path,
+                        whisper_model=whisper_model,
+                        whisper_language=self.settings.whisper_language,
+                        whisper_device=self.settings.whisper_device,
+                        whisper_compute_type=self.settings.whisper_compute_type,
+                        gpu_worker_url=self.settings.gpu_worker_url,
+                        gpu_worker_token=self.settings.gpu_worker_token,
+                        compute_backend=config.compute_backend,
+                        should_cancel=self._is_cancelled,
+                        on_log=self.on_log,
+                    )
+                if (
+                    not transcript_has_text(part_transcript)
+                    and config.transcribe_mode in {"whisper", "official_then_whisper"}
+                ):
+                    video_path = media_info.get("local_video") or ""
+                    if not video_path or not Path(video_path).is_file():
+                        video_info = await fetch_media(
+                            client,
+                            bvid=bvid,
+                            cid=cid,
+                            folder=part_folder,
+                            mode="video",
+                            qn=self.settings.video_quality,
+                            ffmpeg_path=self.settings.ffmpeg_path,
+                            on_log=self.on_log,
+                            should_cancel=self._is_cancelled,
+                        )
+                        video_path = video_info.get("local_video") or ""
+                        if video_info.get("local_audio"):
+                            media_info["local_audio"] = video_info["local_audio"]
+                        if video_path:
+                            media_info["local_video"] = video_path
+                    if video_path:
+                        ocr_transcript = await transcribe_video_ocr(
+                            video_path=video_path,
+                            folder=part_folder,
+                            ffmpeg_path=self.settings.ffmpeg_path,
+                            interval=OCR_FRAME_INTERVAL,
+                            min_confidence=self.settings.ocr_min_confidence,
+                            compute_backend=config.compute_backend,
+                            gpu_worker_url=self.settings.gpu_worker_url,
+                            gpu_worker_token=self.settings.gpu_worker_token,
+                            should_cancel=self._is_cancelled,
+                            on_log=self.on_log,
+                        )
+                        if transcript_has_text(ocr_transcript):
+                            _write_transcript_outputs(part_folder, ocr_transcript)
+                            part_transcript = ocr_transcript
                 part_pipeline.mark(
                     "transcript",
                     transcript_signature,
@@ -691,8 +757,8 @@ class Crawler:
         bvid = str(meta.get("bvid") or "")
         if not bvid:
             return
-        owner = meta.get("owner") or {}
-        stat = meta.get("stat") or {}
+        owner = meta.get("owner") if isinstance(meta.get("owner"), dict) else {}
+        stat = meta.get("stat") if isinstance(meta.get("stat"), dict) else {}
         aid = None
         try:
             aid = int(meta.get("aid") or 0) or None

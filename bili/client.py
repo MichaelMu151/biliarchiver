@@ -25,6 +25,14 @@ UA = (
 
 RISK_CODES = {-352, -412, -799, -509, 412, -403, -401}
 
+
+def has_risk_voucher(payload: dict[str, Any] | None) -> bool:
+    """Related-video APIs return ``data`` as a list; only dict payloads have v_voucher."""
+    if not isinstance(payload, dict):
+        return False
+    data = payload.get("data")
+    return isinstance(data, dict) and bool(data.get("v_voucher"))
+
 # Browser-like fingerprint fields required by some space / search WBI APIs.
 DM_IMG = {
     "dm_img_list": "[]",
@@ -173,7 +181,7 @@ class BiliClient:
                     payload = None
                 if isinstance(payload, dict):
                     code = payload.get("code")
-                    if code in RISK_CODES or payload.get("data", {}).get("v_voucher"):
+                    if code in RISK_CODES or has_risk_voucher(payload):
                         if wbi_sign:
                             await self._refresh_wbi(force=True)
                         backoff = min(30, 4 * attempt + random.choice([1, 2, 4]))
@@ -504,7 +512,13 @@ class BiliClient:
         if data.get("code") != 0:
             self.on_log("warn", f"相关推荐 {bvid} 失败：{data.get('message')}")
             return []
-        items = data.get("data") or []
+        raw = data.get("data")
+        if isinstance(raw, dict):
+            items = raw.get("related") or raw.get("archives") or raw.get("list") or []
+        else:
+            items = raw or []
+        if not isinstance(items, list):
+            items = []
         out: list[dict[str, Any]] = []
         for item in items:
             if not isinstance(item, dict) or not item.get("bvid"):

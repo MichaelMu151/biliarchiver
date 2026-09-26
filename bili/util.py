@@ -55,15 +55,26 @@ def cutoff_ts(range_key: str) -> int | None:
 
 
 def parse_uids(raw: str) -> list[str]:
+    """Extract UP 主 UID from space links or plain numeric tokens only.
+
+    Avoid treating tracking params like ``spm_id_from=333.337...`` in video URLs as UID 333.
+    """
     found: list[str] = []
     seen: set[str] = set()
-    for part in re.split(r"[\s,;，；]+", raw.strip()):
-        if not part:
+    for part in re.split(r"[\s,;，；\n]+", raw.strip()):
+        token = part.strip()
+        if not token:
             continue
-        match = UID_RE.search(part)
+        match = UID_RE.search(token)
         if not match:
             continue
         uid = match.group(1)
+        if "space.bilibili.com/" in token:
+            pass
+        elif token.isdigit():
+            pass
+        else:
+            continue
         if uid not in seen:
             seen.add(uid)
             found.append(uid)

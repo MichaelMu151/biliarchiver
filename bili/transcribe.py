@@ -43,6 +43,78 @@ def segments_to_markdown(segments: list[dict[str, Any]], source: str) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def transcript_has_text(result: dict[str, Any] | None) -> bool:
+    """True when there is spoken or on-screen text, not just a source header."""
+    data = result or {}
+    for seg in data.get("segments") or []:
+        if str(seg.get("text") or "").strip():
+            return True
+    body = []
+    for line in str(data.get("markdown") or "").splitlines():
+        text = line.strip()
+        if not text or text.startswith(">"):
+            continue
+        if text.startswith("- `"):
+            text = text.split("`", 2)[-1].strip()
+        if text:
+            body.append(text)
+    return bool(body)
+
+
+def folder_transcript_source(folder: Path) -> str:
+    json_path = folder / "transcript.json"
+    if not json_path.is_file():
+        return ""
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("source") or "")
+
+
+def folder_has_spoken_transcript(folder: Path) -> bool:
+    """True when the folder already has Whisper or official captions, not OCR slides."""
+    if not folder_transcript_has_text(folder):
+        return False
+    source = folder_transcript_source(folder).lower()
+    if "rapidocr" in source or "ocr" in source:
+        return False
+    return True
+
+
+def folder_transcript_has_text(folder: Path) -> bool:
+    json_path = folder / "transcript.json"
+    if json_path.is_file():
+        try:
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        if isinstance(payload, dict) and transcript_has_text(payload):
+            return True
+    md_path = folder / "transcript.md"
+    if md_path.is_file():
+        try:
+            return transcript_has_text({"markdown": md_path.read_text(encoding="utf-8")})
+        except OSError:
+            return False
+    return False
+
+
+def folder_whisper_ran_empty(folder: Path) -> bool:
+    json_path = folder / "transcript.json"
+    if not json_path.is_file():
+        return False
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict) or transcript_has_text(payload):
+        return False
+    return "faster-whisper" in str(payload.get("source") or "")
+
+
 async def fetch_official_transcript(
     client: BiliClient, bvid: str, cid: int, aid: int | None, up_mid: str
 ) -> dict[str, Any]:
@@ -92,6 +164,25 @@ async def fetch_official_transcript(
     return {"source": "B站 AI 总结", "segments": segments, "markdown": markdown}
 
 
+def _is_hub_error(exc: BaseException) -> bool:
+    text = str(exc)
+    needles = (
+        "Cannot assign requested address",
+        "snapshot folder",
+        "locate the files on the Hub",
+        "huggingface.co",
+        "LocalEntryNotFoundError",
+    )
+    return any(needle in text for needle in needles)
+
+
+def _hub_error_message(model_size: str, exc: BaseException) -> str:
+    return (
+        f"Whisper 模型 {model_size} 不在本地缓存，且连不上 HuggingFace（{exc}）。"
+        "AutoDL 请重新点「一键接入」：会走 hf-mirror.com 并预先下载 large-v3。"
+    )
+
+
 def whisper_available() -> bool:
     try:
         import faster_whisper  # noqa: F401
@@ -110,15 +201,39 @@ def _get_whisper_model(model_size: str, device: str = "auto", compute_type: str 
         if _MODEL is None or _MODEL_KEY != cache_key:
             try:
                 _MODEL = WhisperModel(model_size, device=resolved_device, compute_type=resolved_compute)
-            except Exception:
+            except Exception as exc:
+                if _is_hub_error(exc):
+                    raise RuntimeError(_hub_error_message(model_size, exc)) from exc
                 if resolved_device == "cpu":
                     raise
                 resolved_device, resolved_compute, note = "cpu", "int8", "GPU 加载失败，已回退 CPU"
                 cache_key = f"{model_size}:cpu:int8"
-                _MODEL = WhisperModel(model_size, device="cpu", compute_type="int8")
+                try:
+                    _MODEL = WhisperModel(model_size, device="cpu", compute_type="int8")
+                except Exception as nested:
+                    if _is_hub_error(nested):
+                        raise RuntimeError(_hub_error_message(model_size, nested)) from nested
+                    raise
             _MODEL_KEY = cache_key
             _MODEL._bili_backend = (resolved_device, resolved_compute, note)
         return _MODEL
+
+
+def whisper_loaded_key() -> str:
+    return _MODEL_KEY or ""
+
+
+def warmup_whisper(model_size: str, device: str = "auto", compute_type: str = "auto") -> dict[str, Any]:
+    model = _get_whisper_model(model_size, device, compute_type)
+    backend = getattr(model, "_bili_backend", ("auto", "auto", ""))
+    return {
+        "ok": True,
+        "model": model_size,
+        "device": backend[0],
+        "compute": backend[1],
+        "note": backend[2],
+        "loaded": whisper_loaded_key(),
+    }
 
 
 def transcribe_local(
@@ -233,22 +348,45 @@ async def build_transcript(
             on_log("warn", f"官方字幕失败 {bvid}：{exc}")
     if not result.get("markdown") and mode in {"whisper", "official_then_whisper"}:
         if compute_backend == "cloud":
+            from bili.gpu_remote import transcribe_remote, transcribe_remote_from_bili, whisper_model_for_backend
+            from bili.media import select_stream_candidates
+            from bili.settings import load_settings
+
+            cloud_model = whisper_model_for_backend(whisper_model, compute_backend)
             if audio_path and Path(audio_path).exists() and gpu_worker_url:
                 try:
-                    from bili.gpu_remote import transcribe_remote
-
                     result = await transcribe_remote(
                         url=gpu_worker_url,
                         token=gpu_worker_token,
                         audio_path=audio_path,
-                        model=whisper_model,
+                        model=cloud_model,
                         language=whisper_language,
                         on_log=on_log,
                     )
                 except Exception as exc:
-                    on_log("warn", f"云端 GPU 转写失败 {bvid}：{exc}")
-            else:
-                on_log("warn", f"云端 GPU 未激活或没有本地音频，已把 {bvid} 写入 cloud_job.json")
+                    detail = str(exc).strip() or type(exc).__name__
+                    on_log("warn", f"本机 SFTP 转写失败 {bvid}：{detail}，改由 GPU 直拉音频")
+            if not result.get("markdown"):
+                try:
+                    settings = load_settings()
+                    play = await client.get_playurl(bvid, cid, qn=settings.video_quality)
+                    _, audio_urls = select_stream_candidates(play, settings.video_quality)
+                    if not audio_urls:
+                        raise RuntimeError("playurl 没有音频地址")
+                    result = await transcribe_remote_from_bili(
+                        bvid=bvid,
+                        urls=audio_urls,
+                        cookie=settings.cookie,
+                        token=gpu_worker_token,
+                        model=cloud_model,
+                        language=whisper_language,
+                        on_log=on_log,
+                    )
+                except Exception as exc:
+                    detail = str(exc).strip() or type(exc).__name__
+                    on_log("warn", f"GPU 直拉转写失败 {bvid}：{detail}")
+            if not result.get("markdown"):
+                on_log("warn", f"云端 GPU 未激活或没有可用音频，已把 {bvid} 写入 cloud_job.json")
         elif audio_path and Path(audio_path).exists() and whisper_available():
             on_log("info", f"本地 Whisper 转录 {bvid}，可能较慢")
             try:
@@ -265,9 +403,14 @@ async def build_transcript(
                 on_log("warn", f"Whisper 失败 {bvid}：{exc}")
         else:
             on_log("warn", "未安装 faster-whisper 或没有本地音频，已把任务写入 cloud_job.json")
-    if result.get("markdown"):
+    if transcript_has_text(result):
         result["status"] = "done"
         _write_transcript_outputs(folder, result)
-    else:
-        result = {"status": "pending", "source": "", "segments": [], "markdown": ""}
-    return result
+        return result
+    if result.get("source"):
+        result["status"] = "pending"
+        result.setdefault("segments", [])
+        result["markdown"] = result.get("markdown") or ""
+        _write_transcript_outputs(folder, result)
+        return result
+    return {"status": "pending", "source": "", "segments": [], "markdown": ""}

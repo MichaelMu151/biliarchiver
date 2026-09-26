@@ -76,12 +76,33 @@ def which_rclone(explicit: str = "rclone") -> str | None:
     return None
 
 
+def resolve_rclone_remote(requested: str = "") -> str:
+    """Map UI / leftover names like gdrive onto the remote that actually exists."""
+    remotes = rclone_remote_names()
+    name = (requested or "").strip().rstrip(":")
+    if name in remotes:
+        return name
+    aliases = {
+        "gdrive": ("googledrive", "drive", "google"),
+        "googledrive": ("gdrive", "drive", "google"),
+        "drive": ("gdrive", "googledrive"),
+        "google": ("gdrive", "googledrive"),
+    }
+    for candidate in aliases.get(name, ()):
+        if candidate in remotes:
+            return candidate
+    if len(remotes) == 1:
+        return remotes[0]
+    return name
+
+
 def rclone_drive_ready(remote: str) -> tuple[bool, str]:
     """Confirm the named remote can actually talk to Google Drive."""
     binary = which_rclone()
     if not binary:
         return False, "未找到 rclone"
     remotes = rclone_remote_names()
+    remote = resolve_rclone_remote(remote)
     if remote not in remotes:
         shown = "、".join(remotes) or "无"
         return False, f"没有名为 {remote} 的远程。当前：{shown}"
@@ -201,7 +222,13 @@ def rclone_upload(
     if not binary:
         raise RuntimeError("未找到 rclone。请先安装：brew install rclone，再执行 rclone config")
     uploaded: list[str] = []
-    remote = (remote or "gdrive").strip()
+    remote = resolve_rclone_remote(remote)
+    if not remote:
+        raise RuntimeError("未配置 rclone 远程名。请在设置里填写，并与 rclone listremotes 一致。")
+    remotes = rclone_remote_names()
+    if remotes and remote not in remotes:
+        shown = "、".join(remotes) or "无"
+        raise RuntimeError(f"没有名为 {remote} 的远程。当前：{shown}")
     root = (root or "BiliArchiver").strip().strip("/")
     for path in paths:
         if not path.exists() or not path.is_file():

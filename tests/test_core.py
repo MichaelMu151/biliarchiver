@@ -51,6 +51,72 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(compute, "int8")
         self.assertTrue(note)
 
+    def test_register_cuda_dlls_tolerates_namespace_nvidia(self) -> None:
+        import sys
+        import types
+
+        from bili.runtime import register_cuda_dlls
+
+        fake = types.ModuleType("nvidia")
+        fake.__file__ = None  # type: ignore[assignment]
+        sys.modules["nvidia"] = fake
+        try:
+            added = register_cuda_dlls()
+            self.assertIsInstance(added, list)
+        finally:
+            sys.modules.pop("nvidia", None)
+
+    def test_register_cuda_dlls_reads_namespace_lib_path(self) -> None:
+        import os
+        import sys
+        import types
+
+        from bili.runtime import register_cuda_dlls
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = Path(tmp) / "cublas" / "lib"
+            lib.mkdir(parents=True)
+            (lib / "libcublas.so.12").write_bytes(b"")
+            fake = types.ModuleType("nvidia")
+            fake.__file__ = None  # type: ignore[assignment]
+            fake.__path__ = [tmp]
+            sys.modules["nvidia"] = fake
+            before = os.environ.get("LD_LIBRARY_PATH", "")
+            try:
+                added = register_cuda_dlls()
+                self.assertTrue(any(str(lib) in path or path.endswith("cublas/lib") for path in added))
+            finally:
+                sys.modules.pop("nvidia", None)
+                if before:
+                    os.environ["LD_LIBRARY_PATH"] = before
+
+    def test_worker_launch_exports_ld_library_path(self) -> None:
+        from bili.autodl import _cuda12_probe_command, _worker_launch_command
+
+        command = _worker_launch_command("/root/miniconda3/bin/python", "/root/autodl-tmp/biliarchiver", "tok", "large-v3")
+        self.assertIn("LD_LIBRARY_PATH", command)
+        self.assertIn("cuda_library_dirs", command)
+        self.assertIn("HF_ENDPOINT", command)
+        probe = _cuda12_probe_command("/root/miniconda3/bin/python")
+        self.assertIn("CUBLAS12_OK", probe)
+        self.assertIn("libcublas.so.12", probe)
+
+    def test_parses_nvidia_smi_driver_and_cuda(self) -> None:
+        from bili.autodl import parse_nvidia_smi_header, _cuda_tuple
+
+        driver, cuda = parse_nvidia_smi_header(
+            "NVIDIA-SMI 570.124.04    Driver Version: 570.124.04      CUDA Version: 12.8"
+        )
+        self.assertEqual(driver, "570.124.04")
+        self.assertEqual(cuda, "12.8")
+        driver, cuda = parse_nvidia_smi_header(
+            "Driver Version: 595.71.05      CUDA Version: 13.2"
+        )
+        self.assertEqual(driver, "595.71.05")
+        self.assertEqual(cuda, "13.2")
+        self.assertGreater(_cuda_tuple("13.0"), _cuda_tuple("12.8"))
+        self.assertLessEqual(_cuda_tuple("12.8"), _cuda_tuple("12.8"))
+
     def test_rclone_discovery_does_not_crash(self) -> None:
         from bili.storage import rclone_remote_names, which_rclone
 
@@ -59,6 +125,20 @@ class RuntimeTests(unittest.TestCase):
         if binary:
             self.assertTrue(Path(binary).exists())
             self.assertIsInstance(names, list)
+
+    def test_resolves_gdrive_alias_to_existing_remote(self) -> None:
+        from unittest.mock import patch
+
+        from bili.storage import resolve_rclone_remote
+
+        with patch("bili.storage.rclone_remote_names", return_value=["googledrive"]):
+            self.assertEqual(resolve_rclone_remote("gdrive"), "googledrive")
+            self.assertEqual(resolve_rclone_remote("googledrive"), "googledrive")
+            self.assertEqual(resolve_rclone_remote(""), "googledrive")
+        with patch("bili.storage.rclone_remote_names", return_value=["gdrive", "backup"]):
+            self.assertEqual(resolve_rclone_remote("gdrive"), "gdrive")
+            self.assertEqual(resolve_rclone_remote("googledrive"), "gdrive")
+            self.assertEqual(resolve_rclone_remote(""), "")
 
 
 class NotifyTests(unittest.TestCase):
@@ -74,12 +154,15 @@ class NotifyTests(unittest.TestCase):
         self.assertIn("应用退出", progress_messages("interrupted", {"videos_done": 2}))
 
     def test_legacy_cloud_modes_collapse_to_backend(self) -> None:
-        from bili.gpu_remote import needs_remote_models, resolve_compute
+        from bili.gpu_remote import needs_remote_models, resolve_compute, whisper_model_for_backend
 
         self.assertEqual(resolve_compute("official_then_cloud", "local"), ("official_then_whisper", "cloud"))
         self.assertEqual(resolve_compute("whisper", "cloud"), ("whisper", "cloud"))
         self.assertTrue(needs_remote_models("official_then_whisper", "cloud", True))
         self.assertFalse(needs_remote_models("official", "cloud", False))
+        self.assertEqual(whisper_model_for_backend("small", "cloud"), "large-v3")
+        self.assertEqual(whisper_model_for_backend("large-v2", "cloud"), "large-v2")
+        self.assertEqual(whisper_model_for_backend("small", "local"), "small")
 
     def test_gpu_worker_url_requires_host(self) -> None:
         from bili.gpu_remote import gpu_worker_ready, normalize_worker_url
@@ -101,6 +184,82 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual(target2.port, 12345)
         with self.assertRaises(ValueError):
             parse_ssh_command("ssh -p 你的SSH端口 root@host")
+
+    def test_remote_inbox_stays_on_autodl_data_disk(self):
+        from bili.autodl import REMOTE_PULL_PY, remote_inbox_path
+
+        remote = remote_inbox_path(Path("/tmp/BV1MN4r6NEyt.m4a"))
+        self.assertTrue(remote.startswith("/root/autodl-tmp/biliarchiver/inbox/"))
+        self.assertIn("BV1MN4r6NEyt", remote)
+        self.assertFalse(remote.startswith("/tmp/"))
+        self.assertIn("transcribe_path", REMOTE_PULL_PY)
+        self.assertIn("urllib.request", REMOTE_PULL_PY)
+        from bili.autodl import fetch_and_transcribe_via_session
+        from bili.gpu_remote import transcribe_remote_from_bili
+
+        self.assertTrue(callable(fetch_and_transcribe_via_session))
+        self.assertTrue(callable(transcribe_remote_from_bili))
+
+    def test_autodl_upload_skips_local_venv_backups(self) -> None:
+        from bili.autodl import iter_upload_files
+
+        files = iter_upload_files()
+        self.assertLess(len(files), 100)
+        self.assertTrue(any(p.name == "gpu_worker.py" for p in files))
+        self.assertFalse(any(".venv-py314.bak" in p.parts for p in files))
+
+    def test_pick_python_reads_conda_path(self) -> None:
+        from bili import autodl
+
+        class Fake:
+            def __init__(self, output: str) -> None:
+                self.output = output
+
+            def exec_command(self, command, get_pty=True, timeout=30):  # noqa: ANN001
+                class Chan:
+                    def __init__(self, text: str) -> None:
+                        self._data = text.encode()
+                        self._sent = False
+
+                    def settimeout(self, _t):  # noqa: ANN001
+                        return None
+
+                    def recv_ready(self) -> bool:
+                        return not self._sent
+
+                    def exit_status_ready(self) -> bool:
+                        return self._sent
+
+                    def recv(self, _n: int) -> bytes:
+                        if self._sent:
+                            return b""
+                        self._sent = True
+                        return self._data
+
+                    def recv_exit_status(self) -> int:
+                        return 0
+
+                class Empty:
+                    def read(self) -> bytes:
+                        return b""
+
+                class Out:
+                    def __init__(self, text: str) -> None:
+                        self.channel = Chan(text)
+
+                return None, Out(self.output), Empty()
+
+        found = autodl._pick_python(Fake("/root/miniconda3/bin/python\n"), lambda *_a, **_k: None)
+        self.assertEqual(found, "/root/miniconda3/bin/python")
+
+    def test_autodl_uses_hf_mirror(self) -> None:
+        from bili.autodl import HF_MIRROR, _hf_exports
+
+        env = _hf_exports()
+        self.assertIn("hf-mirror.com", HF_MIRROR)
+        self.assertIn("HF_ENDPOINT", env)
+        self.assertIn("hf-mirror.com", env)
+        self.assertIn("HF_HUB_DISABLE_XET", env)
 
 
 class StorageTests(unittest.TestCase):
@@ -224,6 +383,90 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(segments, [{"id": 1, "start": 1.2, "end": 2.5, "text": "你好"}])
         self.assertEqual(_srt_time(65.123), "00:01:05,123")
 
+    def test_empty_whisper_header_is_not_text(self) -> None:
+        from bili.transcribe import folder_has_spoken_transcript, folder_transcript_has_text, transcript_has_text
+
+        self.assertFalse(
+            transcript_has_text(
+                {
+                    "source": "faster-whisper large-v3 · cuda/float16 · nn · p=0.61",
+                    "segments": [],
+                    "markdown": "> 来源：faster-whisper large-v3 · cuda/float16 · nn · p=0.61\n",
+                }
+            )
+        )
+        self.assertTrue(
+            transcript_has_text(
+                {
+                    "segments": [{"start": 0, "end": 2, "text": "养不起"}],
+                    "markdown": "> 来源：x\n\n- `00:00` 养不起\n",
+                }
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "transcript.md").write_text(
+                "> 来源：faster-whisper large-v3 · cuda/float16 · nn · p=0.61\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(folder_transcript_has_text(folder))
+            (folder / "transcript.json").write_text(
+                json.dumps(
+                    {
+                        "source": "rapidocr frames · 2s · 50 slides",
+                        "segments": [{"start": 0, "end": 2, "text": "屏幕字"}],
+                        "markdown": "- `00:00` 屏幕字\n",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            self.assertTrue(folder_transcript_has_text(folder))
+            self.assertFalse(folder_has_spoken_transcript(folder))
+
+    def test_merges_repeated_ocr_slides(self) -> None:
+        from bili.ocr import merge_frame_ocr_segments
+
+        segments = merge_frame_ocr_segments(
+            [
+                {"start": 0, "text": "中国最晚明年迈入高收入"},
+                {"start": 2, "text": "中国最晚明年迈入高收入"},
+                {"start": 4, "text": "中国最晚明年迈入高收入国家行列"},
+                {"start": 6, "text": ""},
+                {"start": 8, "text": "人均国民收入"},
+            ],
+            interval=2.0,
+        )
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0]["start"], 0)
+        self.assertEqual(segments[0]["end"], 6)
+        self.assertIn("国家行列", segments[0]["text"])
+        self.assertEqual(segments[1]["start"], 8)
+        self.assertEqual(segments[1]["text"], "人均国民收入")
+
+    def test_ocr_dedupes_slow_slides_and_later_repeats(self) -> None:
+        from bili.ocr import merge_frame_ocr_segments
+
+        segments = merge_frame_ocr_segments(
+            [
+                {"start": 0, "text": "对不起，我不想再无脑吹捧中国了"},
+                {"start": 2, "text": "对不起 我不想再无脑吹捧中国了"},
+                {"start": 4, "text": "对不起，我不想再无脑吹捧中国了。"},
+                {"start": 6, "text": "接下来看三组数据"},
+                {"start": 8, "text": "接下来看三组数据"},
+                {"start": 12, "text": "对不起，我不想再无脑吹捧中国了"},
+            ],
+            interval=2.0,
+        )
+        self.assertEqual(
+            [seg["text"] for seg in segments],
+            ["对不起，我不想再无脑吹捧中国了。", "接下来看三组数据"],
+        )
+        self.assertEqual(segments[0]["start"], 0)
+        self.assertEqual(segments[0]["end"], 6)
+        self.assertEqual(segments[1]["start"], 6)
+        self.assertEqual(segments[1]["end"], 10)
+
 
 class AcademicCorpusTests(unittest.TestCase):
     def test_parse_bvids_and_seeds(self) -> None:
@@ -235,6 +478,24 @@ class AcademicCorpusTests(unittest.TestCase):
         bvids, uids = parse_academic_seeds(raw)
         self.assertEqual(bvids, ["BV1xx411c7mD", "BV1GJ411x7h7"])
         self.assertIn("208259", uids)
+
+    def test_transcribe_config_skips_gate_by_flag(self) -> None:
+        from bili.academic import AcademicConfig
+
+        cfg = AcademicConfig(job_id="t", skip_gate=True, max_depth=2)
+        self.assertTrue(cfg.skip_gate)
+        self.assertFalse(AcademicConfig(job_id="t").skip_gate)
+
+    def test_video_url_tracking_params_are_not_uids(self) -> None:
+        from bili.academic import parse_academic_seeds
+
+        raw = (
+            "https://www.bilibili.com/video/BV1h4nTz6Erm/"
+            "?spm_id_from=333.337.search-card.all.click&vd_source=abc"
+        )
+        bvids, uids = parse_academic_seeds(raw)
+        self.assertEqual(bvids, ["BV1h4nTz6Erm"])
+        self.assertEqual(uids, [])
 
     def test_gate_rejects_old_and_keyword_miss(self) -> None:
         import time
@@ -298,6 +559,26 @@ class AcademicCorpusTests(unittest.TestCase):
         self.assertEqual(config.transcribe_mode, "official_then_whisper")
         self.assertEqual(config.media_mode, "audio")
         self.assertTrue(config.crawl_comments)
+
+    def test_related_payload_list_is_not_a_risk_voucher(self) -> None:
+        from bili.client import has_risk_voucher
+
+        self.assertFalse(has_risk_voucher({"code": 0, "data": [{"bvid": "BV1xx411c7mD"}]}))
+        self.assertFalse(has_risk_voucher({"code": 0, "data": []}))
+        self.assertTrue(has_risk_voucher({"code": 0, "data": {"v_voucher": "abc"}}))
+        self.assertFalse(has_risk_voucher({"code": 0, "data": {"list": []}}))
+
+    def test_requeue_visiting_also_retries_error_nodes(self) -> None:
+        from bili.corpus import Corpus, FrontierItem
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Corpus(Path(tmp) / "corpus.db")
+            db.start_run("r1", "academic", {}, label="t")
+            db.enqueue("r1", [FrontierItem(bvid="BV1xx411c7mD", depth=0, seed_bvid="BV1xx411c7mD")])
+            db.mark_frontier("r1", "BV1xx411c7mD", "error", "list get")
+            restored = db.requeue_visiting("r1")
+            self.assertEqual(restored, 1)
+            self.assertEqual(db.frontier_stats("r1").get("pending"), 1)
 
     def test_corpus_topology_does_not_wipe_stats(self) -> None:
         from bili.corpus import Corpus

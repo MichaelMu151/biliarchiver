@@ -585,7 +585,7 @@ class Corpus:
                         p.get("part") or "",
                     )
                     for i, p in enumerate(pages)
-                    if _as_int(p.get("cid"))
+                    if isinstance(p, dict) and _as_int(p.get("cid"))
                 ],
             )
 
@@ -697,10 +697,11 @@ class Corpus:
             )
 
     def requeue_visiting(self, run_id: str) -> int:
-        """A crash leaves rows in 'visiting'; put them back so resume is lossless."""
+        """Resume puts visiting/error nodes back so a failed related-fetch can retry."""
         with self.connect() as conn:
             cur = conn.execute(
-                "UPDATE frontier SET state='pending', updated_at=? WHERE run_id=? AND state='visiting'",
+                "UPDATE frontier SET state='pending', updated_at=? "
+                "WHERE run_id=? AND state IN ('visiting','error')",
                 (now_iso(), run_id),
             )
             return cur.rowcount or 0
@@ -741,6 +742,8 @@ class Corpus:
         stamp = now_iso()
         payloads: list[dict[str, Any]] = []
         for raw in rows:
+            if not isinstance(raw, dict):
+                continue
             rpid = str(raw.get("rpid") or "").strip()
             if not rpid:
                 continue
@@ -936,7 +939,25 @@ class Corpus:
 
     # -- reading ------------------------------------------------------------
 
-    def table_counts(self) -> dict[str, int]:
+    def missing_transcript_bvids(self, run_id: str) -> list[str]:
+        """Passed-gate videos in a snowball run that still lack usable transcript text."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT v.bvid
+                FROM videos v
+                WHERE v.run_id = ?
+                  AND v.pass_filter = 1
+                  AND NOT EXISTS (
+                    SELECT 1 FROM transcripts t
+                    WHERE t.bvid = v.bvid AND IFNULL(t.char_count, 0) > 0
+                  )
+                ORDER BY v.pubdate
+                """,
+                (run_id,),
+            ).fetchall()
+        return [str(row["bvid"]) for row in rows if row["bvid"]]
+
         counts: dict[str, int] = {}
         with self.connect() as conn:
             for table in CORPUS_TABLES:

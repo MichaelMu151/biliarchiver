@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import os
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -24,6 +26,19 @@ def worker_headers(token: str) -> dict[str, str]:
     if not token:
         return {}
     return {"Authorization": f"Bearer {token}"}
+
+
+CLOUD_WHISPER_MODEL = "large-v3"
+
+
+def whisper_model_for_backend(local_model: str, compute_backend: str | None = None) -> str:
+    """Cloud GPU jobs use large-v3; do not inherit the Mac's small default."""
+    name = (local_model or "").strip()
+    if (compute_backend or "local") != "cloud":
+        return name or "small"
+    if name.lower().startswith("large"):
+        return name
+    return CLOUD_WHISPER_MODEL
 
 
 def resolve_compute(transcribe_mode: str, compute_backend: str | None = None) -> tuple[str, str]:
@@ -73,6 +88,71 @@ def gpu_worker_ready(url: str, token: str = "", timeout: float = 6.0) -> tuple[b
     return True, f"已连接 {base} · 设备 {device} · {ocr}"
 
 
+def local_app_url() -> str:
+    return (os.environ.get("BILI_APP_URL") or "http://127.0.0.1:8765").rstrip("/")
+
+
+def _put_via_local_app(local_path: Path) -> str:
+    """Ask the already-running web server to SFTP over its AutoDL SSH session."""
+    timeout = httpx.Timeout(30.0, read=300.0, write=30.0, pool=30.0)
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        response = client.post(
+            f"{local_app_url()}/api/gpu/autodl/put",
+            json={"path": str(local_path)},
+        )
+    if response.status_code >= 400:
+        detail = (response.text or "")[:240]
+        raise RuntimeError(f"本机代传失败 HTTP {response.status_code} {detail}")
+    remote = str((response.json() or {}).get("remote") or "")
+    if not remote:
+        raise RuntimeError("本机代传没有返回远程路径")
+    return remote
+
+
+def _sftp_put_audio(local_path: Path, on_log=None) -> str:
+    """Copy audio on the existing AutoDL SSH. Never open a second login."""
+    from bili.autodl import put_via_session, session_alive
+
+    def emit(message: str, level: str = "info") -> None:
+        if on_log:
+            on_log(level, message)
+
+    if session_alive():
+        return put_via_session(local_path, log=emit)
+    return _put_via_local_app(local_path)
+
+
+async def transcribe_remote_from_bili(
+    *,
+    bvid: str,
+    urls: list[str],
+    cookie: str,
+    token: str,
+    model: str,
+    language: str,
+    on_log,
+) -> dict[str, Any]:
+    """Let AutoDL download audio from Bilibili and Whisper locally. Archive stays on the Mac."""
+    from bili.autodl import fetch_and_transcribe_via_session
+
+    def emit(message: str, level: str = "info") -> None:
+        on_log(level, message)
+
+    data = await asyncio.to_thread(
+        fetch_and_transcribe_via_session,
+        bvid=bvid,
+        urls=urls,
+        referer=f"https://www.bilibili.com/video/{bvid}",
+        cookie=cookie or "",
+        token=token,
+        model=model,
+        language=language,
+        log=emit,
+    )
+    data["status"] = "done"
+    return data
+
+
 async def transcribe_remote(
     *,
     url: str,
@@ -88,16 +168,16 @@ async def transcribe_remote(
     path = Path(audio_path)
     if not path.is_file():
         raise RuntimeError("没有可上传的本地音频")
-    on_log("info", f"上传音频到云端 GPU：{path.name}")
-    timeout = httpx.Timeout(30.0, read=1200.0, write=120.0, pool=30.0)
+    on_log("info", f"经已有 AutoDL 隧道传音频：{path.name} ({path.stat().st_size} 字节)")
+    remote_path = await asyncio.to_thread(_sftp_put_audio, path, on_log)
+    on_log("info", f"已传到工作机，开始转写 {path.name}")
+    timeout = httpx.Timeout(30.0, read=1200.0, write=60.0, pool=30.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        with path.open("rb") as fh:
-            response = await client.post(
-                f"{base}/v1/transcribe",
-                headers=worker_headers(token),
-                data={"model": model, "language": language},
-                files={"file": (path.name, fh, "application/octet-stream")},
-            )
+        response = await client.post(
+            f"{base}/v1/transcribe_path",
+            headers=worker_headers(token),
+            data={"path": remote_path, "model": model, "language": language},
+        )
     if response.status_code in {401, 403}:
         raise RuntimeError("GPU 工作机 Token 不正确")
     if response.status_code >= 400:

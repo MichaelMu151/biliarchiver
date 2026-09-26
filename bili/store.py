@@ -265,6 +265,20 @@ class Store:
             "dynamics": [dict(x) for x in dyns],
         }
 
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        try:
+            item["config"] = json.loads(item.pop("config_json") or "{}")
+            item["progress"] = json.loads(item.pop("progress_json") or "{}")
+        except json.JSONDecodeError:
+            item["config"] = {}
+            item["progress"] = {}
+        return item
+
     def list_jobs(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 50").fetchall()

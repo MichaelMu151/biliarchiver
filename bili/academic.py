@@ -47,6 +47,9 @@ class AcademicConfig:
     ocr_enabled: bool = False
     resume: bool = True
     compute_backend: str = "local"
+    rclone_remote: str = ""
+    rclone_root: str = "BiliArchiver"
+    skip_gate: bool = False
 
 
 def parse_academic_seeds(raw: str) -> tuple[list[str], list[str]]:
@@ -78,7 +81,7 @@ def evaluate_gate(
     tags: list[str] | None = None,
 ) -> tuple[bool, str, dict[str, Any]]:
     """AND of depth, category, views, engagement, tag co-occurrence, optional keyword, recency."""
-    stat = view.get("stat") or {}
+    stat = view.get("stat") if isinstance(view.get("stat"), dict) else {}
     title = str(view.get("title") or "")
     desc = str(view.get("desc") or "")
     tname = str(view.get("tname") or "")
@@ -173,7 +176,7 @@ class AcademicCrawler:
             "pruned": 0,
             "current": "",
             "max_nodes": config.max_nodes,
-            "kind": "academic",
+            "kind": "transcribe" if config.skip_gate else "academic",
         }
 
         async def emit() -> None:
@@ -187,11 +190,11 @@ class AcademicCrawler:
 
         self.corpus.start_run(
             config.job_id,
-            "academic",
+            "transcribe" if config.skip_gate else "academic",
             {
                 "seed_bvids": bvids,
                 "seed_uids": uids,
-                "max_depth": config.max_depth,
+                "max_depth": 0 if config.skip_gate else config.max_depth,
                 "max_nodes": config.max_nodes,
                 "min_views": config.min_views,
                 "min_replies": config.min_replies,
@@ -201,8 +204,9 @@ class AcademicCrawler:
                 "tag_terms": config.tag_terms,
                 "keyword": config.keyword,
                 "time_range": config.time_range,
+                "skip_gate": config.skip_gate,
             },
-            label="滚雪球采样",
+            label="按视频号采集" if config.skip_gate else "学术滚雪球",
         )
         if config.resume:
             restored = self.corpus.requeue_visiting(config.job_id)
@@ -290,16 +294,19 @@ class AcademicCrawler:
 
     async def _visit(self, client: BiliClient, config: AcademicConfig, item: FrontierItem) -> bool:
         detail = await client.get_view_detail(item.bvid)
-        view = detail.get("View") or {}
+        view = detail.get("View") if isinstance(detail.get("View"), dict) else {}
         if not view.get("bvid") and not view.get("aid"):
             self.corpus.record_gate_decision(config.job_id, item.bvid, False, "no_view", {}, item.depth)
             self.corpus.mark_frontier(config.job_id, item.bvid, "error", "no_view")
             return False
         view["bvid"] = view.get("bvid") or item.bvid
         tags = extract_tags(detail)
-        passed, reason, checks = evaluate_gate(view, config, item.depth, tags=tags)
+        if config.skip_gate:
+            passed, reason, checks = True, "forced_transcribe", {"forced": True}
+        else:
+            passed, reason, checks = evaluate_gate(view, config, item.depth, tags=tags)
         self.corpus.record_gate_decision(config.job_id, item.bvid, passed, reason, checks, item.depth)
-        owner = view.get("owner") or {}
+        owner = view.get("owner") if isinstance(view.get("owner"), dict) else {}
         mid = str(owner.get("mid") or "")
         name = owner.get("name") or mid or "unknown"
         if not passed:
@@ -345,9 +352,11 @@ class AcademicCrawler:
             media_mode=config.media_mode or "audio",
             transcribe_mode=config.transcribe_mode or "official_then_whisper",
             media_keep=config.media_keep,
-            ocr_enabled=False,
+            ocr_enabled=bool(config.ocr_enabled) or config.skip_gate,
             resume=config.resume,
             job_id=config.job_id,
+            rclone_remote=config.rclone_remote or self.settings.rclone_remote,
+            rclone_root=config.rclone_root or self.settings.rclone_root,
             compute_backend=config.compute_backend,
             discovery="seed" if item.depth == 0 else "snowball",
         )
@@ -369,20 +378,27 @@ class AcademicCrawler:
             run_id=config.job_id,
         )
         neighbours: list[str] = []
-        if item.depth < config.max_depth:
-            related = await client.get_related(item.bvid, limit=config.related_limit)
-            neighbours = [str(row.get("bvid") or "") for row in related if row.get("bvid")]
-            self.corpus.add_edges(config.job_id, item.bvid, neighbours)
-            children = [
-                FrontierItem(
-                    bvid=bvid,
-                    depth=item.depth + 1,
-                    parent_bvid=item.bvid,
-                    seed_bvid=item.seed_bvid or item.bvid,
-                )
-                for bvid in neighbours
-            ]
-            added = self.corpus.enqueue(config.job_id, children)
-            self.on_log("info", f"{item.bvid} 相关 {len(neighbours)} · 新入队 {added}")
+        if (not config.skip_gate) and item.depth < config.max_depth:
+            try:
+                related = await client.get_related(item.bvid, limit=config.related_limit)
+                neighbours = [
+                    str(row.get("bvid") or "")
+                    for row in related
+                    if isinstance(row, dict) and row.get("bvid")
+                ]
+                self.corpus.add_edges(config.job_id, item.bvid, neighbours)
+                children = [
+                    FrontierItem(
+                        bvid=bvid,
+                        depth=item.depth + 1,
+                        parent_bvid=item.bvid,
+                        seed_bvid=item.seed_bvid or item.bvid,
+                    )
+                    for bvid in neighbours
+                ]
+                added = self.corpus.enqueue(config.job_id, children)
+                self.on_log("info", f"{item.bvid} 相关 {len(neighbours)} · 新入队 {added}")
+            except Exception as exc:
+                self.on_log("warn", f"{item.bvid} 相关推荐失败，节点仍计完成：{exc}")
         self.corpus.mark_frontier(config.job_id, item.bvid, "done")
         return True
