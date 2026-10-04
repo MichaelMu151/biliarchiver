@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
@@ -16,12 +17,14 @@ from bili.export import (
     write_account_index,
     write_dynamic_markdown,
     write_profile,
+    write_scout_catalog,
     write_video_markdown,
 )
 from bili.gpu_remote import whisper_model_for_backend
+from bili.labor_lexicon import match_labor
 from bili.media import fetch_media
 from bili.ocr import OCR_FRAME_INTERVAL, collect_images_and_ocr, transcribe_video_ocr
-from bili.paths import LIBRARY_DIR, ensure_dirs
+from bili.paths import EXPORT_DIR, LIBRARY_DIR, ensure_dirs
 from bili.pipeline import PipelineState
 from bili.settings import AppSettings
 from bili.storage import reclaim_folder, should_fetch_media
@@ -34,10 +37,23 @@ from bili.transcribe import (
     folder_whisper_ran_empty,
     transcript_has_text,
 )
-from bili.util import cutoff_ts, now_iso, pick, safe_name, write_json, write_text
+from bili.util import cutoff_ts, now_iso, pick, safe_name, ts_iso, write_json, write_text
 
 LogFn = Callable[[str, str], None]
 ProgressFn = Callable[[dict[str, Any]], Awaitable[None] | None]
+
+# Scout: UPs at/above this archive count use list-title prefilter (skip detail for non-hits).
+SCOUT_LARGE_ARCHIVE_THRESHOLD = 400
+
+
+def _scout_listing_text(item: dict[str, Any]) -> str:
+    """Title-focused text from space archive listing (available before detail API)."""
+    return " ".join(
+        [
+            str(item.get("title") or ""),
+            str(item.get("description") or item.get("desc") or ""),
+        ]
+    )
 
 
 def _line_count(path: Path) -> int:
@@ -125,6 +141,11 @@ class JobConfig:
     rclone_root: str = "BiliArchiver"
     compute_backend: str = "local"
     discovery: str = "space"
+    # archive = full UP crawl; scout = titles/tags/dynamics only for screening
+    mode: str = "archive"
+    # Optional per-job comment controls (None → fall back to AppSettings).
+    comment_max_pages: int | None = None
+    include_sub_replies: bool | None = None
 
 
 @dataclass
@@ -188,15 +209,36 @@ class Crawler:
     async def run(self, config: JobConfig, on_progress: Callable[[dict[str, Any]], Any] | None = None) -> dict[str, Any]:
         ensure_dirs()
         self.library.mkdir(parents=True, exist_ok=True)
+        if config.mode == "scout":
+            # Force a light footprint; UI also sets these, but never trust a mixed config.
+            config.crawl_comments = False
+            config.crawl_danmaku = False
+            config.ocr_enabled = False
+            config.media_mode = "none"
+            config.transcribe_mode = "none"
+            config.media_keep = "keep"
+            config.crawl_videos = True
+            config.crawl_dynamics = True
+            config.crawl_profile = True
         client = BiliClient(self.settings, on_log=self.on_log)
         progress = {
             "uids_total": len(config.uids),
             "uids_done": 0,
             "videos_done": 0,
             "dynamics_done": 0,
+            "labor_videos_kept": 0,
+            "labor_dynamics_kept": 0,
+            "videos_skipped": 0,
+            "dynamics_skipped": 0,
             "current": "",
+            "last_up_name": "",
             "stage": "bootstrap",
+            "mode": config.mode,
+            "kind": "scout" if config.mode == "scout" else "archive",
         }
+        scout_accounts: list[dict[str, Any]] = []
+        scout_videos: list[dict[str, Any]] = []
+        scout_dynamics: list[dict[str, Any]] = []
 
         async def emit() -> None:
             if on_progress:
@@ -209,14 +251,20 @@ class Crawler:
                 "任务登记",
                 lambda c: c.start_run(
                     config.job_id,
-                    "archive",
+                    "scout" if config.mode == "scout" else "archive",
                     {
                         "uids": config.uids,
                         "time_range": config.time_range,
+                        "mode": config.mode,
                         "transcribe_mode": config.transcribe_mode,
                         "compute_backend": config.compute_backend,
+                        "labor_filter": config.mode == "scout",
                     },
-                    label=f"UP 主归档 · {len(config.uids)} 个账号",
+                    label=(
+                        f"选题预览 · {len(config.uids)} 个账号 · 劳工词表筛选"
+                        if config.mode == "scout"
+                        else f"UP 主归档 · {len(config.uids)} 个账号"
+                    ),
                 ),
             )
 
@@ -225,12 +273,68 @@ class Crawler:
             for uid in config.uids:
                 if self._is_cancelled():
                     break
+                scout_key = f"uid:{uid}:scout_done"
+                if config.mode == "scout" and config.resume and config.job_id and self.store.item_done(config.job_id, scout_key):
+                    progress["uids_done"] += 1
+                    reloaded = self._reload_scout_labor_from_disk(uid)
+                    if reloaded:
+                        scout_accounts.append(reloaded.get("account") or {})
+                        scout_videos.extend(reloaded.get("videos") or [])
+                        scout_dynamics.extend(reloaded.get("dynamics") or [])
+                        progress["labor_videos_kept"] = len(scout_videos)
+                        progress["labor_dynamics_kept"] = len(scout_dynamics)
+                        progress["last_up_name"] = (reloaded.get("account") or {}).get("name") or uid
+                    progress["current"] = f"{progress.get('last_up_name') or uid}（已完成，跳过）"
+                    progress["notify_uid"] = False
+                    self.on_log("info", f"跳过已完成选题预览账号 {uid}")
+                    await emit()
+                    continue
                 progress["current"] = uid
                 progress["stage"] = "account"
                 await emit()
-                await self._crawl_uid(client, config, uid, progress, emit)
+                result = await self._crawl_uid(client, config, uid, progress, emit)
+                if config.mode == "scout" and result:
+                    inline = bool(result.pop("_inline_prefiltered", False))
+                    # Large UPs: list-title gate already applied. Others: post-filter with tags.
+                    filtered = self._filter_scout_labor(config, result, already_filtered=inline)
+                    scout_accounts.append(filtered.get("account") or {})
+                    scout_videos.extend(filtered.get("videos") or [])
+                    scout_dynamics.extend(filtered.get("dynamics") or [])
+                    progress["labor_videos_kept"] = len(scout_videos)
+                    progress["labor_dynamics_kept"] = len(scout_dynamics)
+                    progress["last_up_name"] = (filtered.get("account") or {}).get("name") or uid
+                    progress["current"] = progress["last_up_name"]
+                    progress["notify_uid"] = True
+                    if config.job_id:
+                        self.store.mark_item(config.job_id, scout_key, "done")
+                    # Incremental export so cancelled runs still leave a usable CSV.
+                    if config.job_id:
+                        out = EXPORT_DIR / f"scout_{config.job_id}"
+                        write_scout_catalog(
+                            out,
+                            job_id=config.job_id,
+                            accounts=[row for row in scout_accounts if row],
+                            videos=scout_videos,
+                            dynamics=scout_dynamics,
+                        )
+                        progress["scout_export"] = str(out)
                 progress["uids_done"] += 1
                 await emit()
+            if config.mode == "scout" and config.job_id and not self.cancelled:
+                out = EXPORT_DIR / f"scout_{config.job_id}"
+                write_scout_catalog(
+                    out,
+                    job_id=config.job_id,
+                    accounts=[row for row in scout_accounts if row],
+                    videos=scout_videos,
+                    dynamics=scout_dynamics,
+                )
+                progress["scout_export"] = str(out)
+                self.on_log(
+                    "ok",
+                    f"选题预览已导出：{out} · 账号 {len(scout_accounts)} · "
+                    f"劳工视频 {len(scout_videos)} · 劳工动态 {len(scout_dynamics)}",
+                )
             progress["stage"] = "done" if not self.cancelled else "cancelled"
             await emit()
             return progress
@@ -240,7 +344,126 @@ class Crawler:
                 self._corpus_guard("任务收尾", lambda c: c.finish_run(config.job_id, status))
             await client.close()
 
-    async def _crawl_uid(self, client: BiliClient, config: JobConfig, uid: str, progress: dict, emit) -> None:
+    def _filter_scout_labor(
+        self,
+        config: JobConfig,
+        result: dict[str, Any],
+        *,
+        already_filtered: bool = False,
+    ) -> dict[str, Any]:
+        """Keep only labor-lexicon hits.
+
+        When ``already_filtered`` is True (inline scout path), only annotate tier/matched
+        and do not delete — the list-stage gate already skipped non-matches.
+        """
+        account = dict(result.get("account") or {})
+        mid = str(account.get("mid") or "")
+        name = str(account.get("name") or mid)
+        kept_videos: list[dict[str, Any]] = []
+        kept_dynamics: list[dict[str, Any]] = []
+        dropped_v = dropped_d = 0
+
+        for row in result.get("videos") or []:
+            text = " ".join(
+                [
+                    str(row.get("title") or ""),
+                    str(row.get("tags") or "").replace(" · ", " "),
+                    str(row.get("description_short") or ""),
+                    str(row.get("tname") or ""),
+                ]
+            )
+            hit = match_labor(text)
+            bvid = str(row.get("bvid") or "")
+            folder = Path(str(row.get("folder") or ""))
+            if not folder.exists() and bvid:
+                for cand in self.library.glob(f"{mid}_*/videos/*_{bvid}_*"):
+                    folder = cand
+                    break
+            if hit.hit or (already_filtered and row.get("tier")):
+                enriched = dict(row)
+                if hit.hit:
+                    enriched["tier"] = hit.tier
+                    enriched["matched"] = " · ".join(hit.terms)
+                kept_videos.append(enriched)
+            elif already_filtered:
+                # Inline path already gated; keep annotated row even if rematch is soft.
+                kept_videos.append(dict(row))
+            else:
+                if folder.exists():
+                    shutil.rmtree(folder, ignore_errors=True)
+                if bvid:
+                    try:
+                        with self.store.connect() as conn:
+                            conn.execute("DELETE FROM videos WHERE bvid=?", (bvid,))
+                    except Exception:
+                        pass
+                    if config.job_id:
+                        self.store.mark_item(config.job_id, f"video:{bvid}", "dropped")
+                dropped_v += 1
+
+        for row in result.get("dynamics") or []:
+            text = str(row.get("text") or "")
+            hit = match_labor(text)
+            dyn_id = str(row.get("dyn_id") or "")
+            folder = Path(str(row.get("folder") or ""))
+            if not folder.exists() and dyn_id:
+                for cand in self.library.glob(f"{mid}_*/dynamics/*_{dyn_id}"):
+                    folder = cand
+                    break
+            if hit.hit or (already_filtered and row.get("tier")):
+                enriched = dict(row)
+                if hit.hit:
+                    enriched["tier"] = hit.tier
+                    enriched["matched"] = " · ".join(hit.terms)
+                kept_dynamics.append(enriched)
+            elif already_filtered:
+                kept_dynamics.append(dict(row))
+            else:
+                if folder.exists():
+                    shutil.rmtree(folder, ignore_errors=True)
+                if dyn_id:
+                    try:
+                        with self.store.connect() as conn:
+                            conn.execute("DELETE FROM dynamics WHERE dyn_id=?", (dyn_id,))
+                    except Exception:
+                        pass
+                    if config.job_id:
+                        self.store.mark_item(config.job_id, f"dyn:{dyn_id}", "dropped")
+                dropped_d += 1
+
+        account["video_n"] = len(kept_videos)
+        account["dynamic_n"] = len(kept_dynamics)
+        account["videos_dropped"] = dropped_v
+        account["dynamics_dropped"] = dropped_d
+
+        for acc_dir in self.library.glob(f"{mid}_*"):
+            detail = self.store.account_detail(mid)
+            profile_path = acc_dir / "profile.json"
+            profile = {}
+            if profile_path.exists():
+                try:
+                    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    profile = {"mid": mid, "name": name}
+            else:
+                profile = {"mid": mid, "name": name, "space_url": account.get("space_url")}
+            write_account_index(
+                acc_dir,
+                profile,
+                detail.get("videos") or [],
+                detail.get("dynamics") or [],
+            )
+            break
+
+        if dropped_v or dropped_d:
+            self.on_log(
+                "ok",
+                f"{name} · 劳工筛选：视频保留 {len(kept_videos)}/{len(kept_videos)+dropped_v} · "
+                f"动态保留 {len(kept_dynamics)}/{len(kept_dynamics)+dropped_d}",
+            )
+        return {"account": account, "videos": kept_videos, "dynamics": kept_dynamics}
+
+    async def _crawl_uid(self, client: BiliClient, config: JobConfig, uid: str, progress: dict, emit) -> dict[str, Any] | None:
         cutoff = cutoff_ts(config.time_range)
         card = await client.get_card(uid)
         acc = card.get("card") or {}
@@ -284,19 +507,74 @@ class Crawler:
             write_profile(acc_dir, profile, snapshot)
             self.on_log("ok", f"{name} · 粉丝 {snapshot['follower']} · 关注 {snapshot['following']}")
 
+        archive_count = int(snapshot.get("archive_count") or 0)
+        inline_prefilter = config.mode == "scout" and archive_count >= SCOUT_LARGE_ARCHIVE_THRESHOLD
+        if inline_prefilter:
+            self.on_log(
+                "info",
+                f"{name} · 投稿约 {archive_count} ≥ {SCOUT_LARGE_ARCHIVE_THRESHOLD}，"
+                f"启用列表标题预筛（超大号：标题命中才拉详情）",
+            )
+
         videos_meta: list[dict[str, Any]] = []
+        scout_video_rows: list[dict[str, Any]] = []
+        scout_skipped_videos = 0
+        scout_skipped_dynamics = 0
         if config.crawl_videos:
             async for item in client.iter_videos(uid, cutoff):
                 if self._is_cancelled():
                     break
                 bvid = item.get("bvid")
                 key = f"video:{bvid}"
+                prior = self.store.item_status(config.job_id, key) if config.job_id else ""
+                if config.resume and prior == "done":
+                    if config.mode == "scout":
+                        existing = self._scout_row_from_disk(uid, name, bvid)
+                        if existing:
+                            scout_video_rows.append(existing)
+                            videos_meta.append({"bvid": bvid, "title": existing.get("title")})
+                    progress["videos_done"] += 1
+                    continue
+                if config.resume and prior == "skipped" and inline_prefilter:
+                    scout_skipped_videos += 1
+                    continue
+                # Large-UP scout: filter on listing title before detail API.
+                if inline_prefilter:
+                    listing_hit = match_labor(_scout_listing_text(item))
+                    if not listing_hit.hit:
+                        scout_skipped_videos += 1
+                        if config.job_id:
+                            self.store.mark_item(config.job_id, key, "skipped", "labor_lexicon_listing_title")
+                        if scout_skipped_videos % 50 == 1:
+                            progress["stage"] = "scout_skip"
+                            progress["current"] = f"{name} · 标题未命中，跳过（本号已跳 {scout_skipped_videos}）"
+                            progress["videos_skipped"] = int(progress.get("videos_skipped") or 0)
+                            await emit()
+                        continue
                 progress["stage"] = f"video {bvid}"
                 progress["current"] = f"{name} / {item.get('title')}"
                 await emit()
                 try:
-                    meta_row = await self._crawl_video(client, config, uid, acc_dir, item)
-                    videos_meta.append(meta_row)
+                    if config.mode == "scout":
+                        meta_row, scout_row = await self._scout_video(client, config, uid, name, acc_dir, item)
+                        if inline_prefilter:
+                            detail_hit = match_labor(
+                                " ".join(
+                                    [
+                                        str(scout_row.get("title") or ""),
+                                        str(scout_row.get("tags") or "").replace(" · ", " "),
+                                        str(scout_row.get("description_short") or ""),
+                                        str(scout_row.get("tname") or ""),
+                                    ]
+                                )
+                            )
+                            scout_row["tier"] = detail_hit.tier if detail_hit.hit else "listing"
+                            scout_row["matched"] = " · ".join(detail_hit.terms) if detail_hit.hit else "标题预筛"
+                        videos_meta.append(meta_row)
+                        scout_video_rows.append(scout_row)
+                    else:
+                        meta_row = await self._crawl_video(client, config, uid, acc_dir, item)
+                        videos_meta.append(meta_row)
                     if config.job_id:
                         self.store.mark_item(config.job_id, key, "done")
                     progress["videos_done"] += 1
@@ -307,6 +585,7 @@ class Crawler:
                 await emit()
 
         dynamics_meta: list[dict[str, Any]] = []
+        scout_dyn_rows: list[dict[str, Any]] = []
         if config.crawl_dynamics:
             async for item in client.iter_dynamics(uid, cutoff):
                 if self._is_cancelled():
@@ -314,12 +593,45 @@ class Crawler:
                 extracted = extract_dynamic(item)
                 dyn_id = extracted["dyn_id"]
                 key = f"dyn:{dyn_id}"
+                prior = self.store.item_status(config.job_id, key) if config.job_id else ""
+                if config.resume and prior == "done":
+                    if config.mode == "scout":
+                        existing = self._scout_dyn_from_disk(uid, name, dyn_id)
+                        if existing:
+                            scout_dyn_rows.append(existing)
+                            dynamics_meta.append({"dyn_id": dyn_id, "text": existing.get("text")})
+                    progress["dynamics_done"] += 1
+                    continue
+                if config.resume and prior == "skipped" and inline_prefilter:
+                    scout_skipped_dynamics += 1
+                    continue
+                # Large-UP scout: filter dynamic text before write / extra requests.
+                if inline_prefilter:
+                    dyn_hit = match_labor(str(extracted.get("text") or ""))
+                    if not dyn_hit.hit:
+                        scout_skipped_dynamics += 1
+                        if config.job_id:
+                            self.store.mark_item(config.job_id, key, "skipped", "labor_lexicon")
+                        if scout_skipped_dynamics % 50 == 1:
+                            progress["stage"] = "scout_skip"
+                            progress["current"] = f"{name} · 动态未命中，跳过（本号已跳 {scout_skipped_dynamics}）"
+                            await emit()
+                        continue
                 progress["stage"] = f"dynamic {dyn_id}"
                 progress["current"] = f"{name} / 动态 {dyn_id}"
                 await emit()
                 try:
-                    row = await self._crawl_dynamic(client, config, uid, acc_dir, extracted)
-                    dynamics_meta.append(row)
+                    if config.mode == "scout":
+                        row, scout_row = await self._scout_dynamic(client, config, uid, name, acc_dir, extracted)
+                        if inline_prefilter:
+                            dyn_hit = match_labor(str(scout_row.get("text") or ""))
+                            scout_row["tier"] = dyn_hit.tier
+                            scout_row["matched"] = " · ".join(dyn_hit.terms)
+                        dynamics_meta.append(row)
+                        scout_dyn_rows.append(scout_row)
+                    else:
+                        row = await self._crawl_dynamic(client, config, uid, acc_dir, extracted)
+                        dynamics_meta.append(row)
                     if config.job_id:
                         self.store.mark_item(config.job_id, key, "done")
                     progress["dynamics_done"] += 1
@@ -328,6 +640,15 @@ class Crawler:
                     if config.job_id:
                         self.store.mark_item(config.job_id, key, "error", str(exc))
                 await emit()
+
+        if inline_prefilter:
+            progress["videos_skipped"] = int(progress.get("videos_skipped") or 0) + scout_skipped_videos
+            progress["dynamics_skipped"] = int(progress.get("dynamics_skipped") or 0) + scout_skipped_dynamics
+            self.on_log(
+                "ok",
+                f"{name} · 超大号标题预筛：保留视频 {len(scout_video_rows)} / 跳过 {scout_skipped_videos} · "
+                f"保留动态 {len(scout_dyn_rows)} / 跳过 {scout_skipped_dynamics}",
+            )
 
         # Rebuild durable indexes from SQLite, not only this run's in-memory slice.
         # This keeps prior items visible after cancellation, a narrower time range,
@@ -355,6 +676,334 @@ class Crawler:
                 ],
             },
         )
+        if config.mode == "scout":
+            return {
+                "account": {
+                    "mid": uid,
+                    "name": name,
+                    "space_url": profile.get("space_url"),
+                    "video_n": len(scout_video_rows),
+                    "dynamic_n": len(scout_dyn_rows),
+                    "follower": snapshot.get("follower") or 0,
+                    "sign": (profile.get("sign") or "")[:120],
+                },
+                "videos": scout_video_rows,
+                "dynamics": scout_dyn_rows,
+                "_inline_prefiltered": inline_prefilter,
+            }
+        return None
+
+    async def _scout_video(
+        self,
+        client: BiliClient,
+        config: JobConfig,
+        uid: str,
+        up_name: str,
+        acc_dir: Path,
+        listing: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Titles + tags + basic stats only — no comments/media/transcript."""
+        bvid = listing["bvid"]
+        detail = await client.get_view_detail(bvid)
+        view = detail.get("View") if isinstance(detail.get("View"), dict) else {}
+        owner = view.get("owner") if isinstance(view.get("owner"), dict) else {}
+        stat = view.get("stat") if isinstance(view.get("stat"), dict) else {}
+        folder = video_dir(
+            acc_dir,
+            int(view.get("pubdate") or listing.get("created") or 0),
+            bvid,
+            view.get("title") or listing.get("title") or bvid,
+        )
+        captured = now_iso()
+        tags: list[str] = []
+        for tag in detail.get("Tags") or []:
+            if isinstance(tag, dict):
+                name = str(tag.get("tag_name") or tag.get("name") or "").strip()
+                if name:
+                    tags.append(name)
+        title = view.get("title") or listing.get("title") or bvid
+        desc = str(view.get("desc") or "")
+        meta = {
+            "bvid": bvid,
+            "aid": view.get("aid"),
+            "cid": view.get("cid"),
+            "title": title,
+            "pubdate": view.get("pubdate") or listing.get("created"),
+            "duration": view.get("duration") or listing.get("length"),
+            "desc": desc,
+            "tname": view.get("tname") or "",
+            "owner": owner,
+            "stat": stat,
+            "pages": [],
+            "tags": tags,
+            "page_url": f"https://www.bilibili.com/video/{bvid}",
+            "captured_at": captured,
+            "scout": True,
+        }
+        write_json(folder / "meta.json", meta)
+        pipeline = PipelineState.load(folder)
+        pipeline.mark("metadata", "v2-scout", "done", captured_at=captured)
+        md = (
+            f"# {title}\n\n"
+            f"- BV：{bvid}\n"
+            f"- 分区：{meta.get('tname') or '—'}\n"
+            f"- 标签：{' · '.join(tags) if tags else '（无）'}\n"
+            f"- 播放 {stat.get('view') or 0} · 点赞 {stat.get('like') or 0} · 评论 {stat.get('reply') or 0}\n"
+            f"- 链接：{meta['page_url']}\n\n"
+            f"## 简介\n\n{desc or '（无）'}\n\n"
+            f"> 选题预览模式：未采集评论 / 弹幕 / 媒体 / 转写。\n"
+        )
+        md_path = folder / "video.md"
+        write_text(md_path, md)
+        row = {
+            "bvid": bvid,
+            "mid": uid,
+            "aid": str(view.get("aid") or ""),
+            "cid": str(view.get("cid") or ""),
+            "title": title,
+            "pubdate": meta.get("pubdate"),
+            "duration": meta.get("duration"),
+            "view": stat.get("view"),
+            "like_n": stat.get("like"),
+            "coin": stat.get("coin"),
+            "favorite": stat.get("favorite"),
+            "share": stat.get("share"),
+            "reply": stat.get("reply"),
+            "danmaku": stat.get("danmaku"),
+            "tname": meta.get("tname"),
+            "description": desc,
+            "page_url": meta["page_url"],
+            "local_audio": "",
+            "local_video": "",
+            "transcript_path": "",
+            "markdown_path": str(md_path),
+            "status": "done",
+            "error": "",
+            "captured_at": captured,
+        }
+        self.store.upsert_video(row)
+        self._corpus_guard(
+            f"视频 {bvid}",
+            lambda c: c.upsert_video(
+                {
+                    "bvid": bvid,
+                    "aid": meta.get("aid"),
+                    "cid": meta.get("cid"),
+                    "mid": uid,
+                    "author_name": owner.get("name") or up_name,
+                    "title": title,
+                    "description": desc,
+                    "tname": meta.get("tname"),
+                    "pubdate": meta.get("pubdate"),
+                    "duration": meta.get("duration"),
+                    "view_count": stat.get("view"),
+                    "like_count": stat.get("like"),
+                    "coin_count": stat.get("coin"),
+                    "favorite_count": stat.get("favorite"),
+                    "share_count": stat.get("share"),
+                    "reply_count": stat.get("reply"),
+                    "danmaku_count": stat.get("danmaku"),
+                    "tags": tags,
+                    "pages": [],
+                    "page_count": 1,
+                    "page_url": meta["page_url"],
+                    "discovery": "space",
+                    "run_id": config.job_id,
+                    "captured_at": captured,
+                }
+            ),
+        )
+        scout_row = {
+            "mid": uid,
+            "name": up_name,
+            "bvid": bvid,
+            "title": title,
+            "tags": " · ".join(tags),
+            "tname": meta.get("tname") or "",
+            "pubdate_iso": ts_iso(int(meta.get("pubdate") or 0))[:10],
+            "view": stat.get("view") or 0,
+            "like": stat.get("like") or 0,
+            "reply": stat.get("reply") or 0,
+            "duration": meta.get("duration") or 0,
+            "page_url": meta["page_url"],
+            "description_short": desc.replace("\n", " ")[:160],
+            "folder": str(folder),
+        }
+        self.on_log("ok", f"预览视频 {bvid} · 标签 {len(tags)}")
+        return row, scout_row
+
+    async def _scout_dynamic(
+        self,
+        client: BiliClient,
+        config: JobConfig,
+        uid: str,
+        up_name: str,
+        acc_dir: Path,
+        dyn: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Dynamic text only — no OCR, no comments, no image download."""
+        folder = dynamic_dir(acc_dir, dyn["pub_ts"], dyn["dyn_id"])
+        captured = now_iso()
+        dyn = dict(dyn)
+        dyn["captured_at"] = captured
+        dyn["scout"] = True
+        write_json(folder / "meta.json", dyn)
+        pipeline = PipelineState.load(folder)
+        pipeline.mark("metadata", "v2-scout", "done", captured_at=captured)
+        text = str(dyn.get("text") or "")
+        pics = dyn.get("pictures") or []
+        md = (
+            f"# 动态 {dyn['dyn_id']}\n\n"
+            f"- 时间：{ts_iso(int(dyn.get('pub_ts') or 0))}\n"
+            f"- 赞 {dyn.get('like') or 0} · 评 {dyn.get('comment') or 0} · 转发 {dyn.get('forward') or 0}\n"
+            f"- 图片数：{len(pics)}\n"
+            f"- 链接：{dyn.get('jump_url') or '—'}\n\n"
+            f"## 正文\n\n{text or '（无文字）'}\n\n"
+            f"> 选题预览模式：未下载图片 / OCR / 评论。\n"
+        )
+        md_path = folder / "dynamic.md"
+        write_text(md_path, md)
+        row = {
+            "dyn_id": dyn["dyn_id"],
+            "mid": uid,
+            "dyn_type": dyn.get("dyn_type"),
+            "pub_ts": dyn.get("pub_ts"),
+            "text": text,
+            "like_n": dyn.get("like"),
+            "comment_n": dyn.get("comment"),
+            "forward_n": dyn.get("forward"),
+            "markdown_path": str(md_path),
+            "status": "done",
+            "error": "",
+            "captured_at": captured,
+        }
+        self.store.upsert_dynamic(row)
+        dyn_payload = dict(dyn)
+        dyn_payload["mid"] = uid
+        self._corpus_guard(
+            f"动态 {dyn['dyn_id']}",
+            lambda c: c.upsert_dynamic(dyn_payload, [], run_id=config.job_id),
+        )
+        scout_row = {
+            "mid": uid,
+            "name": up_name,
+            "dyn_id": dyn["dyn_id"],
+            "pub_time_iso": ts_iso(int(dyn.get("pub_ts") or 0)),
+            "text": text.replace("\n", " ")[:500],
+            "like": dyn.get("like") or 0,
+            "comment": dyn.get("comment") or 0,
+            "forward": dyn.get("forward") or 0,
+            "picture_count": len(pics),
+            "jump_url": dyn.get("jump_url") or "",
+            "folder": str(folder),
+        }
+        self.on_log("ok", f"预览动态 {dyn['dyn_id']}")
+        return row, scout_row
+
+    def _scout_row_from_disk(self, uid: str, up_name: str, bvid: str) -> dict[str, Any] | None:
+        for folder in self.library.glob(f"{uid}_*/videos/*_{bvid}_*"):
+            meta_path = folder / "meta.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            tags = meta.get("tags") or []
+            if isinstance(tags, str):
+                tags = [tags]
+            return {
+                "mid": uid,
+                "name": up_name,
+                "bvid": bvid,
+                "title": meta.get("title") or "",
+                "tags": " · ".join(tags),
+                "tname": meta.get("tname") or "",
+                "pubdate_iso": ts_iso(int(meta.get("pubdate") or 0))[:10],
+                "view": (meta.get("stat") or {}).get("view") or 0,
+                "like": (meta.get("stat") or {}).get("like") or 0,
+                "reply": (meta.get("stat") or {}).get("reply") or 0,
+                "duration": meta.get("duration") or 0,
+                "page_url": meta.get("page_url") or f"https://www.bilibili.com/video/{bvid}",
+                "description_short": str(meta.get("desc") or "").replace("\n", " ")[:160],
+                "folder": str(folder),
+            }
+        return None
+
+    def _scout_dyn_from_disk(self, uid: str, up_name: str, dyn_id: str) -> dict[str, Any] | None:
+        for folder in self.library.glob(f"{uid}_*/dynamics/*_{dyn_id}"):
+            meta_path = folder / "meta.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            text = str(meta.get("text") or "")
+            return {
+                "mid": uid,
+                "name": up_name,
+                "dyn_id": dyn_id,
+                "pub_time_iso": ts_iso(int(meta.get("pub_ts") or 0)),
+                "text": text.replace("\n", " ")[:500],
+                "like": meta.get("like") or 0,
+                "comment": meta.get("comment") or 0,
+                "forward": meta.get("forward") or 0,
+                "picture_count": len(meta.get("pictures") or []),
+                "jump_url": meta.get("jump_url") or "",
+                "folder": str(folder),
+            }
+        return None
+
+    def _reload_scout_labor_from_disk(self, uid: str) -> dict[str, Any] | None:
+        acc_dirs = list(self.library.glob(f"{uid}_*"))
+        if not acc_dirs:
+            return None
+        acc_dir = acc_dirs[0]
+        name = acc_dir.name.split("_", 1)[-1] if "_" in acc_dir.name else uid
+        profile_path = acc_dir / "profile.json"
+        if profile_path.exists():
+            try:
+                name = json.loads(profile_path.read_text(encoding="utf-8")).get("name") or name
+            except (OSError, json.JSONDecodeError):
+                pass
+        videos: list[dict[str, Any]] = []
+        dynamics: list[dict[str, Any]] = []
+        for folder in sorted((acc_dir / "videos").glob("*")) if (acc_dir / "videos").exists() else []:
+            meta_path = folder / "meta.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            bvid = str(meta.get("bvid") or "")
+            row = self._scout_row_from_disk(uid, name, bvid)
+            if row:
+                videos.append(row)
+        for folder in sorted((acc_dir / "dynamics").glob("*")) if (acc_dir / "dynamics").exists() else []:
+            meta_path = folder / "meta.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            dyn_id = str(meta.get("dyn_id") or "")
+            row = self._scout_dyn_from_disk(uid, name, dyn_id)
+            if row:
+                dynamics.append(row)
+        return {
+            "account": {
+                "mid": uid,
+                "name": name,
+                "space_url": f"https://space.bilibili.com/{uid}",
+                "video_n": len(videos),
+                "dynamic_n": len(dynamics),
+            },
+            "videos": videos,
+            "dynamics": dynamics,
+        }
 
     async def _crawl_video(
         self,
@@ -409,7 +1058,17 @@ class Crawler:
         comment_count = 0
         if config.crawl_comments:
             comments_path = folder / "comments.jsonl"
-            signature = f"v2:pages={self.settings.comment_max_pages}:sub={int(self.settings.include_sub_replies)}"
+            max_pages = (
+                int(config.comment_max_pages)
+                if config.comment_max_pages is not None
+                else int(self.settings.comment_max_pages)
+            )
+            include_sub = (
+                bool(config.include_sub_replies)
+                if config.include_sub_replies is not None
+                else bool(self.settings.include_sub_replies)
+            )
+            signature = f"v2:pages={max_pages}:sub={int(include_sub)}"
             if config.resume and pipeline.completed("comments", signature, [comments_path]):
                 comment_count = _line_count(comments_path)
                 self.on_log("info", f"复用评论 {bvid} · {comment_count} 条")
@@ -420,8 +1079,8 @@ class Crawler:
                     client.iter_comments(
                         str(view.get("aid") or listing.get("aid")),
                         1,
-                        max_pages=self.settings.comment_max_pages,
-                        include_sub=self.settings.include_sub_replies,
+                        max_pages=max_pages,
+                        include_sub=include_sub,
                     ),
                 )
                 pipeline.mark("comments", signature, "done", count=comment_count)
@@ -897,7 +1556,17 @@ class Crawler:
         comment_count = 0
         if config.crawl_comments and dyn.get("comment_id"):
             path = folder / "comments.jsonl"
-            signature = f"v2:pages={self.settings.comment_max_pages}:sub={int(self.settings.include_sub_replies)}"
+            max_pages = (
+                int(config.comment_max_pages)
+                if config.comment_max_pages is not None
+                else int(self.settings.comment_max_pages)
+            )
+            include_sub = (
+                bool(config.include_sub_replies)
+                if config.include_sub_replies is not None
+                else bool(self.settings.include_sub_replies)
+            )
+            signature = f"v2:pages={max_pages}:sub={int(include_sub)}"
             if config.resume and pipeline.completed("comments", signature, [path]):
                 comment_count = _line_count(path)
             else:
@@ -907,8 +1576,8 @@ class Crawler:
                     client.iter_comments(
                         str(dyn["comment_id"]),
                         int(dyn.get("comment_type") or 17),
-                        max_pages=self.settings.comment_max_pages,
-                        include_sub=self.settings.include_sub_replies,
+                        max_pages=max_pages,
+                        include_sub=include_sub,
                     ),
                 )
                 pipeline.mark("comments", signature, "done", count=comment_count)

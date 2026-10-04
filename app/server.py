@@ -20,7 +20,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from bili.academic import AcademicConfig, AcademicCrawler, parse_academic_seeds
-from bili.autodl import SESSION as AUTODL_SESSION, connect_autodl, put_via_session, session_alive
+from bili.keyword_sample import KeywordSampleConfig, KeywordSampler, SEARCH_ORDERS, parse_keywords
+from bili.autodl import SESSION as AUTODL_SESSION, channel_catalog, connect_autodl, normalize_autodl_role, put_via_session, session_alive
 from bili.client import BiliClient
 from bili.corpus import Corpus
 from bili.crawler import Crawler, JobConfig
@@ -144,7 +145,7 @@ class JobIn(BaseModel):
     ocr_enabled: bool = True
     resume: bool = True
     compute_backend: str = "local"
-    kind: str = "archive"
+    kind: str = "archive"  # archive | scout
 
 
 class JobRuntime:
@@ -407,6 +408,7 @@ async def gpu_test(body: GpuTestIn = GpuTestIn()) -> dict[str, Any]:
 class AutodlConnectIn(BaseModel):
     ssh_command: str | None = None
     password: str | None = None
+    role: str | None = None
 
 
 class AutodlPutIn(BaseModel):
@@ -428,6 +430,12 @@ def _require_library_file(raw: str) -> Path:
 @app.get("/api/gpu/autodl/status")
 async def autodl_status() -> dict[str, Any]:
     return AUTODL_SESSION.status()
+
+
+@app.get("/api/gpu/autodl/channels")
+async def autodl_channels() -> dict[str, Any]:
+    """Return upload/model matrix for each AutoDL channel (collect vs analyze)."""
+    return {"channels": channel_catalog()}
 
 
 @app.post("/api/gpu/autodl/put")
@@ -487,12 +495,18 @@ async def autodl_connect(body: AutodlConnectIn = AutodlConnectIn()) -> Streaming
     settings = load_settings()
     ssh_command = (body.ssh_command or settings.autodl_ssh_command or "").strip()
     password = (body.password or settings.autodl_ssh_password or "").strip()
+    try:
+        role = normalize_autodl_role(body.role)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     if not ssh_command:
         raise HTTPException(400, "请粘贴 AutoDL 的 SSH 登录指令")
     if not password:
         raise HTTPException(400, "请填写 AutoDL SSH 密码")
-    token = (settings.gpu_worker_token or "").strip() or secrets.token_hex(16)
-    # 本机 Intel Mac 默认 small；租 GPU 就是为了跑 large-v3，不要沿用本机模型档。
+    token = (settings.gpu_worker_token or "").strip()
+    if role == "collect":
+        token = token or secrets.token_hex(16)
+    # 本机 Intel Mac 默认 small；采集转写租 GPU 就是为了跑 large-v3。
     model = "large-v3"
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -507,23 +521,33 @@ async def autodl_connect(body: AutodlConnectIn = AutodlConnectIn()) -> Streaming
                 password=password,
                 token=token,
                 model=model,
+                role=role,
                 log=emit,
             )
             current = load_settings()
             current.autodl_ssh_command = ssh_command
             current.autodl_ssh_password = password
-            current.gpu_worker_token = token
-            current.gpu_worker_url = str(result["url"])
-            current.compute_backend = "cloud"
+            if role == "collect":
+                current.gpu_worker_token = token
+                current.gpu_worker_url = str(result["url"])
+                current.compute_backend = "cloud"
+                done_msg = "AutoDL 已接入（采集转写）"
+                emit("接入完成。按 UP 主采集选文字研究或完整归档，步骤 6 选云端 GPU。", "ok")
+            else:
+                current.gpu_worker_url = ""
+                if current.compute_backend == "cloud":
+                    current.compute_backend = "local"
+                done_msg = "AutoDL 已接入（主题分析）"
+                emit("接入完成。未加载 Whisper。接下来运行 tools/launch_bertopic_autodl.py。", "ok")
             save_settings(current)
-            emit("接入完成。按 UP 主采集选文字研究或完整归档，步骤 6 选云端 GPU。", "ok")
             loop.call_soon_threadsafe(
                 queue.put_nowait,
                 {
                     "done": True,
                     "ok": True,
-                    "message": "AutoDL 已接入",
-                    "url": result["url"],
+                    "message": done_msg,
+                    "role": role,
+                    "url": result.get("url") or "",
                     "settings": public_settings(load_settings()),
                 },
             )
@@ -556,6 +580,37 @@ async def create_job(body: JobIn) -> dict[str, Any]:
         raise HTTPException(400, "请填写至少一个 UID 或空间链接")
     if body.time_range not in {"all", "3y", "2y", "1y", "9m", "6m", "3m"}:
         raise HTTPException(400, "时间范围无效")
+    kind = body.kind if body.kind in {"archive", "scout"} else "archive"
+    if kind == "scout":
+        # Screening pass: titles/tags/dynamics only. Ignore heavy module flags from the form.
+        job_id = uuid.uuid4().hex[:12]
+        settings = load_settings()
+        config = {
+            "uids_text": body.uids_text,
+            "uids": uids,
+            "time_range": body.time_range,
+            "crawl_profile": True,
+            "crawl_videos": True,
+            "crawl_dynamics": True,
+            "crawl_comments": False,
+            "crawl_danmaku": False,
+            "ocr_enabled": False,
+            "media_mode": "none",
+            "transcribe_mode": "none",
+            "media_keep": "keep",
+            "resume": False,
+            "compute_backend": "local",
+            "rclone_remote": settings.rclone_remote,
+            "rclone_root": settings.rclone_root,
+            "kind": "scout",
+            "mode": "scout",
+        }
+        runtime = JobRuntime(job_id, config)
+        JOBS[job_id] = runtime
+        store.save_job(job_id, config, "queued", {})
+        runtime.task = asyncio.create_task(_run_job(runtime))
+        return {"id": job_id, "uids": uids, "status": "queued", "kind": "scout"}
+
     if body.media_mode not in {"none", "link", "audio", "video"}:
         raise HTTPException(400, "媒体策略无效")
     if body.transcribe_mode not in TRANSCRIBE_MODES:
@@ -584,11 +639,12 @@ async def create_job(body: JobIn) -> dict[str, Any]:
     config["rclone_remote"] = settings.rclone_remote
     config["rclone_root"] = settings.rclone_root
     config["kind"] = "archive"
+    config["mode"] = "archive"
     runtime = JobRuntime(job_id, config)
     JOBS[job_id] = runtime
     store.save_job(job_id, config, "queued", {})
     runtime.task = asyncio.create_task(_run_job(runtime))
-    return {"id": job_id, "uids": uids, "status": "queued"}
+    return {"id": job_id, "uids": uids, "status": "queued", "kind": "archive"}
 
 
 class AcademicJobIn(BaseModel):
@@ -765,7 +821,100 @@ async def create_transcribe_job(body: TranscribeJobIn) -> dict[str, Any]:
     store.save_job(job_id, config, "queued", {})
     runtime.task = asyncio.create_task(_run_job(runtime))
     return {"id": job_id, "bvids": bvids, "status": "queued"}
-    sql: str
+
+
+class KeywordJobIn(BaseModel):
+    keywords_text: str
+    title_must_terms: str = ""
+    title_match_mode: str = "any"
+    date_from: str = ""
+    date_to: str = ""
+    order: str = "pubdate"
+    duration: int = 0
+    tids: int = 0
+    max_pages_per_keyword: int = 30
+    max_nodes: int = 200
+    min_views: int = 0
+    min_likes: int = 0
+    min_danmaku: int = 0
+    min_replies: int = 0
+    min_engagement: float = 0.0
+    category_allow: str = ""
+    category_deny: str = "游戏,动画,番剧,国创,音乐,舞蹈,影视,娱乐,鬼畜,运动,汽车,时尚,美食,搞笑"
+    crawl_comments: bool = True
+    comment_with_replies: bool = True
+    comment_max_pages: int = 0
+    crawl_danmaku: bool = False
+    crawl_transcript: bool = True
+    transcribe_mode: str = "official_then_whisper"
+    media_mode: str = "audio"
+    media_keep: str = "delete_after_text"
+    resume: bool = True
+    compute_backend: str = "cloud"
+
+
+@app.post("/api/jobs/keyword")
+async def create_keyword_job(body: KeywordJobIn) -> dict[str, Any]:
+    keywords = parse_keywords(body.keywords_text)
+    if not keywords:
+        raise HTTPException(400, "请至少填写一个搜索关键词（可多行或逗号分隔）")
+    if body.title_match_mode not in {"any", "all"}:
+        raise HTTPException(400, "标题匹配模式须为 any 或 all")
+    if body.order not in SEARCH_ORDERS:
+        raise HTTPException(400, "排序无效")
+    if int(body.duration) not in {0, 1, 2, 3, 4}:
+        raise HTTPException(400, "时长筛选项无效")
+    if body.max_nodes < 1 or body.max_nodes > 1000:
+        raise HTTPException(400, "采集上限请放在 1–1000")
+    if body.max_pages_per_keyword < 1 or body.max_pages_per_keyword > 50:
+        raise HTTPException(400, "每个关键词翻页上限请放在 1–50")
+    if body.comment_max_pages < 0 or body.comment_max_pages > 200:
+        raise HTTPException(400, "评论页数请放在 0–200（0=全部）")
+    if body.media_mode not in {"none", "link", "audio", "video"}:
+        raise HTTPException(400, "媒体策略无效")
+    transcribe_mode = body.transcribe_mode if body.crawl_transcript else "none"
+    if transcribe_mode not in TRANSCRIBE_MODES:
+        raise HTTPException(400, "转写策略无效")
+    transcribe_mode, compute_backend = resolve_compute(transcribe_mode, body.compute_backend)
+    if transcribe_mode in LOCAL_WHISPER and body.media_mode not in {"audio", "video"}:
+        raise HTTPException(400, "语音识别需要音频：请把媒体策略改为“下载音频”或“下载视频”")
+    if needs_remote_models(transcribe_mode, compute_backend, False):
+        settings_now = load_settings()
+        ok, message = gpu_worker_ready(settings_now.gpu_worker_url, settings_now.gpu_worker_token)
+        if not ok:
+            raise HTTPException(400, "请先到设置里接入 AutoDL GPU。\n" + message)
+    if body.media_keep not in KEEP_POLICIES:
+        raise HTTPException(400, "空间策略无效")
+    if body.media_keep == "upload_then_delete":
+        settings_now = load_settings()
+        ok, message = rclone_drive_ready(settings_now.rclone_remote)
+        if not ok:
+            raise HTTPException(400, message)
+    from bili.util import parse_date_boundary
+
+    if body.date_from and parse_date_boundary(body.date_from) is None:
+        raise HTTPException(400, "开始日期格式应为 YYYY-MM-DD")
+    if body.date_to and parse_date_boundary(body.date_to, end_of_day=True) is None:
+        raise HTTPException(400, "结束日期格式应为 YYYY-MM-DD")
+    begin = parse_date_boundary(body.date_from)
+    end = parse_date_boundary(body.date_to, end_of_day=True)
+    if begin and end and begin > end:
+        raise HTTPException(400, "开始日期不能晚于结束日期")
+
+    job_id = uuid.uuid4().hex[:12]
+    settings = load_settings()
+    config = body.model_dump()
+    config["kind"] = "keyword"
+    config["keywords"] = keywords
+    config["transcribe_mode"] = transcribe_mode
+    config["compute_backend"] = compute_backend
+    config["rclone_remote"] = settings.rclone_remote
+    config["rclone_root"] = settings.rclone_root
+    runtime = JobRuntime(job_id, config)
+    JOBS[job_id] = runtime
+    store.save_job(job_id, config, "queued", {})
+    runtime.task = asyncio.create_task(_run_job(runtime))
+    return {"id": job_id, "keywords": keywords, "status": "queued", "kind": "keyword"}
 
 
 @app.get("/api/corpus")
@@ -854,15 +1003,26 @@ async def cancel_job(job_id: str) -> dict[str, str]:
 @app.post("/api/jobs/{job_id}/resume")
 async def resume_job(job_id: str) -> dict[str, Any]:
     busy = [item for item in JOBS.values() if item.status in {"queued", "running", "cancelling"}]
-    if busy:
-        raise HTTPException(400, "已有任务在跑。请先取消或等它结束，再续跑。")
+    same = next((item for item in busy if item.id == job_id), None)
+    if same and same.status in {"queued", "running"}:
+        return {"id": job_id, "status": same.status, "kind": (same.config or {}).get("kind"), "already_running": True}
+    if same and same.status == "cancelling":
+        for _ in range(40):
+            await asyncio.sleep(0.5)
+            if same.status not in {"queued", "running", "cancelling"}:
+                break
+        else:
+            raise HTTPException(400, "正在暂停，等当前请求结束后再点续跑")
+        busy = [item for item in JOBS.values() if item.status in {"queued", "running", "cancelling"}]
+    elif busy:
+        raise HTTPException(400, "已有别的任务在跑。请先暂停它，再续跑这一次。")
     live = JOBS.get(job_id)
     recorded = store.get_job(job_id)
     # Prefer on-disk config so manual limit bumps (e.g. max_nodes) take effect on resume.
     config = ((recorded or {}).get("config") if recorded else None) or (live.config if live else None)
     if not config:
         raise HTTPException(404, "任务不存在，无法续跑")
-    if (config.get("kind") or "archive") not in {"academic", "transcribe", "archive"}:
+    if (config.get("kind") or "archive") not in {"academic", "transcribe", "archive", "scout", "keyword"}:
         raise HTTPException(400, "这种任务不能续跑")
     config = dict(config)
     config["resume"] = True
@@ -978,6 +1138,7 @@ async def _execute_job(job: JobRuntime) -> None:
         rclone_remote=job.config.get("rclone_remote") or settings.rclone_remote,
         rclone_root=job.config.get("rclone_root") or settings.rclone_root,
         compute_backend=job.config.get("compute_backend") or settings.compute_backend,
+        mode=job.config.get("mode") or ("scout" if job.config.get("kind") == "scout" else "archive"),
     )
 
     async def bark(event: str, payload: dict[str, Any] | None = None) -> None:
@@ -1004,24 +1165,93 @@ async def _execute_job(job: JobRuntime) -> None:
             on_log("warn", f"Bark 推送失败：{result.get('error') or result.get('data') or result.get('status')}")
 
     async def on_progress(payload: dict[str, Any]) -> None:
-        nonlocal last_videos, last_uids
+        nonlocal last_uids
         if job.cancel:
             crawler.cancelled = True
         job.progress = payload
         job.emit("progress", payload)
         store.save_job(job.id, job.config, job.status, payload, job.error)
-        videos = int(payload.get("videos_done") or 0)
+        # Bark only once per finished UP — never on every video (too noisy).
+        # Scout skip-resume sets notify_uid=False so already-done UPs don't ding.
         uids_done = int(payload.get("uids_done") or 0)
-        if videos > last_videos:
-            last_videos = videos
-            await bark("video", payload)
         if uids_done > last_uids:
             last_uids = uids_done
-            await bark("uid", payload)
+            if payload.get("notify_uid", True):
+                await bark("uid", payload)
 
-    last_videos = 0
     last_uids = 0
     job.status = "running"
+    if job.config.get("kind") == "keyword":
+        on_log(
+            "info",
+            "关键词采样启动 · "
+            + " / ".join(job.config.get("keywords") or [])
+            + f" · 上限 {job.config.get('max_nodes')}",
+        )
+        await bark("start", {"uids_total": job.config.get("max_nodes") or 0, "kind": "keyword"})
+        sampler = KeywordSampler(
+            settings=settings,
+            store=store,
+            corpus=corpus,
+            crawler=crawler,
+            on_log=on_log,
+            should_cancel=lambda: job.cancel,
+        )
+        cfg_kw = KeywordSampleConfig(
+            job_id=job.id,
+            keywords_text=job.config.get("keywords_text") or "",
+            keywords=list(job.config.get("keywords") or []),
+            title_must_terms=job.config.get("title_must_terms") or "",
+            title_match_mode=job.config.get("title_match_mode") or "any",
+            date_from=job.config.get("date_from") or "",
+            date_to=job.config.get("date_to") or "",
+            order=job.config.get("order") or "pubdate",
+            duration=int(job.config.get("duration") or 0),
+            tids=int(job.config.get("tids") or 0),
+            max_pages_per_keyword=int(job.config.get("max_pages_per_keyword") or 30),
+            max_nodes=int(job.config.get("max_nodes") or 200),
+            min_views=int(job.config.get("min_views") or 0),
+            min_likes=int(job.config.get("min_likes") or 0),
+            min_danmaku=int(job.config.get("min_danmaku") or 0),
+            min_replies=int(job.config.get("min_replies") or 0),
+            min_engagement=float(job.config.get("min_engagement") or 0),
+            category_allow=job.config.get("category_allow") or "",
+            category_deny=job.config.get("category_deny") or "",
+            crawl_comments=bool(job.config.get("crawl_comments", True)),
+            comment_with_replies=bool(job.config.get("comment_with_replies", True)),
+            comment_max_pages=int(job.config.get("comment_max_pages") or 0),
+            crawl_danmaku=bool(job.config.get("crawl_danmaku", False)),
+            transcribe_mode=job.config.get("transcribe_mode") or "official_then_whisper",
+            media_mode=job.config.get("media_mode") or "audio",
+            media_keep=job.config.get("media_keep") or "delete_after_text",
+            ocr_enabled=bool(job.config.get("ocr_enabled", False)),
+            resume=bool(job.config.get("resume", True)),
+            compute_backend=job.config.get("compute_backend") or "local",
+            rclone_remote=job.config.get("rclone_remote") or settings.rclone_remote,
+            rclone_root=job.config.get("rclone_root") or settings.rclone_root,
+        )
+        try:
+            await sampler.run(cfg_kw, on_progress=on_progress)
+            job.status = "cancelled" if job.cancel or sampler.cancelled else "done"
+            on_log("ok", "关键词采样结束" if job.status == "done" else "已取消")
+        except asyncio.CancelledError:
+            job.status = "cancelled"
+            on_log("warn", "任务已取消；队列和已采集节点已保留")
+        except Exception as exc:
+            if job.cancel:
+                job.status = "cancelled"
+                on_log("warn", "任务已取消；已完成步骤已保留")
+            else:
+                job.status = "error"
+                job.error = str(exc)
+                on_log("error", f"任务失败：{exc}")
+        store.save_job(job.id, job.config, job.status, job.progress, job.error)
+        finish = dict(job.progress or {})
+        finish["error"] = job.error
+        await bark("cancelled" if job.status == "cancelled" else ("error" if job.status == "error" else "done"), finish)
+        job.emit("done", {"status": job.status, "progress": job.progress, "error": job.error})
+        return
+
     if job.config.get("kind") in {"academic", "transcribe"}:
         transcribe_job = job.config.get("kind") == "transcribe" or bool(job.config.get("skip_gate"))
         on_log(
@@ -1095,12 +1325,19 @@ async def _execute_job(job: JobRuntime) -> None:
         job.emit("done", {"status": job.status, "progress": job.progress, "error": job.error})
         return
 
-    on_log("info", f"任务启动 · {len(cfg.uids)} 个账号 · 范围 {cfg.time_range} · 算力 {cfg.compute_backend}")
+    if cfg.mode == "scout":
+        on_log("info", f"选题预览启动 · {len(cfg.uids)} 个账号 · 范围 {cfg.time_range} · 只采标题/标签/动态")
+    else:
+        on_log("info", f"任务启动 · {len(cfg.uids)} 个账号 · 范围 {cfg.time_range} · 算力 {cfg.compute_backend}")
     await bark("start", {"uids_total": len(cfg.uids)})
     try:
         await crawler.run(cfg, on_progress=on_progress)
         job.status = "cancelled" if job.cancel else "done"
-        on_log("ok", "任务结束" if not job.cancel else "已取消")
+        if cfg.mode == "scout" and not job.cancel:
+            export_path = (job.progress or {}).get("scout_export")
+            on_log("ok", f"选题预览结束" + (f" · 结果在 {export_path}" if export_path else ""))
+        else:
+            on_log("ok", "任务结束" if not job.cancel else "已取消")
     except asyncio.CancelledError:
         job.status = "cancelled"
         on_log("warn", "任务已取消；下载断点和已完成步骤已保留")

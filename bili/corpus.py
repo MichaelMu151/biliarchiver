@@ -21,10 +21,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
+from bili.analysis_hygiene import ensure_analysis_columns
 from bili.paths import CORPUS_DB_PATH, ensure_dirs
 from bili.util import now_iso, ts_iso
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -103,6 +104,9 @@ CREATE TABLE IF NOT EXISTS videos (
   seed_bvid TEXT,
   pass_filter INTEGER,             -- 1 通过门禁 / 0 被剪枝 / NULL 未评估
   reject_reason TEXT,
+  -- Soft analysis flags (hygiene); never hard-delete research rows
+  analysis_exclude INTEGER DEFAULT 0,  -- 1 = drop from modeling views
+  analysis_exclude_reason TEXT,
   -- Derived text metrics, precomputed so queries stay cheap
   title_length INTEGER,
   description_length INTEGER,
@@ -116,6 +120,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_tid ON videos(tid);
 CREATE INDEX IF NOT EXISTS idx_videos_depth ON videos(depth);
 CREATE INDEX IF NOT EXISTS idx_videos_pass ON videos(pass_filter);
 CREATE INDEX IF NOT EXISTS idx_videos_run ON videos(run_id);
+CREATE INDEX IF NOT EXISTS idx_videos_analysis_exclude ON videos(analysis_exclude);
 
 -- Long form of tags_json: one row per (video, tag) for co-occurrence analysis.
 CREATE TABLE IF NOT EXISTS video_tags (
@@ -198,6 +203,9 @@ CREATE TABLE IF NOT EXISTS comments (
   reply_count INTEGER,
   pub_ts INTEGER,
   pub_time_iso TEXT,
+  -- Soft noise flags from tools/corpus_hygiene.py
+  is_noise INTEGER DEFAULT 0,
+  noise_reason TEXT,
   run_id TEXT,
   captured_at TEXT
 );
@@ -208,6 +216,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_level ON comments(hierarchy_level);
 CREATE INDEX IF NOT EXISTS idx_comments_len ON comments(text_length);
 CREATE INDEX IF NOT EXISTS idx_comments_user ON comments(user_mid);
 CREATE INDEX IF NOT EXISTS idx_comments_ts ON comments(pub_ts);
+CREATE INDEX IF NOT EXISTS idx_comments_is_noise ON comments(is_noise);
 
 CREATE TABLE IF NOT EXISTS danmaku (
   danmaku_id TEXT PRIMARY KEY,
@@ -342,6 +351,35 @@ SELECT
   v.pass_filter, v.seed_bvid, v.parent_bvid
 FROM transcripts t
 LEFT JOIN videos v ON v.bvid = t.bvid;
+
+-- Modeling-ready slices (post hygiene soft flags)
+DROP VIEW IF EXISTS v_video_analysis;
+CREATE VIEW v_video_analysis AS
+SELECT v.*
+FROM videos v
+WHERE IFNULL(v.pass_filter, 0) = 1
+  AND IFNULL(v.analysis_exclude, 0) = 0;
+
+DROP VIEW IF EXISTS v_comment_analysis;
+CREATE VIEW v_comment_analysis AS
+SELECT
+  c.rpid, c.target_kind, c.target_id, c.hierarchy_level,
+  c.root_rpid, c.parent_rpid, c.bvid,
+  c.user_mid, c.user_name, c.ip_location,
+  c.content, c.text_length, c.like_count, c.reply_count,
+  c.pub_ts, c.pub_time_iso,
+  c.is_noise, c.noise_reason,
+  v.title AS video_title, v.tname AS video_category, v.tid AS video_tid,
+  v.view_count AS video_view, v.reply_count AS video_reply,
+  v.depth AS snowball_depth, v.seed_bvid, v.run_id AS video_run_id,
+  v.analysis_exclude, v.analysis_exclude_reason
+FROM comments c
+JOIN videos v ON v.bvid = c.bvid
+WHERE IFNULL(v.pass_filter, 0) = 1
+  AND IFNULL(v.analysis_exclude, 0) = 0
+  AND IFNULL(c.is_noise, 0) = 0
+  AND c.content IS NOT NULL
+  AND TRIM(c.content) != '';
 """
 
 CORPUS_TABLES = (
@@ -368,6 +406,8 @@ EXPORTABLE_VIEWS = (
     "v_transcript_corpus",
     "v_snowball_network",
     "v_gate_funnel",
+    "v_video_analysis",
+    "v_comment_analysis",
 )
 
 
@@ -412,6 +452,8 @@ class Corpus:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            # Existing DBs created before schema v3 need ALTER TABLE columns.
+            ensure_analysis_columns(conn)
             conn.execute(
                 "INSERT INTO schema_meta(key,value) VALUES('schema_version',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

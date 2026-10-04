@@ -200,13 +200,27 @@ class NotifyTests(unittest.TestCase):
         self.assertTrue(callable(fetch_and_transcribe_via_session))
         self.assertTrue(callable(transcribe_remote_from_bili))
 
-    def test_autodl_upload_skips_local_venv_backups(self) -> None:
-        from bili.autodl import iter_upload_files
+    def test_autodl_upload_is_role_allowlisted(self) -> None:
+        from bili.autodl import UPLOAD_MANIFEST, iter_upload_files, normalize_autodl_role
 
-        files = iter_upload_files()
-        self.assertLess(len(files), 100)
-        self.assertTrue(any(p.name == "gpu_worker.py" for p in files))
-        self.assertFalse(any(".venv-py314.bak" in p.parts for p in files))
+        self.assertEqual(normalize_autodl_role("bertopic"), "analyze")
+        self.assertEqual(normalize_autodl_role("whisper"), "collect")
+        collect = iter_upload_files(role="collect")
+        analyze = iter_upload_files(role="analyze")
+        collect_names = {p.name for p in collect}
+        analyze_names = {p.name for p in analyze}
+        self.assertEqual(len(collect), len(UPLOAD_MANIFEST["collect"]))
+        self.assertEqual(len(analyze), len(UPLOAD_MANIFEST["analyze"]))
+        self.assertLess(len(collect), 20)
+        self.assertLess(len(analyze), 8)
+        self.assertIn("gpu_worker.py", collect_names)
+        self.assertIn("requirements-ai.txt", collect_names)
+        self.assertNotIn("run_gpu_full_bertopic.py", collect_names)
+        self.assertIn("run_gpu_full_bertopic.py", analyze_names)
+        self.assertIn("requirements-analysis-gpu.txt", analyze_names)
+        self.assertNotIn("gpu_worker.py", analyze_names)
+        self.assertFalse(any(".venv-py314.bak" in p.parts for p in collect + analyze))
+        self.assertFalse(any(p.name.endswith(".md") for p in collect + analyze))
 
     def test_pick_python_reads_conda_path(self) -> None:
         from bili import autodl
@@ -610,6 +624,82 @@ class AcademicCorpusTests(unittest.TestCase):
             self.assertTrue(created)
             with self.assertRaises(ValueError):
                 db.query("DELETE FROM videos")
+
+
+class KeywordSampleTests(unittest.TestCase):
+    def test_parse_keywords_and_title_gate(self) -> None:
+        from bili.keyword_sample import (
+            KeywordSampleConfig,
+            evaluate_keyword_gate,
+            normalize_search_hit,
+            parse_keywords,
+            title_terms_match,
+        )
+        from bili.util import parse_date_boundary, strip_html
+
+        self.assertEqual(parse_keywords("八小时\n8小时,双休；单休\n八小时"), ["八小时", "8小时", "双休", "单休"])
+        self.assertTrue(title_terms_match("讨论八小时工作制", ["8小时", "八小时"], "any"))
+        self.assertFalse(title_terms_match("讨论双休", ["8小时", "八小时"], "any"))
+        self.assertTrue(title_terms_match("八小时与双休", ["八小时", "双休"], "all"))
+        self.assertEqual(strip_html('<em class="keyword">八小时</em>工作制'), "八小时工作制")
+        begin = parse_date_boundary("2026-09-01")
+        self.assertIsNotNone(begin)
+
+        cfg = KeywordSampleConfig(
+            job_id="t",
+            title_must_terms="八小时,双休",
+            title_match_mode="any",
+            date_from="2026-09-01",
+            min_views=1000,
+            min_likes=10,
+            min_danmaku=5,
+            min_replies=20,
+        )
+        hit = normalize_search_hit(
+            {
+                "bvid": "BV1xxxxxxxx",
+                "title": "<em>八小时</em>工作制争议",
+                "description": "test",
+                "pubdate": begin + 86400,
+                "play": 5000,
+                "like": 50,
+                "video_review": 12,
+                "review": 40,
+                "typename": "社科·法律·心理",
+                "typeid": 228,
+            }
+        )
+        ok, reason, _ = evaluate_keyword_gate(hit, cfg, stage="listing")
+        self.assertTrue(ok, reason)
+
+        hit_bad = dict(hit)
+        hit_bad["title"] = "周末去哪玩"
+        ok, reason, _ = evaluate_keyword_gate(hit_bad, cfg, stage="listing")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "title_terms")
+
+        hit_low = dict(hit)
+        hit_low["views"] = 10
+        ok, reason, _ = evaluate_keyword_gate(hit_low, cfg, stage="listing")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "min_views")
+
+    def test_autodl_channels_are_disjoint(self) -> None:
+        from bili.autodl import channel_catalog, normalize_autodl_role
+
+        rows = {row["id"]: row for row in channel_catalog()}
+        self.assertEqual(set(rows), {"collect", "analyze"})
+        collect_files = set(rows["collect"]["upload_files"])
+        analyze_files = set(rows["analyze"]["upload_files"])
+        self.assertTrue(collect_files)
+        self.assertTrue(analyze_files)
+        self.assertFalse(collect_files & analyze_files)
+        self.assertIn("tools/gpu_worker.py", collect_files)
+        self.assertIn("run_gpu_full_bertopic.py", analyze_files)
+        self.assertTrue(rows["collect"]["starts_worker"])
+        self.assertFalse(rows["analyze"]["starts_worker"])
+        self.assertEqual(normalize_autodl_role("whisper"), "collect")
+        self.assertEqual(normalize_autodl_role("bertopic"), "analyze")
 
 
 if __name__ == "__main__":

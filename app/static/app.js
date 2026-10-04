@@ -1,7 +1,8 @@
 const titles = {
-  guide: ["使用指南", "三种采集分开用。每种都能从头开始，也能续跑中断的那一次。"],
-  task: ["按 UP 主采集", "指定账号，按时间窗口把投稿、动态和评论整库归档。"],
+  guide: ["使用指南", "四种采集分开用。每种都能从头开始，也能续跑中断的那一次。"],
+  task: ["按 UP 主采集", "完整归档，或先用「选题预览」只采标题/标签/动态再人工筛选。"],
   academic: ["学术滚雪球", "从种子视频沿相关推荐扩样本，过门禁的才写入分析库。"],
+  keyword: ["关键词采样", "全站搜索关键词，按标题/时间/互动门禁后采集转写与评论。"],
   transcribe: ["按视频号采集", "只处理你列出的 BV：不扩散推荐，也不过门禁。"],
   monitor: ["运行监控", "看进度和日志。中断的任务在这里续跑；换条件请回到采集页从头开始。"],
   results: ["采集结果", "浏览账号快照、视频 Markdown 和动态 OCR。"],
@@ -11,15 +12,17 @@ const titles = {
 
 const KIND_LABEL = {
   archive: "按 UP 主采集",
+  scout: "选题预览",
   academic: "学术滚雪球",
+  keyword: "关键词采样",
   transcribe: "按视频号采集",
 };
 
 const STATUS_LABEL = {
   queued: "排队",
   running: "进行中",
-  cancelling: "取消中",
-  cancelled: "已取消",
+  cancelling: "暂停中",
+  cancelled: "已暂停",
   interrupted: "已中断",
   done: "已完成",
   error: "出错",
@@ -58,8 +61,12 @@ function showPage(name) {
     loadMissingBvids();
     fillResumePick("transcribe-resume-pick", "transcribe", "transcribe-resume-hint");
   }
-  if (name === "task") fillResumePick("task-resume-pick", "archive", "task-resume-hint");
+  if (name === "task") fillResumePick("task-resume-pick", ["archive", "scout"], "task-resume-hint");
   if (name === "academic") fillResumePick("academic-resume-pick", "academic", "academic-resume-hint");
+  if (name === "keyword") {
+    fillResumePick("keyword-resume-pick", "keyword", "keyword-resume-hint");
+    updateKeywordHints();
+  }
   if (name === "monitor") loadJobHistory();
 }
 
@@ -75,8 +82,10 @@ document.querySelectorAll(".choice-card input").forEach((input) => {
     syncChoiceCards();
     enforceCompatibleChoices(input.name);
     enforceAcademicChoices(input.name);
+    enforceKeywordChoices(input.name);
     updatePlanSummary();
     updateAcademicHints();
+    updateKeywordHints();
   });
 });
 
@@ -148,6 +157,31 @@ function enforceAcademicChoices(changedName) {
   } else if (changedName === "ac-media-mode" && needsAudio && !["audio", "video"].includes(media)) {
     setRadio("ac-transcribe-mode", "official");
     toast("未下载音频时，学术滚雪球改为只取官方字幕");
+  }
+}
+
+function enforceKeywordChoices(changedName) {
+  if (!$("keyword-start")) return;
+  const wantTranscript = $("kw-transcript")?.checked !== false;
+  if ($("kw-transcribe-card")) $("kw-transcribe-card").hidden = !wantTranscript;
+  if (!wantTranscript) return;
+  const media = radioValue("kw-media-mode") || "audio";
+  const transcript = radioValue("kw-transcribe-mode") || "official_then_whisper";
+  const needsAudio = ["whisper", "official_then_whisper"].includes(transcript);
+  if (changedName === "kw-transcribe-mode" && needsAudio && !["audio", "video"].includes(media)) {
+    setRadio("kw-media-mode", "audio");
+    toast("关键词采样已改为下载音频，才能跑 Whisper");
+  } else if (changedName === "kw-media-mode" && needsAudio && !["audio", "video"].includes(media)) {
+    setRadio("kw-transcribe-mode", "official");
+    toast("未下载音频时，关键词采样改为只取官方字幕");
+  }
+}
+
+function updateKeywordHints() {
+  // Keep date_to empty = until now; no dedicated hint node required.
+  if ($("kw-comments") && $("kw-comment-mode")) {
+    $("kw-comment-mode").disabled = !$("kw-comments").checked;
+    $("kw-comment-pages").disabled = !$("kw-comments").checked;
   }
 }
 
@@ -240,6 +274,7 @@ $("task-form").addEventListener("submit", async (e) => {
     transcribe_mode: radioValue("transcribe-mode"),
     media_keep: radioValue("media-keep"),
     compute_backend: radioValue("compute-backend") || "local",
+    kind: "archive",
   };
   try {
     const res = await api("/api/jobs", { method: "POST", body });
@@ -254,10 +289,111 @@ $("task-form").addEventListener("submit", async (e) => {
   }
 });
 
+$("scout-start")?.addEventListener("click", async () => {
+  const body = {
+    uids_text: $("uids").value,
+    time_range: selectedRange,
+    kind: "scout",
+  };
+  try {
+    const res = await api("/api/jobs", { method: "POST", body });
+    currentJobId = res.id;
+    $("job-id").textContent = "#" + res.id;
+    $("log-view").textContent = "";
+    showPage("monitor");
+    listenJob(res.id);
+    toast("选题预览已开始：只采标题、标签和动态");
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+async function pauseLiveJob(kinds) {
+  const list = Array.isArray(kinds) ? kinds : [kinds];
+  const data = await fetchJobs();
+  const job = (data.live || []).find((item) =>
+    ["queued", "running", "cancelling"].includes(item.status) && list.includes(jobKind(item))
+  );
+  if (!job) {
+    toast("当前没有在跑的这类任务");
+    return null;
+  }
+  if (job.status === "cancelling") {
+    toast("正在暂停，稍等即可");
+    return job;
+  }
+  await api("/api/jobs/" + job.id + "/cancel", { method: "POST" });
+  currentJobId = job.id;
+  if ($("job-id")) $("job-id").textContent = "#" + job.id;
+  toast("正在暂停，等当前这条请求结束");
+  for (let i = 0; i < 24; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const latest = await api("/api/jobs/" + job.id).catch(() => null);
+    const status = latest?.status || "";
+    if (status && !["queued", "running", "cancelling"].includes(status)) {
+      toast("已暂停。进度已保留，回来后点「续跑」即可。");
+      return latest;
+    }
+  }
+  toast("已发出暂停。若监控里仍显示进行中，是当前请求还没返回，返回后会停下。");
+  return job;
+}
+
 $("cancel-btn").addEventListener("click", async () => {
-  if (!currentJobId) return;
-  await api("/api/jobs/" + currentJobId + "/cancel", { method: "POST" });
-  toast("正在取消");
+  try {
+    const job = await pauseLiveJob(["archive", "scout", "academic", "keyword", "transcribe"]);
+    if (!job && currentJobId) {
+      await api("/api/jobs/" + currentJobId + "/cancel", { method: "POST" });
+      toast("已暂停。进度已保留，回来后点「续跑」即可。");
+    }
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+$("task-pause")?.addEventListener("click", async () => {
+  try {
+    await pauseLiveJob(["archive", "scout"]);
+    fillResumePick("task-resume-pick", ["archive", "scout"], "task-resume-hint");
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+$("scout-pause")?.addEventListener("click", async () => {
+  try {
+    await pauseLiveJob("scout");
+    fillResumePick("task-resume-pick", ["archive", "scout"], "task-resume-hint");
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+$("academic-pause")?.addEventListener("click", async () => {
+  try {
+    await pauseLiveJob("academic");
+    fillResumePick("academic-resume-pick", "academic", "academic-resume-hint");
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+$("keyword-pause")?.addEventListener("click", async () => {
+  try {
+    await pauseLiveJob("keyword");
+    fillResumePick("keyword-resume-pick", "keyword", "keyword-resume-hint");
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+$("transcribe-pause")?.addEventListener("click", async () => {
+  try {
+    await pauseLiveJob("transcribe");
+    fillResumePick("transcribe-resume-pick", "transcribe", "transcribe-resume-hint");
+  } catch (err) {
+    toast(err.message);
+  }
 });
 
 function jobKind(job) {
@@ -286,25 +422,29 @@ async function fetchJobs() {
 }
 
 function jobsOfKind(data, kind) {
+  const kinds = Array.isArray(kind) ? kind : [kind];
   const seen = new Set();
   const rows = [];
   for (const job of [...(data.live || []), ...(data.history || [])]) {
-    if (jobKind(job) !== kind || seen.has(job.id)) continue;
+    const k = jobKind(job);
+    if (!kinds.includes(k) || seen.has(job.id)) continue;
     seen.add(job.id);
     rows.push(job);
   }
-  return rows.slice(0, 20);
+  return rows.slice(0, 30);
 }
 
 async function fillResumePick(selectId, kind, hintId) {
   const select = $(selectId);
   if (!select) return;
+  const kinds = Array.isArray(kind) ? kind : [kind];
+  const label = kinds.map((k) => KIND_LABEL[k] || k).join(" / ");
   try {
     const data = await fetchJobs();
-    const rows = jobsOfKind(data, kind).filter((job) => !["queued", "running", "cancelling"].includes(job.status));
+    const rows = jobsOfKind(data, kinds).filter((job) => !["queued", "running", "cancelling"].includes(job.status));
     select.innerHTML = rows.length
       ? rows.map((job) => `<option value="${job.id}">${escapeHtml(jobOptionLabel(job))}</option>`).join("")
-      : `<option value="">还没有可续跑的${KIND_LABEL[kind] || "任务"}</option>`;
+      : `<option value="">还没有可续跑的${label}</option>`;
     const hint = hintId ? $(hintId) : null;
     if (hint && !rows.length) hint.textContent = "还没有保存过这类任务。先从头开始一次。";
   } catch (err) {
@@ -346,6 +486,14 @@ $("task-resume")?.addEventListener("click", async () => {
 $("academic-resume")?.addEventListener("click", async () => {
   try {
     await resumeExistingJob($("academic-resume-pick")?.value || "");
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+$("keyword-resume")?.addEventListener("click", async () => {
+  try {
+    await resumeExistingJob($("keyword-resume-pick")?.value || "");
   } catch (err) {
     toast(err.message);
   }
@@ -398,6 +546,56 @@ $("academic-start")?.addEventListener("click", async () => {
     showPage("monitor");
     listenJob(res.id);
     toast("已从头开始一次学术滚雪球");
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+$("keyword-start")?.addEventListener("click", async () => {
+  try {
+    const wantTranscript = $("kw-transcript")?.checked !== false;
+    let transcribe = wantTranscript ? (radioValue("kw-transcribe-mode") || "official_then_whisper") : "none";
+    let media = wantTranscript ? (radioValue("kw-media-mode") || "audio") : "link";
+    if (["whisper", "official_then_whisper"].includes(transcribe) && !["audio", "video"].includes(media)) {
+      media = "audio";
+    }
+    const res = await api("/api/jobs/keyword", {
+      method: "POST",
+      body: {
+        keywords_text: $("kw-keywords").value,
+        title_must_terms: $("kw-title-terms").value,
+        title_match_mode: $("kw-title-mode").value || "any",
+        date_from: $("kw-date-from").value || "",
+        date_to: $("kw-date-to").value || "",
+        order: $("kw-order").value || "pubdate",
+        duration: Number($("kw-duration").value || 0),
+        max_pages_per_keyword: Number($("kw-pages").value || 30),
+        max_nodes: Number($("kw-nodes").value || 200),
+        min_views: Number($("kw-min-views").value || 0),
+        min_likes: Number($("kw-min-likes").value || 0),
+        min_danmaku: Number($("kw-min-danmaku").value || 0),
+        min_replies: Number($("kw-min-replies").value || 0),
+        min_engagement: Number($("kw-min-eng").value || 0),
+        category_allow: $("kw-allow").value,
+        category_deny: $("kw-deny").value,
+        crawl_transcript: wantTranscript,
+        crawl_comments: Boolean($("kw-comments")?.checked),
+        comment_with_replies: ($("kw-comment-mode")?.value || "tree") === "tree",
+        comment_max_pages: Number($("kw-comment-pages").value || 0),
+        crawl_danmaku: Boolean($("kw-danmaku")?.checked),
+        transcribe_mode: transcribe,
+        media_mode: media,
+        media_keep: radioValue("kw-media-keep") || "delete_after_text",
+        compute_backend: radioValue("kw-compute-backend") || "cloud",
+        resume: false,
+      },
+    });
+    currentJobId = res.id;
+    $("job-id").textContent = "#" + res.id;
+    $("log-view").textContent = "";
+    showPage("monitor");
+    listenJob(res.id);
+    toast("已从头开始一次关键词采样");
   } catch (err) {
     toast(err.message);
   }
@@ -557,18 +755,26 @@ function appendLog(item) {
 function applyProgress(p) {
   if (!p) return;
   const transcribe = p.kind === "transcribe";
-  const academic = p.kind === "academic" || (!transcribe && Boolean(p.max_nodes));
-  const listed = transcribe || academic;
+  const keyword = p.kind === "keyword";
+  const academic = p.kind === "academic" || (!transcribe && !keyword && Boolean(p.max_nodes));
+  const listed = transcribe || academic || keyword;
   const total = listed ? (p.max_nodes || 1) : (p.uids_total || 1);
   const done = listed ? (p.nodes_done || p.videos_done || 0) : (p.uids_done || 0);
-  if ($("m-uids-label")) $("m-uids-label").textContent = transcribe ? "进度" : academic ? "节点" : "账号";
-  if ($("m-videos-label")) $("m-videos-label").textContent = transcribe ? "完成" : academic ? "通过" : "视频";
-  if ($("m-dyn-label")) $("m-dyn-label").textContent = transcribe ? "失败" : academic ? "剪枝" : "动态";
+  if ($("m-uids-label")) {
+    $("m-uids-label").textContent = transcribe ? "进度" : keyword ? "节点" : academic ? "节点" : "账号";
+  }
+  if ($("m-videos-label")) {
+    $("m-videos-label").textContent = transcribe ? "完成" : keyword || academic ? "通过" : "视频";
+  }
+  if ($("m-dyn-label")) {
+    $("m-dyn-label").textContent = transcribe ? "失败" : keyword || academic ? "剪枝" : "动态";
+  }
   $("m-status").textContent = translateStatus(p.stage || "running");
   $("m-uids").textContent = `${done} / ${total}`;
   $("m-videos-n").textContent = listed ? (p.passed || p.videos_done || 0) : (p.videos_done || 0);
   $("m-dyn-n").textContent = listed ? (p.pruned || 0) : (p.dynamics_done || 0);
-  $("m-current").textContent = p.current || "";
+  const extra = keyword && p.searched ? ` · 已搜 ${p.searched} · 候选 ${p.candidates || 0}` : "";
+  $("m-current").textContent = (p.current || "") + extra;
   const percent = Math.min(100, (done / total) * 100);
   $("progress-bar").style.width = percent + "%";
   $("progress-wrap").setAttribute("aria-valuenow", String(Math.round(percent)));
@@ -705,9 +911,9 @@ async function loadCapabilities() {
       ["ocr", "图片 OCR", capabilities.ocr],
       ["rclone", "Google Drive", capabilities.rclone || { ready: false, purpose: "上传后删除本地媒体" }],
       ["gpu_worker", "云端 GPU 工作机", capabilities.gpu_worker || { ready: false, purpose: "未激活" }],
-      ["autodl", "AutoDL 隧道", capabilities.autodl?.connected
-        ? { ready: true, purpose: `已接通 ${capabilities.autodl.target || ""}` }
-        : { ready: false, purpose: "一键接入后保持本页开着" }],
+      ["autodl", "AutoDL", capabilities.autodl?.connected
+        ? { ready: true, purpose: `${capabilities.autodl.role_label || "已接通"} ${capabilities.autodl.target || ""}`.trim() }
+        : { ready: false, purpose: "先选采集转写或主题分析，再一键接入" }],
     ];
     $("capability-grid").innerHTML = items
       .map(([key, title, item]) => `
@@ -823,6 +1029,102 @@ $("gpu-test")?.addEventListener("click", async () => {
   }
 });
 
+function autodlRole() {
+  const picked = document.querySelector('input[name="autodl-role"]:checked');
+  return picked && picked.value === "analyze" ? "analyze" : "collect";
+}
+
+let autodlChannels = null;
+
+async function loadAutodlChannels() {
+  try {
+    const data = await api("/api/gpu/autodl/channels");
+    autodlChannels = data.channels || [];
+    renderAutodlChannelMatrix();
+  } catch (_) {
+    autodlChannels = null;
+  }
+}
+
+function channelById(id) {
+  return (autodlChannels || []).find((row) => row.id === id) || null;
+}
+
+function renderAutodlChannelMatrix() {
+  const box = $("autodl-channel-matrix");
+  if (!box) return;
+  const ch = channelById(autodlRole());
+  if (!ch) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  const files = (ch.upload_files || []).map((f) => `<li><code>${escapeHtml(f)}</code></li>`).join("");
+  const models = (ch.download_models || []).map((f) => `<li>${escapeHtml(f)}</li>`).join("");
+  const skip = (ch.skip_models || []).map((f) => `<li>${escapeHtml(f)}</li>`).join("");
+  const covers = (ch.covers || []).map((f) => `<li>${escapeHtml(f)}</li>`).join("");
+  box.innerHTML = `
+    <h4>${escapeHtml(ch.label)} · ${escapeHtml(ch.badge || "")}</h4>
+    <div class="mtx-grid">
+      <div class="mtx-block">
+        <div class="mtx-label">覆盖功能</div>
+        <ul>${covers}</ul>
+      </div>
+      <div class="mtx-block">
+        <div class="mtx-label">会下载 / 预热</div>
+        <ul>${models || "<li>无（接入阶段不预热）</li>"}</ul>
+      </div>
+      <div class="mtx-block">
+        <div class="mtx-label">明确跳过</div>
+        <ul>${skip}</ul>
+      </div>
+      <div class="mtx-block">
+        <div class="mtx-label">本次上传（${ch.upload_count || 0}）</div>
+        <ul>${files}</ul>
+      </div>
+    </div>
+    <p class="mtx-note">${escapeHtml(ch.upload_note || "")} ${escapeHtml(ch.next_step || "")}</p>
+  `;
+  const collectSummary = $("autodl-collect-summary");
+  const analyzeSummary = $("autodl-analyze-summary");
+  const collect = channelById("collect");
+  const analyze = channelById("analyze");
+  if (collectSummary && collect) {
+    collectSummary.textContent = `覆盖四种采集的云端 Whisper。上传 ${collect.upload_count} 个文件；预热 large-v3。`;
+  }
+  if (analyzeSummary && analyze) {
+    analyzeSummary.textContent = `覆盖 BERTopic。上传 ${analyze.upload_count} 个文件；不下载 Whisper。`;
+  }
+}
+
+function updateAutodlRoleHint() {
+  const hint = $("autodl-role-hint");
+  const btn = $("autodl-connect");
+  if (!hint) return;
+  const ch = channelById(autodlRole());
+  if (autodlRole() === "analyze") {
+    hint.innerHTML = ch?.next_step
+      ? escapeHtml(ch.next_step)
+      : "主题分析：只同步 BERTopic 脚本，<strong>不会</strong>下载 Whisper large-v3。接入后运行 <code>tools/launch_bertopic_autodl.py</code>。";
+    if (btn) btn.textContent = "接入主题分析通道";
+  } else {
+    hint.innerHTML = ch?.next_step
+      ? escapeHtml(ch.next_step)
+      : "采集转写：爬虫仍在本机，云端只做 Whisper / OCR。四种采集共用这一通道。";
+    if (btn) btn.textContent = "接入采集转写通道";
+  }
+  renderAutodlChannelMatrix();
+}
+
+document.querySelectorAll('input[name="autodl-role"]').forEach((input) => {
+  input.addEventListener("change", () => {
+    syncChoiceCards();
+    updateAutodlRoleHint();
+  });
+});
+updateAutodlRoleHint();
+loadAutodlChannels();
+
 function appendAutodlLog(message, level) {
   const view = $("autodl-log");
   if (!view || !message) return;
@@ -840,12 +1142,17 @@ $("autodl-connect")?.addEventListener("click", async () => {
   if (view) view.textContent = "";
   const btn = $("autodl-connect");
   if (btn) btn.disabled = true;
-  appendAutodlLog("开始接入 AutoDL…", "info");
+  appendAutodlLog(
+    autodlRole() === "analyze"
+      ? "开始接入「主题分析通道」：只传 BERTopic 脚本，不预热 Whisper…"
+      : "开始接入「采集转写通道」：同步 Whisper 工作机并预热 large-v3（四种采集共用）…",
+    "info",
+  );
   try {
     const res = await fetch("/api/gpu/autodl/connect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ssh_command: ssh, password }),
+      body: JSON.stringify({ ssh_command: ssh, password, role: autodlRole() }),
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
@@ -922,7 +1229,7 @@ async function restoreLiveJob() {
     }
     const paused = (data.history || []).find((item) =>
       ["cancelled", "interrupted", "error"].includes(item.status)
-      && ["academic", "transcribe", "archive"].includes(jobKind(item))
+      && ["academic", "keyword", "transcribe", "archive", "scout"].includes(jobKind(item))
     );
     if (paused) {
       currentJobId = paused.id;
@@ -943,7 +1250,7 @@ async function loadJobHistory(preset) {
     const rows = [...(data.live || []), ...(data.history || [])].filter((job) => {
       if (seen.has(job.id)) return false;
       seen.add(job.id);
-      return ["archive", "academic", "transcribe"].includes(jobKind(job));
+      return ["archive", "scout", "academic", "keyword", "transcribe"].includes(jobKind(job));
     }).slice(0, 12);
     if (!rows.length) {
       box.innerHTML = '<p class="muted">还没有任务。到左侧三种采集里选一种，点「从头开始」。</p>';
@@ -957,13 +1264,27 @@ async function loadJobHistory(preset) {
           <b>${escapeHtml(KIND_LABEL[jobKind(job)] || "任务")} · ${escapeHtml(status)}</b>
           <span class="muted">#${escapeHtml(job.id)} · ${escapeHtml(jobProgressText(job))}</span>
         </div>
-        <button type="button" class="ghost" data-resume="${escapeHtml(job.id)}" ${busy ? "disabled" : ""}>${busy ? "进行中" : "续跑"}</button>
+        ${busy
+          ? `<button type="button" class="ghost" data-pause="${escapeHtml(job.id)}">暂停</button>`
+          : `<button type="button" class="ghost" data-resume="${escapeHtml(job.id)}">续跑</button>`}
       </div>`;
     }).join("");
     box.querySelectorAll("[data-resume]").forEach((btn) => {
       btn.addEventListener("click", async () => {
         try {
           await resumeExistingJob(btn.dataset.resume);
+        } catch (err) {
+          toast(err.message);
+        }
+      });
+    });
+    box.querySelectorAll("[data-pause]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        try {
+          await api("/api/jobs/" + btn.dataset.pause + "/cancel", { method: "POST" });
+          currentJobId = btn.dataset.pause;
+          toast("已暂停。进度已保留，回来后点「续跑」即可。");
+          setTimeout(() => loadJobHistory(), 1500);
         } catch (err) {
           toast(err.message);
         }

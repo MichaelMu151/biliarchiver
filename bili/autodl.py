@@ -20,6 +20,92 @@ REMOTE_INBOX = f"{DEFAULT_REMOTE_DIR}/inbox"
 WORKER_PORT = 6006
 HF_MIRROR = "https://hf-mirror.com"
 HF_HOME_REMOTE = "/root/autodl-tmp/huggingface"
+
+# Two AutoDL jobs share one SSH box but must not share a file/model stack.
+# collect = Whisper/OCR worker for ALL four collection lanes (archive / scout /
+#           academic / keyword / BV-list). analyze = BGE + BERTopic only.
+AUTODL_ROLES = ("collect", "analyze")
+
+# Explicit allowlists. Do not rglob the repo: that used to ship ~51 files
+# (crawler, UI, reports, tests) and then prefetch Whisper even for analysis.
+UPLOAD_MANIFEST: dict[str, tuple[str, ...]] = {
+    "collect": (
+        "requirements.txt",
+        "requirements-ai.txt",
+        "tools/gpu_worker.py",
+        "bili/__init__.py",
+        "bili/paths.py",
+        "bili/util.py",
+        "bili/runtime.py",
+        "bili/settings.py",
+        "bili/wbi.py",
+        "bili/danmaku.py",
+        "bili/client.py",
+        "bili/transcribe.py",
+        "bili/ocr.py",
+    ),
+    "analyze": (
+        "requirements-analysis-gpu.txt",
+        "run_gpu_full_bertopic.py",
+    ),
+}
+
+# Human-facing channel cards for the UI / API. Keep IDs = AUTODL_ROLES.
+CHANNEL_CATALOG: dict[str, dict[str, Any]] = {
+    "collect": {
+        "id": "collect",
+        "label": "采集转写通道",
+        "badge": "Whisper large-v3",
+        "covers": [
+            "按 UP 主采集（云端 Whisper）",
+            "选题预览后完整归档（云端 Whisper）",
+            "学术滚雪球（云端 Whisper）",
+            "关键词采样（云端 Whisper）",
+            "按视频号采集（云端 Whisper）",
+        ],
+        "upload_files": UPLOAD_MANIFEST["collect"],
+        "upload_note": "只同步 GPU 工作机代码（约 13 个小文件），不同步爬虫 UI / 资料库 / corpus.db",
+        "download_models": [
+            "faster-whisper large-v3（约 3GB，hf-mirror，只需一次）",
+            "PaddleOCR 模型（首次做画面 OCR 时才下）",
+        ],
+        "skip_models": [
+            "BGE / sentence-transformers",
+            "BERTopic 全量依赖以外的分析脚本数据",
+        ],
+        "pip_file": "requirements-ai.txt",
+        "starts_worker": True,
+        "next_step": "接入后，在任一采集任务里把算力选成「云端 GPU」。",
+    },
+    "analyze": {
+        "id": "analyze",
+        "label": "主题分析通道",
+        "badge": "BGE / BERTopic",
+        "covers": [
+            "分析数据集 · GPU 全量 BERTopic",
+            "tools/launch_bertopic_autodl.py",
+        ],
+        "upload_files": UPLOAD_MANIFEST["analyze"],
+        "upload_note": "只同步 2 个文件；评论语料由 launch 脚本另传 JSONL.GZ，不传整库",
+        "download_models": [
+            "BGE 中文向量模型（sentence-transformers，首次跑分析时下载）",
+        ],
+        "skip_models": [
+            "Whisper large-v3（本通道明确不预热、并会停掉转写工作机）",
+            "PaddleOCR",
+            "gpu_worker 常驻进程",
+        ],
+        "pip_file": "requirements-analysis-gpu.txt",
+        "starts_worker": False,
+        "next_step": "接入后运行 tools/launch_bertopic_autodl.py；保持本页开着或凭已存 SSH 续连。",
+    },
+}
+
+ROLE_LABELS = {
+    "collect": CHANNEL_CATALOG["collect"]["label"] + "（Whisper large-v3）",
+    "analyze": CHANNEL_CATALOG["analyze"]["label"] + "（BGE / BERTopic）",
+}
+
 SKIP_DIR_NAMES = {
     ".git",
     ".venv",
@@ -102,6 +188,50 @@ def _as_port(value: str) -> int:
         raise ValueError("SSH 端口必须是数字，不要把「你的SSH端口」这类占位符贴进来") from exc
 
 
+def normalize_autodl_role(role: str | None) -> str:
+    value = (role or "collect").strip().lower()
+    aliases = {
+        "transcribe": "collect",
+        "whisper": "collect",
+        "collect_whisper": "collect",
+        "采样": "collect",
+        "采集": "collect",
+        "bertopic": "analyze",
+        "analysis": "analyze",
+        "bge": "analyze",
+        "分析": "analyze",
+    }
+    value = aliases.get(value, value)
+    if value not in AUTODL_ROLES:
+        raise ValueError("AutoDL 通道只能是 collect（采集转写）或 analyze（主题分析）")
+    return value
+
+
+def channel_catalog() -> list[dict[str, Any]]:
+    """UI / API payload: what each AutoDL channel uploads and downloads."""
+    rows: list[dict[str, Any]] = []
+    for role in AUTODL_ROLES:
+        spec = CHANNEL_CATALOG[role]
+        files = list(spec["upload_files"])
+        rows.append(
+            {
+                "id": role,
+                "label": spec["label"],
+                "badge": spec["badge"],
+                "covers": list(spec["covers"]),
+                "upload_files": files,
+                "upload_count": len(files),
+                "upload_note": spec["upload_note"],
+                "download_models": list(spec["download_models"]),
+                "skip_models": list(spec["skip_models"]),
+                "pip_file": spec["pip_file"],
+                "starts_worker": bool(spec["starts_worker"]),
+                "next_step": spec["next_step"],
+            }
+        )
+    return rows
+
+
 def _should_skip(path: Path) -> bool:
     if path.name.lower() in SKIP_FILE_NAMES:
         return True
@@ -117,16 +247,24 @@ def _should_skip(path: Path) -> bool:
     return False
 
 
-def iter_upload_files(root: Path | None = None) -> list[Path]:
+def iter_upload_files(root: Path | None = None, role: str = "collect") -> list[Path]:
+    """Return the allowlisted files for one AutoDL role. Never walks the whole tree."""
     base = root or ROOT
+    role = normalize_autodl_role(role)
     files: list[Path] = []
-    for path in base.rglob("*"):
+    missing: list[str] = []
+    for rel in UPLOAD_MANIFEST[role]:
+        path = base / rel
+        if path.is_symlink() or ".." in Path(rel).parts:
+            raise RuntimeError(f"同步清单非法路径：{rel}")
         if not path.is_file():
+            missing.append(rel)
             continue
-        rel = path.relative_to(base)
-        if _should_skip(rel):
+        if _should_skip(Path(rel)):
             continue
         files.append(path)
+    if missing:
+        raise RuntimeError("本机缺少 AutoDL 同步文件：" + "、".join(missing))
     return files
 
 
@@ -192,15 +330,20 @@ class AutodlSession:
         self.target = ""
         self.local_port = 0
         self.remote_dir = DEFAULT_REMOTE_DIR
+        self.role = ""
 
     def status(self) -> dict[str, Any]:
         alive = bool(self.client and self.client.get_transport() and self.client.get_transport().is_active())
+        worker = bool(alive and self.role == "collect" and self.local_port > 0)
         return {
-            "connected": alive and self.local_port > 0,
+            "connected": alive,
+            "role": self.role,
+            "role_label": ROLE_LABELS.get(self.role, ""),
             "target": self.target,
             "local_port": self.local_port,
-            "url": f"http://127.0.0.1:{self.local_port}" if self.local_port else "",
+            "url": f"http://127.0.0.1:{self.local_port}" if worker else "",
             "remote_dir": self.remote_dir,
+            "worker": worker,
         }
 
     def close(self) -> None:
@@ -227,14 +370,25 @@ class AutodlSession:
         self.thread = None
         self.local_port = 0
         self.target = ""
+        self.role = ""
 
-    def attach(self, client: Any, target: str, local_port: int, remote_dir: str) -> None:
+    def attach(
+        self,
+        client: Any,
+        target: str,
+        local_port: int,
+        remote_dir: str,
+        role: str = "collect",
+    ) -> None:
         with self.lock:
             self._close_locked()
             self.client = client
             self.target = target
             self.local_port = local_port
             self.remote_dir = remote_dir
+            self.role = normalize_autodl_role(role)
+            if local_port <= 0 or self.role != "collect":
+                return
             transport = client.get_transport()
 
             class Handler(_TunnelHandler):
@@ -683,9 +837,20 @@ def _sftp_mkdirs(sftp: Any, remote_dir: str) -> None:
             sftp.mkdir(cursor)
 
 
-def _upload(sftp: Any, remote_dir: str, log: LogFn) -> int:
-    files = iter_upload_files()
-    log(f"开始同步代码，共 {len(files)} 个文件 → {remote_dir}", "info")
+def _upload(sftp: Any, remote_dir: str, log: LogFn, role: str = "collect") -> int:
+    role = normalize_autodl_role(role)
+    files = iter_upload_files(role=role)
+    names = "、".join(path.relative_to(ROOT).as_posix() for path in files)
+    spec = CHANNEL_CATALOG[role]
+    log(f"开始同步「{ROLE_LABELS[role]}」，共 {len(files)} 个文件 → {remote_dir}", "info")
+    log(spec["upload_note"], "info")
+    log(f"清单：{names}", "info")
+    if role == "collect":
+        log("将预热模型：" + "；".join(spec["download_models"]), "info")
+        log("本通道不会下载：" + "；".join(spec["skip_models"]), "info")
+    else:
+        log("本通道跳过：" + "；".join(spec["skip_models"]), "info")
+        log("分析模型（BGE 等）在 launch_bertopic 首次跑时再下，不在接入阶段预热。", "info")
     _sftp_mkdirs(sftp, remote_dir)
     sent = 0
     for index, path in enumerate(files, start=1):
@@ -703,10 +868,41 @@ def _upload(sftp: Any, remote_dir: str, log: LogFn) -> int:
         if not skip:
             sftp.put(str(path), remote_path)
             sent += 1
-        if index == 1 or index % 40 == 0 or index == len(files):
-            log(f"同步进度 {index}/{len(files)}", "info")
-    log(f"代码同步完成，实际上传 {sent} 个文件。", "ok")
+        if index == 1 or index == len(files) or index % 20 == 0:
+            log(f"同步进度 {index}/{len(files)} · {rel}", "info")
+    log(f"代码同步完成，实际上传 {sent} 个、跳过未改 {len(files) - sent} 个。", "ok")
     return sent
+
+
+def upload_role_files(client: Any, remote_dir: str, log: LogFn, role: str = "collect") -> int:
+    sftp = _open_sftp(client)
+    try:
+        return _upload(sftp, remote_dir, log, role=role)
+    finally:
+        try:
+            sftp.close()
+        except Exception:
+            pass
+
+
+def stop_whisper_worker(client: Any, log: LogFn | None = None, *, quiet: bool = False) -> None:
+    """Free VRAM held by the collect-mode gpu_worker. Safe if it is not running."""
+
+    def emit(message: str, level: str = "info") -> None:
+        if log:
+            log(message, level)
+
+    _run(
+        client,
+        "pkill -f 'tools/gpu_worker.py' >/dev/null 2>&1 || true",
+        emit,
+        timeout=20,
+        check=False,
+        chatter=False,
+        get_pty=False,
+    )
+    if not quiet:
+        emit("已停止远端 Whisper 工作机（不占用显存）。", "ok")
 
 
 def _run(
@@ -956,113 +1152,134 @@ def _pick_local_port(preferred: int = WORKER_PORT) -> int:
     raise RuntimeError("本机找不到空闲端口做隧道")
 
 
+def _bootstrap_analyze(client: Any, emit: LogFn) -> None:
+    emit("主题分析模式：跳过 Whisper / OCR / ffmpeg，不预热 large-v3。", "info")
+    stop_whisper_worker(client, emit)
+    _log_remote_cuda(client, emit)
+    emit("SSH 已留给 BGE/BERTopic。请运行 tools/launch_bertopic_autodl.py。", "ok")
+
+
+def _bootstrap_collect(
+    client: Any,
+    python: str,
+    remote_dir: str,
+    token: str,
+    model: str,
+    emit: LogFn,
+) -> int:
+    emit("正在安装 faster-whisper / OCR（第一次会几分钟）…", "info")
+    quoted_dir = shlex.quote(remote_dir)
+    _run(
+        client,
+        f"cd {quoted_dir} && {shlex.quote(python)} -m pip install -r requirements-ai.txt",
+        emit,
+        timeout=1800,
+    )
+    emit("正在安装 CUDA 12 运行库（ctranslate2 需要 libcublas.so.12；CUDA 13 镜像也适用）…", "info")
+    _ensure_cuda12_runtime(client, python, emit)
+    ffmpeg = _run(
+        client,
+        "command -v ffmpeg >/dev/null && echo ffmpeg_ok || echo ffmpeg_missing",
+        emit,
+        timeout=20,
+        check=False,
+        chatter=False,
+        get_pty=False,
+    )
+    if "ffmpeg_missing" in ffmpeg:
+        emit("远程没有 ffmpeg，正在安装…", "info")
+        _run(
+            client,
+            "DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq ffmpeg",
+            emit,
+            timeout=300,
+        )
+    try:
+        _prefetch_whisper_model(client, python, remote_dir, model or "large-v3", emit)
+    except Exception as exc:
+        emit(f"预下载模型失败，工作机启动后第一次转写还会再试：{exc}", "warn")
+    emit(f"正在启动 GPU 工作机（端口 6006，模型 {model or 'large-v3'}）…", "info")
+    stop_whisper_worker(client, emit, quiet=True)
+    _run(
+        client,
+        _worker_launch_command(python, remote_dir, token, model or "large-v3"),
+        emit,
+        timeout=30,
+        get_pty=False,
+    )
+    emit("等待工作机就绪…", "info")
+    ready = False
+    auth = token.strip().replace("'", "")
+    curl_cmd = (
+        f"curl -sf -H 'Authorization: Bearer {auth}' "
+        f"http://127.0.0.1:{WORKER_PORT}/health >/dev/null && echo HEALTH_OK || true"
+    )
+    py_cmd = (
+        f"{shlex.quote(python)} -c "
+        f"\"import urllib.request; r=urllib.request.Request('http://127.0.0.1:{WORKER_PORT}/health',"
+        f"headers={{'Authorization':'Bearer {auth}'}}); urllib.request.urlopen(r,timeout=5).read(); print('HEALTH_OK')\""
+    )
+    for _ in range(40):
+        probe = _run(client, curl_cmd, emit, timeout=20, check=False, chatter=False, get_pty=False)
+        if "HEALTH_OK" not in probe:
+            probe = _run(client, py_cmd, emit, timeout=20, check=False, chatter=False, get_pty=False)
+        if "HEALTH_OK" in probe:
+            ready = True
+            break
+        time.sleep(2)
+    if not ready:
+        tail = _run(
+            client,
+            "tail -n 40 /tmp/bili_gpu_worker.log || true",
+            emit,
+            timeout=20,
+            check=False,
+            get_pty=False,
+        )
+        raise RuntimeError("工作机没有在 6006 端口起来。远程日志：\n" + tail[-800:])
+    return _pick_local_port(WORKER_PORT)
+
+
 def connect_autodl(
     ssh_command: str,
     password: str,
-    token: str,
+    token: str = "",
     model: str = "large-v3",
     remote_dir: str = DEFAULT_REMOTE_DIR,
     log: LogFn | None = None,
+    role: str = "collect",
 ) -> dict[str, Any]:
     def emit(message: str, level: str = "info") -> None:
         if log:
             log(message, level)
 
+    role = normalize_autodl_role(role)
     if not (password or "").strip():
         raise ValueError("请填写 AutoDL SSH 密码")
-    if not (token or "").strip():
+    if role == "collect" and not (token or "").strip():
         raise ValueError("缺少工作机 Token")
     target = parse_ssh_command(ssh_command)
+    emit(f"接入用途：{ROLE_LABELS[role]}", "info")
     SESSION.close()
     client = _connect_client(target, password.strip(), emit)
     try:
-        sftp = client.open_sftp()
-        try:
-            _upload(sftp, remote_dir, emit)
-        finally:
-            sftp.close()
+        upload_role_files(client, remote_dir, emit, role=role)
         python = _pick_python(client, emit)
+        if role == "analyze":
+            _bootstrap_analyze(client, emit)
+            SESSION.attach(client, target.label(), 0, remote_dir, role="analyze")
+            return {
+                "ok": True,
+                "role": role,
+                "url": "",
+                "target": target.label(),
+                "remote_dir": remote_dir,
+                "local_port": 0,
+            }
+
         _log_remote_cuda(client, emit)
-        emit("正在安装 faster-whisper / OCR（第一次会几分钟）…", "info")
-        quoted_dir = shlex.quote(remote_dir)
-        _run(
-            client,
-            f"cd {quoted_dir} && {shlex.quote(python)} -m pip install -r requirements-ai.txt",
-            emit,
-            timeout=1800,
-        )
-        emit("正在安装 CUDA 12 运行库（ctranslate2 需要 libcublas.so.12；CUDA 13 镜像也适用）…", "info")
-        _ensure_cuda12_runtime(client, python, emit)
-        ffmpeg = _run(
-            client,
-            "command -v ffmpeg >/dev/null && echo ffmpeg_ok || echo ffmpeg_missing",
-            emit,
-            timeout=20,
-            check=False,
-            chatter=False,
-            get_pty=False,
-        )
-        if "ffmpeg_missing" in ffmpeg:
-            emit("远程没有 ffmpeg，正在安装…", "info")
-            _run(
-                client,
-                "DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq ffmpeg",
-                emit,
-                timeout=300,
-            )
-        try:
-            _prefetch_whisper_model(client, python, remote_dir, model or "large-v3", emit)
-        except Exception as exc:
-            emit(f"预下载模型失败，工作机启动后第一次转写还会再试：{exc}", "warn")
-        emit(f"正在启动 GPU 工作机（端口 6006，模型 {model or 'large-v3'}）…", "info")
-        _run(
-            client,
-            "pkill -f 'tools/gpu_worker.py' >/dev/null 2>&1 || true",
-            emit,
-            timeout=20,
-            check=False,
-            chatter=False,
-            get_pty=False,
-        )
-        _run(
-            client,
-            _worker_launch_command(python, remote_dir, token, model or "large-v3"),
-            emit,
-            timeout=30,
-            get_pty=False,
-        )
-        emit("等待工作机就绪…", "info")
-        ready = False
-        auth = token.strip().replace("'", "")
-        curl_cmd = (
-            f"curl -sf -H 'Authorization: Bearer {auth}' "
-            f"http://127.0.0.1:{WORKER_PORT}/health >/dev/null && echo HEALTH_OK || true"
-        )
-        py_cmd = (
-            f"{shlex.quote(python)} -c "
-            f"\"import urllib.request; r=urllib.request.Request('http://127.0.0.1:{WORKER_PORT}/health',"
-            f"headers={{'Authorization':'Bearer {auth}'}}); urllib.request.urlopen(r,timeout=5).read(); print('HEALTH_OK')\""
-        )
-        for _ in range(40):
-            probe = _run(client, curl_cmd, emit, timeout=20, check=False, chatter=False, get_pty=False)
-            if "HEALTH_OK" not in probe:
-                probe = _run(client, py_cmd, emit, timeout=20, check=False, chatter=False, get_pty=False)
-            if "HEALTH_OK" in probe:
-                ready = True
-                break
-            time.sleep(2)
-        if not ready:
-            tail = _run(
-                client,
-                "tail -n 40 /tmp/bili_gpu_worker.log || true",
-                emit,
-                timeout=20,
-                check=False,
-                get_pty=False,
-            )
-            raise RuntimeError("工作机没有在 6006 端口起来。远程日志：\n" + tail[-800:])
-        local_port = _pick_local_port(WORKER_PORT)
-        SESSION.attach(client, target.label(), local_port, remote_dir)
+        local_port = _bootstrap_collect(client, python, remote_dir, token, model, emit)
+        SESSION.attach(client, target.label(), local_port, remote_dir, role="collect")
         emit(f"本机隧道已打开：http://127.0.0.1:{local_port} → 远程 6006", "ok")
         from bili.gpu_remote import gpu_worker_ready
 
@@ -1083,6 +1300,7 @@ def connect_autodl(
         emit(message, "ok")
         return {
             "ok": True,
+            "role": role,
             "url": f"http://127.0.0.1:{local_port}",
             "target": target.label(),
             "remote_dir": remote_dir,

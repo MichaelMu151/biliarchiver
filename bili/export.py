@@ -210,6 +210,103 @@ def write_dynamic_markdown(
     return path
 
 
+def write_scout_catalog(
+    out_dir: Path,
+    *,
+    job_id: str,
+    accounts: list[dict[str, Any]],
+    videos: list[dict[str, Any]],
+    dynamics: list[dict[str, Any]],
+) -> Path:
+    """Write screening CSVs for scout mode (titles/tags/dynamics only)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    acc_path = out_dir / "accounts.csv"
+    with acc_path.open("w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=[
+                "mid",
+                "name",
+                "space_url",
+                "video_n",
+                "dynamic_n",
+                "follower",
+                "sign",
+            ],
+        )
+        writer.writeheader()
+        for row in accounts:
+            writer.writerow({key: row.get(key, "") for key in writer.fieldnames})
+
+    vid_path = out_dir / "videos.csv"
+    with vid_path.open("w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=[
+                "mid",
+                "name",
+                "bvid",
+                "title",
+                "tags",
+                "tname",
+                "pubdate_iso",
+                "view",
+                "like",
+                "reply",
+                "duration",
+                "page_url",
+                "description_short",
+            ],
+        )
+        writer.writeheader()
+        for row in videos:
+            writer.writerow({key: row.get(key, "") for key in writer.fieldnames})
+
+    dyn_path = out_dir / "dynamics.csv"
+    with dyn_path.open("w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=[
+                "mid",
+                "name",
+                "dyn_id",
+                "pub_time_iso",
+                "text",
+                "like",
+                "comment",
+                "forward",
+                "picture_count",
+                "jump_url",
+            ],
+        )
+        writer.writeheader()
+        for row in dynamics:
+            writer.writerow({key: row.get(key, "") for key in writer.fieldnames})
+
+    readme = f"""# 选题预览 · 任务 {job_id}
+
+本目录是「按 UP 主 → 选题预览」的轻量结果，**只含标题 / 标签 / 动态正文**，不含评论、弹幕、音视频。
+
+## 文件
+
+| 文件 | 内容 |
+| --- | --- |
+| `accounts.csv` | 每个 UP 主一行：昵称、主页、本窗口内视频/动态数 |
+| `videos.csv` | 每条投稿：标题、标签、分区、播放/点赞/评论数 |
+| `dynamics.csv` | 每条主页动态：正文、互动数、链接 |
+
+## 建议用法
+
+1. 用 Excel / Numbers 打开 `videos.csv`，按标签或标题筛选职场/劳工相关 BV。
+2. 对照 `dynamics.csv` 看该 UP 是否经常发相关动态。
+3. 筛完后，把保留的 mid / BV 贴回「按 UP 主采集」或「学术滚雪球」做完整归档。
+
+账号 {len(accounts)} · 视频 {len(videos)} · 动态 {len(dynamics)}
+"""
+    write_text(out_dir / "README.md", readme)
+    return out_dir
+
+
 def write_account_index(acc_dir: Path, profile: dict[str, Any], videos: list[dict[str, Any]], dynamics: list[dict[str, Any]]) -> None:
     v_lines = "\n".join(
         f"- [{item.get('title')}]({Path(item.get('markdown_path') or '').name if False else _rel(acc_dir, item.get('markdown_path'))}) · {ts_iso(item.get('pubdate'))[:10]} · 播放 {item.get('view')}"

@@ -227,6 +227,14 @@ class Store:
             ).fetchone()
         return bool(row and row["status"] == "done")
 
+    def item_status(self, job_id: str, item_key: str) -> str:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM job_items WHERE job_id=? AND item_key=?",
+                (job_id, item_key),
+            ).fetchone()
+        return str(row["status"]) if row else ""
+
     def list_accounts(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(

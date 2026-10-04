@@ -1,0 +1,19 @@
+# GPU host (AutoDL / RunPod) dependencies for run_gpu_full_bertopic.py
+# Install ON THE GPU MACHINE (PyTorch CUDA image already provides torch):
+#   pip install -r requirements-analysis-gpu.txt
+#
+# Do NOT install this on the Intel Mac project venv for full 515k runs.
+# Mac only needs: export JSONL + tools/launch_bertopic_autodl.py (uses existing paramiko).
+
+bertopic>=0.16.0
+sentence-transformers>=3.0.0
+jieba>=0.42.1
+umap-learn>=0.5.6
+hdbscan>=0.8.38
+scikit-learn>=1.4.0
+pandas>=2.0
+plotly>=5.0
+safetensors>=0.4.0
+tqdm>=4.66.0
+# Optional full-GPU UMAP/HDBSCAN (install if AutoDL image supports it):
+# cuml-cu12

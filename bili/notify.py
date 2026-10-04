@@ -70,18 +70,44 @@ def progress_messages(event: str, payload: dict[str, Any] | None = None) -> str:
     dyns = int(data.get("dynamics_done") or 0)
     uids_done = int(data.get("uids_done") or 0)
     uids_total = int(data.get("uids_total") or 0)
+    labor_v = data.get("labor_videos_kept")
+    labor_d = data.get("labor_dynamics_kept")
+    mode = str(data.get("mode") or data.get("kind") or "")
     if event == "start":
+        if mode == "scout":
+            return f"选题预览开始，共 {uids_total} 个账号\n（劳工词表筛选；每完成 1 个 UP 提醒一次）"
+        if mode == "keyword":
+            return f"关键词采样开始，采集上限 {uids_total}"
         return f"任务开始，共 {uids_total} 个账号"
     if event == "video":
+        # Kept for compatibility; server no longer fires Bark on every video.
         return f"视频完成 {videos} 条\n{current}" if current else f"视频完成 {videos} 条"
     if event == "uid":
-        return f"账号完成 {uids_done}/{uids_total}\n视频 {videos} · 动态 {dyns}"
+        name = str(data.get("last_up_name") or current or "").strip()
+        head = f"UP 完成 {uids_done}/{uids_total}"
+        if name:
+            head += f"\n{name}"
+        skipped_v = data.get("videos_skipped")
+        skipped_d = data.get("dynamics_skipped")
+        if labor_v is not None or labor_d is not None:
+            body = (
+                f"{head}\n劳工保留：视频 {int(labor_v or 0)} · 动态 {int(labor_d or 0)}"
+            )
+            if skipped_v is not None or skipped_d is not None:
+                body += f"\n累计跳过：视频 {int(skipped_v or 0)} · 动态 {int(skipped_d or 0)}"
+            return body
+        return f"{head}\n视频 {videos} · 动态 {dyns}"
     if event == "done":
+        if labor_v is not None or labor_d is not None:
+            return (
+                f"选题预览完成。账号 {uids_done}/{uids_total}\n"
+                f"劳工保留：视频 {int(labor_v or 0)} · 动态 {int(labor_d or 0)}"
+            )
         return f"采集完成。账号 {uids_done}/{uids_total}，视频 {videos}，动态 {dyns}"
     if event == "cancelled":
-        return f"任务已取消。已完成视频 {videos}，动态 {dyns}"
+        return f"任务已取消。已完成账号 {uids_done}/{uids_total}，视频 {videos}，动态 {dyns}"
     if event == "error":
         return f"任务失败：{data.get('error') or '未知错误'}"
     if event == "interrupted":
-        return f"采集因应用退出中断。已完成视频 {videos}，动态 {dyns}。勾选续跑再开即可。"
+        return f"采集因应用退出中断。已完成账号 {uids_done}/{uids_total}。续跑即可。"
     return current or event

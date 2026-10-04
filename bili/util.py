@@ -54,6 +54,27 @@ def cutoff_ts(range_key: str) -> int | None:
     return int(time.time()) - days * 86400
 
 
+def parse_date_boundary(raw: str, *, end_of_day: bool = False) -> int | None:
+    """Parse ``YYYY-MM-DD`` (Asia/Shanghai) into a Unix timestamp, or None if empty/invalid."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        day = datetime.strptime(text[:10], "%Y-%m-%d").replace(tzinfo=TZ_SHANGHAI)
+    except ValueError:
+        return None
+    if end_of_day:
+        day = day.replace(hour=23, minute=59, second=59)
+    else:
+        day = day.replace(hour=0, minute=0, second=0)
+    return int(day.timestamp())
+
+
+def strip_html(text: str) -> str:
+    """Remove simple HTML tags from Bilibili search titles (``<em class=\"keyword\">``)."""
+    return re.sub(r"<[^>]+>", "", text or "").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'")
+
+
 def parse_uids(raw: str) -> list[str]:
     """Extract UP 主 UID from space links or plain numeric tokens only.
 

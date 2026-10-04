@@ -24,6 +24,20 @@ UA = (
 )
 
 RISK_CODES = {-352, -412, -799, -509, 412, -403, -401}
+# Soft / transient API failures that should back off + retry (not always in RISK_CODES).
+SOFT_FAIL_CODES = {-502, -504, -500, 86001, 86002}
+SOFT_FAIL_MARKERS = ("请刷新", "稍后重试", "服务繁忙", "系统繁忙", "请求过于频繁", "频率过快")
+
+
+def is_soft_api_failure(payload: dict[str, Any] | None) -> bool:
+    """True when Bilibili returns a transient 'try again later' style failure."""
+    if not isinstance(payload, dict):
+        return False
+    code = payload.get("code")
+    if code in SOFT_FAIL_CODES:
+        return True
+    msg = str(payload.get("message") or "")
+    return any(m in msg for m in SOFT_FAIL_MARKERS)
 
 
 def has_risk_voucher(payload: dict[str, Any] | None) -> bool:
@@ -181,13 +195,15 @@ class BiliClient:
                     payload = None
                 if isinstance(payload, dict):
                     code = payload.get("code")
-                    if code in RISK_CODES or has_risk_voucher(payload):
+                    soft = is_soft_api_failure(payload)
+                    if code in RISK_CODES or has_risk_voucher(payload) or soft:
                         if wbi_sign:
                             await self._refresh_wbi(force=True)
-                        backoff = min(30, 4 * attempt + random.choice([1, 2, 4]))
+                        backoff = min(45 if soft else 30, 4 * attempt + random.choice([1, 2, 4, 6]))
+                        label = "临时错误" if soft and code not in RISK_CODES else "风控"
                         self.on_log(
                             "warn",
-                            f"风控 {code} {payload.get('message','')} · {backoff:.0f}s 后重试 ({attempt}/{retries})",
+                            f"{label} {code} {payload.get('message','')} · {backoff:.0f}s 后重试 ({attempt}/{retries})",
                         )
                         await asyncio.sleep(backoff)
                         last_exc = BiliError(str(payload.get("message") or code), code, True)
@@ -500,6 +516,97 @@ class BiliClient:
             "ctime": reply.get("ctime") or 0,
             "ip_location": reply.get("reply_control", {}).get("location") or "",
         }
+
+    async def search_videos_page(
+        self,
+        keyword: str,
+        *,
+        page: int = 1,
+        page_size: int = 42,
+        order: str = "pubdate",
+        duration: int = 0,
+        tids: int = 0,
+        pubtime_begin_s: int | None = None,
+        pubtime_end_s: int | None = None,
+    ) -> dict[str, Any]:
+        """One page of typed video search (WBI). Returns raw ``data`` payload."""
+        params: dict[str, Any] = {
+            "search_type": "video",
+            "keyword": keyword,
+            "page": max(1, int(page)),
+            "page_size": max(1, min(50, int(page_size))),
+            "order": order or "pubdate",
+            "duration": int(duration or 0),
+            "tids": int(tids or 0),
+            "__refresh__": "true",
+            "platform": "pc",
+            "web_location": "1430654",
+        }
+        if pubtime_begin_s is not None:
+            params["pubtime_begin_s"] = int(pubtime_begin_s)
+        if pubtime_end_s is not None:
+            params["pubtime_end_s"] = int(pubtime_end_s)
+        data = await self.get_json(
+            "https://api.bilibili.com/x/web-interface/wbi/search/type",
+            params=params,
+            wbi=True,
+            referer=f"https://search.bilibili.com/video?keyword={keyword}",
+        )
+        if data.get("code") != 0:
+            # Fall back to the unsigned endpoint used by some clients.
+            data = await self.get_json(
+                "https://api.bilibili.com/x/web-interface/search/type",
+                params={k: v for k, v in params.items() if k not in {"__refresh__", "platform", "web_location"}},
+                wbi=False,
+                referer=f"https://search.bilibili.com/video?keyword={keyword}",
+            )
+        if data.get("code") != 0:
+            raise BiliError(
+                f"搜索失败（{keyword} p{page}）：{data.get('message') or data.get('code')}",
+                data.get("code"),
+                data.get("code") in RISK_CODES or is_soft_api_failure(data),
+            )
+        payload = data.get("data") or {}
+        return payload if isinstance(payload, dict) else {}
+
+    async def iter_search_videos(
+        self,
+        keyword: str,
+        *,
+        order: str = "pubdate",
+        duration: int = 0,
+        tids: int = 0,
+        pubtime_begin_s: int | None = None,
+        pubtime_end_s: int | None = None,
+        max_pages: int = 50,
+        page_size: int = 42,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yield raw search result rows until empty page, numPages, or max_pages."""
+        for page in range(1, max(1, int(max_pages)) + 1):
+            if should_cancel and should_cancel():
+                return
+            payload = await self.search_videos_page(
+                keyword,
+                page=page,
+                page_size=page_size,
+                order=order,
+                duration=duration,
+                tids=tids,
+                pubtime_begin_s=pubtime_begin_s,
+                pubtime_end_s=pubtime_end_s,
+            )
+            rows = payload.get("result") or []
+            if not isinstance(rows, list) or not rows:
+                return
+            for row in rows:
+                if isinstance(row, dict) and (row.get("bvid") or row.get("aid")):
+                    yield row
+            num_pages = int(payload.get("numPages") or payload.get("numpages") or 0)
+            if num_pages and page >= num_pages:
+                return
+            # Soft pacing between search pages (search is rate-limited hard).
+            await asyncio.sleep(jitter(0.8, 1.6))
 
     async def get_related(self, bvid: str, limit: int = 20) -> list[dict[str, Any]]:
         """Algorithmic recommendation neighbours; the edges of the snowball graph."""
