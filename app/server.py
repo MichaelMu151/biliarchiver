@@ -16,6 +16,9 @@ from typing import Any
 import qrcode
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -47,6 +50,7 @@ from bili.util import parse_uids
 prepare_process()
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+UI_BUILD = "20261005d"
 ensure_dirs()
 store = Store()
 corpus = Corpus()
@@ -96,6 +100,22 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="BiliArchiver", version="1.0.0", lifespan=lifespan)
 JOB_LOCK = asyncio.Lock()
+
+
+class NoCacheHtmlMiddleware(BaseHTTPMiddleware):
+    """Safari/Chrome aggressively cache localhost; force re-fetch after UI updates."""
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response = await call_next(request)
+        path = request.url.path
+        if path == "/" or path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+
+
+app.add_middleware(NoCacheHtmlMiddleware)
 
 
 class SettingsIn(BaseModel):
@@ -1393,9 +1413,21 @@ async def reclaim_existing(body: ReclaimIn) -> dict[str, Any]:
     return summary
 
 
+@app.get("/api/ui-version")
+async def ui_version() -> dict[str, str]:
+    return {"build": UI_BUILD, "keyword_dynamics": "article", "note": "关键词图文：动态 Opus + 专栏 cv"}
+
+
 @app.get("/")
 async def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(
+        STATIC_DIR / "index.html",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

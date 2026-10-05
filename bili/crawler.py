@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import os
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,7 +39,7 @@ from bili.transcribe import (
     folder_whisper_ran_empty,
     transcript_has_text,
 )
-from bili.util import cutoff_ts, now_iso, pick, safe_name, ts_iso, write_json, write_text
+from bili.util import abs_url, cutoff_ts, now_iso, pick, safe_name, strip_html, ts_iso, write_json, write_text
 
 LogFn = Callable[[str, str], None]
 ProgressFn = Callable[[dict[str, Any]], Awaitable[None] | None]
@@ -78,6 +80,27 @@ def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
                 yield row
 
 
+def _html_to_text(raw: str) -> str:
+    text = re.sub(r"(?i)<br\s*/?>", "\n", raw or "")
+    text = re.sub(r"(?i)</p>", "\n", text)
+    text = re.sub(r"(?i)</div>", "\n", text)
+    text = re.sub(r"(?i)</h[1-6]>", "\n", text)
+    text = strip_html(text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _img_urls_from_html(raw: str) -> list[str]:
+    found: list[str] = []
+    for match in re.finditer(r'(?i)<img[^>]+src=["\']([^"\']+)["\']', raw or ""):
+        url = abs_url(match.group(1).strip())
+        if url:
+            found.append(url)
+    return found
+
+
 def extract_dynamic(item: dict[str, Any]) -> dict[str, Any]:
     modules = item.get("modules") or {}
     author = modules.get("module_author") or {}
@@ -89,6 +112,9 @@ def extract_dynamic(item: dict[str, Any]) -> dict[str, Any]:
     opus = major.get("opus") or {}
     if opus.get("summary", {}).get("text"):
         text = text or opus["summary"]["text"]
+    opus_title = str(opus.get("title") or "").strip()
+    if opus_title and opus_title not in text:
+        text = f"{opus_title}\n{text}".strip() if text else opus_title
     pictures: list[str] = []
     for pic in opus.get("pics") or []:
         url = pic.get("url") or pic.get("src")
@@ -101,11 +127,30 @@ def extract_dynamic(item: dict[str, Any]) -> dict[str, Any]:
     archive = major.get("archive") or {}
     if archive.get("title") and archive.get("title") not in text:
         text = (text + "\n" + archive.get("title", "")).strip()
+    article = major.get("article") or {}
+    if isinstance(article, dict):
+        a_title = str(article.get("title") or "").strip()
+        a_desc = str(article.get("desc") or article.get("summary") or "").strip()
+        if a_title and a_title not in text:
+            text = f"{a_title}\n{text}".strip() if text else a_title
+        if a_desc and a_desc not in text:
+            text = f"{text}\n{a_desc}".strip()
+        for cover in article.get("covers") or []:
+            if isinstance(cover, str) and cover:
+                pictures.append(cover)
+            elif isinstance(cover, dict) and (cover.get("url") or cover.get("src")):
+                pictures.append(str(cover.get("url") or cover.get("src")))
     basic = item.get("basic") or {}
-    jump = ""
     dyn_id = str(item.get("id_str") or "")
+    comment_id = str(basic.get("comment_id_str") or dyn_id)
+    comment_type = int(basic.get("comment_type") or 17)
+    jump = ""
     if dyn_id:
         jump = f"https://t.bilibili.com/{dyn_id}"
+    if comment_type == 12 and comment_id:
+        jump = f"https://www.bilibili.com/read/cv{comment_id}"
+    elif dyn_id and len(dyn_id) >= 15:
+        jump = f"https://www.bilibili.com/opus/{dyn_id}"
     return {
         "dyn_id": dyn_id,
         "mid": str(author.get("mid") or ""),
@@ -117,10 +162,66 @@ def extract_dynamic(item: dict[str, Any]) -> dict[str, Any]:
         "like": pick(stat, "like", "count") or 0,
         "comment": pick(stat, "comment", "count") or 0,
         "forward": pick(stat, "forward", "count") or 0,
-        "comment_id": str(basic.get("comment_id_str") or dyn_id),
-        "comment_type": int(basic.get("comment_type") or 17),
+        "comment_id": comment_id,
+        "comment_type": comment_type,
         "jump_url": jump,
         "raw_type": item.get("type"),
+    }
+
+
+def extract_article(payload: dict[str, Any]) -> dict[str, Any]:
+    """Flatten ``/x/article/view`` (or viewinfo) into the dynamic-shaped record."""
+    stats = payload.get("stats") if isinstance(payload.get("stats"), dict) else {}
+    author = payload.get("author") if isinstance(payload.get("author"), dict) else {}
+    cvid = str(payload.get("id") or payload.get("cvid") or "").strip()
+    title = strip_html(str(payload.get("title") or ""))
+    html = str(payload.get("content") or "")
+    body = _html_to_text(html)
+    summary = _html_to_text(str(payload.get("summary") or ""))
+    text = title
+    extra = body or summary
+    if extra:
+        text = f"{title}\n\n{extra}".strip() if title else extra
+    pictures: list[str] = []
+    for key in ("origin_image_urls", "image_urls"):
+        val = payload.get(key)
+        if isinstance(val, list):
+            pictures.extend(str(part) for part in val if part)
+        elif isinstance(val, str) and val.strip():
+            pictures.extend(part.strip() for part in val.split(",") if part.strip())
+    for banner in (payload.get("banner_url"), payload.get("banner_url_hor")):
+        if banner:
+            pictures.append(str(banner))
+    pictures.extend(_img_urls_from_html(html))
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for url in pictures:
+        url = abs_url(str(url).strip())
+        if url and url not in seen:
+            seen.add(url)
+            uniq.append(url)
+    mid = str(author.get("mid") or payload.get("mid") or "")
+    uname = str(author.get("name") or payload.get("author_name") or "")
+    pub_ts = int(payload.get("ctime") or payload.get("publish_time") or payload.get("pubdate") or 0)
+    likes = int(stats.get("like") or payload.get("like") or 0)
+    comments = int(stats.get("reply") or payload.get("reply") or 0)
+    forwards = int(stats.get("share") or payload.get("share") or 0)
+    return {
+        "dyn_id": cvid,
+        "mid": mid,
+        "author_name": uname,
+        "dyn_type": "article",
+        "pub_ts": pub_ts,
+        "text": text,
+        "pictures": uniq,
+        "like": likes,
+        "comment": comments,
+        "forward": forwards,
+        "comment_id": cvid,
+        "comment_type": 12,
+        "jump_url": f"https://www.bilibili.com/read/cv{cvid}" if cvid else "",
+        "raw_type": "article",
+        "content_html": html,
     }
 
 
@@ -1576,6 +1677,13 @@ class Crawler:
                 else bool(self.settings.include_sub_replies)
             )
             signature = f"v2:pages={max_pages}:sub={int(include_sub)}"
+            oid = str(dyn.get("comment_id") or dyn.get("dyn_id") or "")
+            ctype = int(dyn.get("comment_type") or 17)
+            if ctype == 17 and oid.isdigit() and len(oid) < 15:
+                ctype = 12
+            if ctype == 12:
+                # Older runs stored column comments under dynamic type 17 and marked them done.
+                signature = f"v3:type=12:pages={max_pages}:sub={int(include_sub)}"
             if config.resume and pipeline.completed("comments", signature, [path]):
                 comment_count = _line_count(path)
             else:
@@ -1583,8 +1691,8 @@ class Crawler:
                 comment_count = await self._write_async_jsonl(
                     path,
                     client.iter_comments(
-                        str(dyn["comment_id"]),
-                        int(dyn.get("comment_type") or 17),
+                        oid,
+                        ctype,
                         max_pages=max_pages,
                         include_sub=include_sub,
                     ),
@@ -1623,5 +1731,6 @@ class Crawler:
                     run_id=config.job_id,
                 ),
             )
-        self.on_log("ok", f"动态完成 {dyn['dyn_id']}")
+        kind_label = "专栏" if str(dyn.get("dyn_type") or "") in {"article", "DYNAMIC_TYPE_ARTICLE"} or int(dyn.get("comment_type") or 0) == 12 else "动态"
+        self.on_log("ok", f"{kind_label}完成 {dyn['dyn_id']}")
         return row

@@ -875,6 +875,14 @@ class Corpus:
             row = conn.execute("SELECT 1 FROM dynamics WHERE dyn_id=? LIMIT 1", (key,)).fetchone()
         return bool(row)
 
+    def dynamic_type(self, dyn_id: str) -> str:
+        key = str(dyn_id or "").strip()
+        if not key:
+            return ""
+        with self.connect() as conn:
+            row = conn.execute("SELECT dyn_type FROM dynamics WHERE dyn_id=? LIMIT 1", (key,)).fetchone()
+        return str(row[0] or "") if row else ""
+
     def upsert_dynamic(
         self,
         dyn: dict[str, Any],

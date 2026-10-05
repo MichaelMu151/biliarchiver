@@ -180,7 +180,8 @@ def write_dynamic_markdown(
             f"> 识别行数：{len(lines)} · 平均置信度：{average:.2f}\n\n"
             f"{block.get('text') or '（未识别到高置信度文字）'}\n"
         )
-    md = f"""# 动态 {dyn.get('dyn_id')}
+    kind_label = "专栏" if str(dyn.get("dyn_type") or "") in {"article", "DYNAMIC_TYPE_ARTICLE"} or int(dyn.get("comment_type") or 0) == 12 else "动态"
+    md = f"""# {kind_label} {dyn.get('dyn_id')}
 
 - 类型：{dyn.get('dyn_type')}
 - 发布时间：{ts_iso(dyn.get('pub_ts'))}
@@ -417,6 +418,7 @@ def write_keyword_catalog(
             "picture_count",
             "keyword",
             "jump_url",
+            "kind",
         ]
         with (out_dir / "dynamics.csv").open("w", newline="", encoding="utf-8-sig") as fh:
             writer = csv.DictWriter(fh, fieldnames=dyn_fields)
@@ -433,7 +435,7 @@ def write_keyword_catalog(
 | `videos.csv` | 过视频门禁的候选：BV、标题、UP、互动数 |
 | `videos.md` | 同一份，方便在编辑器里筛选 |
 | `bvids.txt` | 只有 BV 号，可直接贴进「按视频号采集」 |
-| `dynamics.csv` | 过动态门禁并已采集的动态（若勾选了爬动态） |
+| `dynamics.csv` | 过门槛并已采集的图文：动态 + 专栏（若勾选了爬图文） |
 
 本任务**不自动开转写**。筛完标题后，用 `bvids.txt` 开「按视频号采集」。
 """

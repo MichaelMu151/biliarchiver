@@ -3,11 +3,14 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
   <title>BiliArchiver · B站数据采集工作台</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=20261005a" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261005d" />
 </head>
 <body>
   <div class="app">
@@ -24,7 +27,7 @@
         <p class="nav-label">四种采集</p>
         <button data-page="task"><span class="nav-title">按 UP 主采集</span><span class="nav-hint">指定账号，按时间整库归档</span></button>
         <button data-page="academic"><span class="nav-title">学术滚雪球</span><span class="nav-hint">从种子沿相关推荐扩样本</span></button>
-        <button data-page="keyword"><span class="nav-title">关键词采样</span><span class="nav-hint">全站搜视频列表 + 动态，不自动转写</span></button>
+        <button data-page="keyword"><span class="nav-title">关键词采样</span><span class="nav-hint">全站搜视频列表 + 图文动态，不自动转写</span></button>
         <button data-page="transcribe"><span class="nav-title">按视频号采集</span><span class="nav-hint">按 BV 列表采评论 / 弹幕 / 转写</span></button>
         <p class="nav-label">查看与设置</p>
         <button data-page="monitor"><span class="nav-title">运行监控</span><span class="nav-hint">进度、日志、续跑与取消</span></button>
@@ -35,6 +38,7 @@
       <div class="sidebar-foot">
         <div class="pill" id="login-pill">检测登录中…</div>
         <div class="muted tiny" id="library-path"></div>
+        <div class="muted tiny" id="ui-build" title="界面版本；外部浏览器若看不到新版，请强刷或开无痕">界面 20261005d</div>
       </div>
     </aside>
 
@@ -521,8 +525,8 @@
       <section id="page-keyword" class="page" hidden>
         <article class="card">
           <p class="step-kicker">关键词采样</p>
-          <h3>全站搜索 → 导出 BV 列表 / 采集动态</h3>
-          <p>同一组关键词分别搜<strong>视频</strong>和<strong>动态</strong>。视频过标题、时间、互动门禁后只导出带标题的列表，<strong>不自动转写</strong>。动态与视频共用时间窗，但用单独的点赞/评论/转发门槛，命中的照单采集（正文、图片 OCR、评论）。筛完标题后，把 <code>bvids.txt</code> 贴进「按视频号采集」。</p>
+          <h3>全站搜索 → 导出 BV 列表 / 采集图文动态</h3>
+          <p>同一组关键词分别搜<strong>视频</strong>和搜索页<strong>「图文」</strong>（动态/专栏）。视频过标题、时间、互动门禁后只导出带标题的列表，<strong>不自动转写</strong>。图文与视频共用时间窗，但用单独的点赞/评论/转发门槛，命中的照单采集（正文、图片 OCR、评论）。筛完标题后，把 <code>bvids.txt</code> 贴进「按视频号采集」。</p>
           <p class="hint">结果在 <code>data/exports/keyword_任务号/</code>。两个勾选可只出列表、只爬动态，或两项都做。中断后选同一任务续跑。</p>
         </article>
 
@@ -586,23 +590,23 @@
           <h3>本轮做什么</h3>
           <div class="checks">
             <label class="choice-card selected"><input type="checkbox" id="kw-export-videos" checked /> 导出视频列表（BV + 标题，不转写）</label>
-            <label class="choice-card selected"><input type="checkbox" id="kw-crawl-dyn" checked /> 采集匹配动态（全站搜索动态）</label>
+            <label class="choice-card selected"><input type="checkbox" id="kw-crawl-dyn" checked /> 采集匹配动态与专栏（走搜索「图文」）</label>
           </div>
-          <p class="hint">可以只出列表、只爬动态，或两项都勾。视频转写请到「按视频号采集」贴 <code>bvids.txt</code>。</p>
+          <p class="hint">可以只出列表、只爬图文，或两项都勾。图文走搜索页的「图文」分类（动态 + 专栏都会采正文、图片、评论）。视频转写请到「按视频号采集」贴 <code>bvids.txt</code>。</p>
         </article>
 
         <article class="card" id="kw-dyn-card">
           <p class="step-kicker">步骤 4</p>
-          <h3>动态门槛与采集</h3>
-          <p class="muted">动态不套用视频标题词。时间窗与步骤 1 相同。门槛全 0 即时间窗内照单全收。</p>
+          <h3>图文门槛与采集</h3>
+          <p class="muted">对应搜索页「图文」分类。<strong>动态</strong>走 Opus 详情；<strong>专栏</strong>走文章正文接口（cv）和评论区 type=12。不套用视频标题词。时间窗与步骤 1 相同。门槛全 0 即时间窗内照单全收。</p>
           <div class="grid-3" style="margin-top:8px">
             <label>动态最低点赞<input id="kw-dyn-likes" type="number" min="0" value="0" /></label>
             <label>动态最低评论<input id="kw-dyn-comments" type="number" min="0" value="0" /></label>
             <label>动态最低转发<input id="kw-dyn-forwards" type="number" min="0" value="0" /></label>
           </div>
           <div class="checks" style="margin-top:12px">
-            <label class="choice-card selected"><input type="checkbox" id="kw-comments" checked /> 采集动态评论</label>
-            <label class="choice-card selected"><input type="checkbox" id="kw-ocr" checked /> 动态图片 OCR</label>
+            <label class="choice-card selected"><input type="checkbox" id="kw-comments" checked /> 采集图文评论（动态 + 专栏）</label>
+            <label class="choice-card selected"><input type="checkbox" id="kw-ocr" checked /> 图文图片 OCR</label>
           </div>
           <div class="grid-3" style="margin-top:12px">
             <label>评论结构
@@ -1026,6 +1030,6 @@
     </main>
   </div>
     <div id="toast" role="status" aria-live="polite"></div>
-  <script src="/static/app.js?v=20261005a"></script>
+  <script src="/static/app.js?v=20261005d"></script>
 </body>
 </html>

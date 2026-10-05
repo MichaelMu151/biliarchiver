@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import random
+import re
 import time
 import urllib.parse
 from pathlib import Path
@@ -55,6 +56,62 @@ DM_IMG = {
     "dm_cover_img_str": "QU5HTEUgKEludGVsLCBJbnRlbChSKSBVSEQgR3JhcGhpY3MgNjIwKCB4ODYpIEdvb2dsZSBJbmMuLCBXaW5kb3dzKQ",
     "dm_img_inter": '{"ds":[],"wh":[0,0,0],"of":[0,0,0]}',
 }
+
+
+_GRAPHIC_ID_RE = re.compile(r"(?:opus/|t\.bilibili\.com/|read/cv)(\d+)", re.I)
+
+
+def graphic_search_id(row: dict[str, Any] | None) -> str:
+    """Id from a 图文 search row (opus snowflake, dyn_id, or column cv)."""
+    if not isinstance(row, dict):
+        return ""
+    for key in ("opus_id", "dyn_id", "dynamic_id", "id_str", "twitter_id"):
+        val = str(row.get(key) or "").strip()
+        if val and val != "0":
+            return val
+    for key in ("url", "uri", "arcurl", "jump_url"):
+        match = _GRAPHIC_ID_RE.search(str(row.get(key) or ""))
+        if match:
+            return match.group(1)
+    val = str(row.get("id") or "").strip()
+    return val if val and val != "0" else ""
+
+
+def graphic_jump_url(row: dict[str, Any] | None, dyn_id: str = "") -> str:
+    """Canonical link for a 图文 hit: opus, column, or t.bilibili."""
+    row = row or {}
+    for key in ("url", "uri", "arcurl", "jump_url"):
+        raw = str(row.get(key) or "").strip()
+        if raw:
+            return abs_url(raw)
+    dyn_id = str(dyn_id or "").strip()
+    if not dyn_id:
+        return ""
+    if len(dyn_id) >= 15:
+        return f"https://www.bilibili.com/opus/{dyn_id}"
+    return f"https://www.bilibili.com/read/cv{dyn_id}"
+
+
+def graphic_kind(row: dict[str, Any] | None, dyn_id: str = "", jump_url: str = "") -> str:
+    """``column`` = 专栏 (cv); ``opus`` = 动态 / 图文 opus."""
+    row = row or {}
+    blob = " ".join(
+        [
+            str(row.get("url") or ""),
+            str(row.get("uri") or ""),
+            str(row.get("arcurl") or ""),
+            str(row.get("jump_url") or ""),
+            str(jump_url or ""),
+        ]
+    ).lower()
+    if "read/cv" in blob:
+        return "column"
+    if "opus/" in blob or "t.bilibili.com/" in blob:
+        return "opus"
+    ident = str(dyn_id or graphic_search_id(row) or "").strip()
+    if ident.isdigit() and len(ident) < 15:
+        return "column"
+    return "opus"
 
 
 class BiliError(RuntimeError):
@@ -197,11 +254,20 @@ class BiliClient:
                 if isinstance(payload, dict):
                     code = payload.get("code")
                     soft = is_soft_api_failure(payload)
-                    if code in RISK_CODES or has_risk_voucher(payload) or soft:
+                    voucher = has_risk_voucher(payload)
+                    if code in RISK_CODES or voucher or soft:
                         if wbi_sign:
                             await self._refresh_wbi(force=True)
-                        backoff = min(45 if soft else 30, 4 * attempt + random.choice([1, 2, 4, 6]))
-                        label = "临时错误" if soft and code not in RISK_CODES else "风控"
+                        if voucher and code == 0:
+                            # Bilibili returns code=0 + v_voucher when throttling typed search.
+                            backoff = min(60, 8 * attempt + jitter(2.0, 5.0))
+                            label = "验票"
+                        elif soft and code not in RISK_CODES:
+                            backoff = min(45, 4 * attempt + random.choice([1, 2, 4, 6]))
+                            label = "临时错误"
+                        else:
+                            backoff = min(30, 4 * attempt + random.choice([1, 2, 4, 6]))
+                            label = "风控"
                         self.on_log(
                             "warn",
                             f"{label} {code} {payload.get('message','')} · {backoff:.0f}s 后重试 ({attempt}/{retries})",
@@ -571,11 +637,18 @@ class BiliClient:
         payload = data.get("data") or {}
         return payload if isinstance(payload, dict) else {}
 
-    async def _pace_search(self, page: int = 1) -> None:
-        """Extra wait on typed search. Moderate: ~1–2.4s, a bit longer after page 8."""
-        wait = jitter(1.0, 2.0)
-        if int(page) >= 8:
-            wait += jitter(0.25, 0.7)
+    async def _pace_search(self, page: int = 1, *, article: bool = False) -> None:
+        """Extra wait on typed search. Article/图文 is slower to avoid v_voucher."""
+        if article:
+            wait = jitter(2.2, 3.8)
+            if int(page) >= 5:
+                wait += jitter(0.6, 1.4)
+            if int(page) >= 10:
+                wait += jitter(0.8, 2.0)
+        else:
+            wait = jitter(1.0, 2.0)
+            if int(page) >= 8:
+                wait += jitter(0.25, 0.7)
         await asyncio.sleep(wait)
 
     async def search_dynamics_page(
@@ -586,9 +659,9 @@ class BiliClient:
         page_size: int = 20,
         order: str = "pubdate",
     ) -> dict[str, Any]:
-        """One page of site-wide dynamic (twitter) search. Returns raw ``data``."""
+        """One page of site-wide 图文 search (search tab; covers dynamics + columns)."""
         params: dict[str, Any] = {
-            "search_type": "twitter",
+            "search_type": "article",
             "keyword": keyword,
             "page": max(1, int(page)),
             "page_size": max(1, min(50, int(page_size))),
@@ -597,7 +670,8 @@ class BiliClient:
             "platform": "pc",
             "web_location": "1430654",
         }
-        search_referer = f"https://search.bilibili.com/all?keyword={urllib.parse.quote(keyword, safe='')}&search_type=twitter"
+        encoded = urllib.parse.quote(keyword, safe="")
+        search_referer = f"https://search.bilibili.com/article?keyword={encoded}"
         data = await self.get_json(
             "https://api.bilibili.com/x/web-interface/wbi/search/type",
             params=params,
@@ -613,7 +687,7 @@ class BiliClient:
             )
         if data.get("code") != 0:
             raise BiliError(
-                f"动态搜索失败（{keyword} p{page}）：{data.get('message') or data.get('code')}",
+                f"图文搜索失败（{keyword} p{page}）：{data.get('message') or data.get('code')}",
                 data.get("code"),
                 data.get("code") in RISK_CODES or is_soft_api_failure(data),
             )
@@ -629,7 +703,7 @@ class BiliClient:
         page_size: int = 20,
         should_cancel: Callable[[], bool] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Yield raw dynamic search rows until empty page, numPages, or max_pages."""
+        """Yield raw 图文 search rows until empty page, numPages, or max_pages."""
         for page in range(1, max(1, int(max_pages)) + 1):
             if should_cancel and should_cancel():
                 return
@@ -645,13 +719,12 @@ class BiliClient:
             for row in rows:
                 if not isinstance(row, dict):
                     continue
-                dyn_id = str(row.get("id") or row.get("twitter_id") or row.get("dynamic_id") or "").strip()
-                if dyn_id:
+                if graphic_search_id(row):
                     yield row
             num_pages = int(payload.get("numPages") or payload.get("numpages") or 0)
             if num_pages and page >= num_pages:
                 return
-            await self._pace_search(page)
+            await self._pace_search(page, article=True)
 
     async def get_dynamic_detail(self, dyn_id: str) -> dict[str, Any]:
         """Polymer dynamic card for one id_str (comments / pictures / stats)."""
@@ -673,11 +746,27 @@ class BiliClient:
             referer=f"https://t.bilibili.com/{dyn_id}",
         )
         if data.get("code") != 0:
-            raise BiliError(
-                data.get("message") or f"动态详情失败 {dyn_id}",
-                data.get("code"),
-                data.get("code") in RISK_CODES or is_soft_api_failure(data),
+            data = await self.get_json(
+                "https://api.bilibili.com/x/polymer/web-dynamic/v1/opus/detail",
+                params={
+                    "id": dyn_id,
+                    "timezone_offset": -480,
+                    "features": params["features"],
+                    "web_location": 333.999,
+                    **DM_IMG,
+                },
+                wbi=True,
+                referer=f"https://www.bilibili.com/opus/{dyn_id}",
             )
+        if data.get("code") != 0:
+            retryable = data.get("code") in RISK_CODES or is_soft_api_failure(data)
+            if retryable:
+                raise BiliError(
+                    data.get("message") or f"动态详情失败 {dyn_id}",
+                    data.get("code"),
+                    True,
+                )
+            return {}
         payload = data.get("data") or {}
         if not isinstance(payload, dict):
             return {}
@@ -688,6 +777,38 @@ class BiliClient:
         if isinstance(item, dict):
             return item
         return payload if payload.get("id_str") or payload.get("modules") else {}
+
+    async def get_article_view(self, cvid: str) -> dict[str, Any]:
+        """专栏正文（``/x/article/view``，失败再试 viewinfo）。"""
+        cvid = str(cvid or "").strip()
+        if not cvid:
+            return {}
+        referer = f"https://www.bilibili.com/read/cv{cvid}"
+        data = await self.get_json(
+            "https://api.bilibili.com/x/article/view",
+            params={"id": cvid},
+            wbi=False,
+            referer=referer,
+        )
+        if data.get("code") != 0:
+            data = await self.get_json(
+                "https://api.bilibili.com/x/article/viewinfo",
+                params={"id": cvid, "mobi_app": "pc"},
+                wbi=False,
+                referer=referer,
+            )
+        if data.get("code") != 0:
+            retryable = data.get("code") in RISK_CODES or is_soft_api_failure(data)
+            if retryable:
+                raise BiliError(
+                    data.get("message") or f"专栏详情失败 cv{cvid}",
+                    data.get("code"),
+                    True,
+                )
+            self.on_log("warn", f"专栏详情失败 cv{cvid}：{data.get('message') or data.get('code')}")
+            return {}
+        payload = data.get("data") or {}
+        return payload if isinstance(payload, dict) else {}
 
     async def iter_search_videos(
         self,

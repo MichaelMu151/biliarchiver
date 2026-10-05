@@ -727,6 +727,7 @@ class KeywordSampleTests(unittest.TestCase):
         self.assertEqual(reason, "min_views")
 
     def test_dynamic_gate_uses_separate_thresholds_and_shared_dates(self) -> None:
+        from bili.client import graphic_search_id
         from bili.keyword_sample import KeywordSampleConfig, evaluate_dynamic_gate, normalize_dynamic_search_hit
         from bili.util import parse_date_boundary
 
@@ -756,6 +757,31 @@ class KeywordSampleTests(unittest.TestCase):
         self.assertEqual(hit["dyn_id"], "1234567890")
         self.assertIn("八小时", hit["text"])
 
+        article = normalize_dynamic_search_hit(
+            {
+                "id": 111222,
+                "title": "<em>八小时</em>工时",
+                "desc": "讨论双休",
+                "mid": 88,
+                "uname": "poster",
+                "like": 20,
+                "reply": 5,
+                "pub_time": begin + 86400,
+                "image_urls": ["https://i0.hdslb.com/bfs/a.jpg"],
+                "url": "//www.bilibili.com/opus/987654321012345678",
+            },
+            keyword="八小时",
+        )
+        self.assertEqual(article["dyn_id"], "987654321012345678")
+        self.assertEqual(article["mid"], "88")
+        self.assertIn("八小时", article["text"])
+        self.assertIn("双休", article["text"])
+        self.assertEqual(article["comments"], 5)
+        self.assertEqual(article["pictures"], ["https://i0.hdslb.com/bfs/a.jpg"])
+        self.assertIn("opus/987654321012345678", article["jump_url"])
+        ok, reason, _ = evaluate_dynamic_gate(article, cfg)
+        self.assertTrue(ok, reason)
+
         cold = dict(hit)
         cold["likes"] = 1
         ok, reason, _ = evaluate_dynamic_gate(cold, cfg)
@@ -767,6 +793,52 @@ class KeywordSampleTests(unittest.TestCase):
         ok, reason, _ = evaluate_dynamic_gate(old, cfg)
         self.assertFalse(ok)
         self.assertEqual(reason, "too_old")
+
+        self.assertEqual(graphic_search_id({"id": 12, "url": "//www.bilibili.com/read/cv9988"}), "9988")
+        self.assertEqual(graphic_search_id({"opus_id": "555", "id": 1}), "555")
+
+        from bili.client import graphic_kind
+        from bili.crawler import extract_article
+
+        self.assertEqual(graphic_kind({"url": "//www.bilibili.com/read/cv53298125"}, "53298125"), "column")
+        self.assertEqual(graphic_kind({"url": "//www.bilibili.com/opus/987654321012345678"}), "opus")
+        self.assertEqual(article["kind"], "opus")
+        column = normalize_dynamic_search_hit(
+            {
+                "id": 53298125,
+                "title": "调休",
+                "desc": "专栏正文摘要",
+                "mid": 1,
+                "uname": "up",
+                "like": 3,
+                "reply": 1,
+                "pub_time": begin + 86400,
+                "url": "//www.bilibili.com/read/cv53298125",
+            },
+            keyword="调休",
+        )
+        self.assertEqual(column["kind"], "column")
+        self.assertEqual(column["dyn_id"], "53298125")
+        parsed = extract_article(
+            {
+                "id": 53298125,
+                "title": "调休说明",
+                "content": "<p>第一段</p><img src='https://i0.hdslb.com/bfs/a.jpg'/><p>第二段</p>",
+                "mid": 9,
+                "author": {"mid": 9, "name": "作者"},
+                "ctime": begin + 86400,
+                "stats": {"like": 8, "reply": 4, "share": 1},
+                "origin_image_urls": ["https://i0.hdslb.com/bfs/cover.jpg"],
+            }
+        )
+        self.assertEqual(parsed["comment_type"], 12)
+        self.assertEqual(parsed["comment_id"], "53298125")
+        self.assertEqual(parsed["dyn_type"], "article")
+        self.assertIn("第一段", parsed["text"])
+        self.assertIn("第二段", parsed["text"])
+        self.assertIn("https://i0.hdslb.com/bfs/cover.jpg", parsed["pictures"])
+        self.assertIn("https://i0.hdslb.com/bfs/a.jpg", parsed["pictures"])
+        self.assertIn("read/cv53298125", parsed["jump_url"])
 
     def test_keyword_defaults_are_list_export_not_transcribe(self) -> None:
         from bili.keyword_sample import KeywordSampleConfig

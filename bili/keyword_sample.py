@@ -15,13 +15,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from bili.academic import CIRCUIT_LIMIT, split_terms
-from bili.client import RISK_CODES, BiliClient, BiliError
+from bili.client import RISK_CODES, BiliClient, BiliError, graphic_jump_url, graphic_kind, graphic_search_id
 from bili.corpus import Corpus
-from bili.crawler import Crawler, JobConfig, extract_dynamic
+from bili.crawler import Crawler, JobConfig, extract_article, extract_dynamic
 from bili.export import account_dir, write_keyword_catalog
 from bili.paths import EXPORT_DIR, LIBRARY_DIR
 from bili.settings import AppSettings
-from bili.util import jitter, parse_date_boundary, pick, strip_html, ts_iso
+from bili.util import jitter, parse_date_boundary, strip_html, ts_iso
 
 SEARCH_ORDERS = {"totalrank", "pubdate", "click", "dm", "stow", "scores"}
 DURATION_CHOICES = {0, 1, 2, 3, 4}
@@ -234,21 +234,31 @@ def evaluate_keyword_gate(
 
 
 def normalize_dynamic_search_hit(row: dict[str, Any], *, keyword: str = "") -> dict[str, Any]:
-    """Flatten a twitter/dynamic search row."""
-    dyn_id = str(row.get("id") or row.get("twitter_id") or row.get("dynamic_id") or "").strip()
+    """Flatten a 图文 search row (dynamics + columns)."""
+    dyn_id = graphic_search_id(row)
     mid = str(row.get("mid") or row.get("uid") or "")
-    uname = strip_html(str(row.get("uname") or row.get("author") or ""))
-    text = strip_html(str(row.get("content") or row.get("title") or row.get("description") or ""))
-    pub_ts = _as_int(row.get("ctime") or row.get("pubdate") or row.get("pub_ts"))
+    uname = strip_html(str(row.get("uname") or row.get("name") or row.get("author") or ""))
+    title = strip_html(str(row.get("title") or ""))
+    desc = strip_html(str(row.get("desc") or row.get("description") or row.get("content") or ""))
+    text = title
+    if desc and desc not in title:
+        text = f"{title}\n{desc}".strip() if title else desc
+    pub_ts = _as_int(row.get("pub_time") or row.get("ctime") or row.get("pubdate") or row.get("pub_ts"))
     likes = _as_int(row.get("like") or row.get("likes"))
-    comments = _as_int(row.get("comment") or row.get("review") or row.get("replies"))
+    comments = _as_int(row.get("reply") or row.get("comment") or row.get("review") or row.get("replies"))
     forwards = _as_int(row.get("retweet") or row.get("repost") or row.get("forward") or row.get("share"))
     pics: list[str] = []
-    raw_pic = row.get("twitter_pic") or row.get("cover") or ""
-    if isinstance(raw_pic, str) and raw_pic.strip():
-        pics = [part.strip() for part in raw_pic.split(",") if part.strip()]
-    elif isinstance(raw_pic, list):
-        pics = [str(part) for part in raw_pic if part]
+    image_urls = row.get("image_urls")
+    if isinstance(image_urls, list):
+        pics = [str(part) for part in image_urls if part]
+    elif isinstance(image_urls, str) and image_urls.strip():
+        pics = [part.strip() for part in image_urls.split(",") if part.strip()]
+    if not pics:
+        raw_pic = row.get("cover") or row.get("twitter_pic") or ""
+        if isinstance(raw_pic, str) and raw_pic.strip():
+            pics = [part.strip() for part in raw_pic.split(",") if part.strip()]
+        elif isinstance(raw_pic, list):
+            pics = [str(part) for part in raw_pic if part]
     return {
         "dyn_id": dyn_id,
         "mid": mid,
@@ -260,7 +270,8 @@ def normalize_dynamic_search_hit(row: dict[str, Any], *, keyword: str = "") -> d
         "forwards": forwards,
         "pictures": pics,
         "keyword": keyword,
-        "jump_url": f"https://t.bilibili.com/{dyn_id}" if dyn_id else "",
+        "jump_url": graphic_jump_url(row, dyn_id),
+        "kind": graphic_kind(row, dyn_id, graphic_jump_url(row, dyn_id)),
         "raw": row,
     }
 
@@ -585,7 +596,7 @@ class KeywordSampler:
         for keyword in keywords:
             if self._stop() or len(catalog) >= safety_cap:
                 break
-            self.on_log("info", f"搜索动态「{keyword}」…")
+            self.on_log("info", f"搜索图文/动态「{keyword}」…")
             progress["stage"] = f"dyn-search:{keyword}"
             progress["current"] = keyword
             await emit()
@@ -620,10 +631,14 @@ class KeywordSampler:
                         progress["pruned"] = int(progress.get("pruned") or 0) + 1
                         continue
                     if config.resume and self.corpus.has_dynamic(dyn_id):
-                        self.on_log("info", f"复用动态 {dyn_id}")
-                        catalog.append(self._dyn_catalog_row(hit))
-                        progress["dynamics_done"] = len(catalog)
-                        continue
+                        existing_type = self.corpus.dynamic_type(dyn_id)
+                        if existing_type != "search":
+                            self.on_log("info", f"复用动态 {dyn_id}")
+                            catalog.append(self._dyn_catalog_row(hit))
+                            progress["dynamics_done"] = len(catalog)
+                            continue
+                        hit["_refetch_stub"] = True
+                        self.on_log("info", f"{dyn_id} 此前只有搜索摘要，改为补采全文")
                     progress["stage"] = f"dynamic {dyn_id}"
                     progress["current"] = dyn_id
                     await emit()
@@ -648,13 +663,13 @@ class KeywordSampler:
                         else:
                             consecutive_risk = 0
                             self.on_log("error", f"动态 {dyn_id} 失败：{exc}")
-                    await asyncio.sleep(jitter(0.45, 1.05))
+                    await asyncio.sleep(jitter(1.2, 2.4))
             except Exception as exc:
-                self.on_log("error", f"动态搜索「{keyword}」失败，跳过该词继续：{exc}")
-                await asyncio.sleep(jitter(1.2, 2.4))
+                self.on_log("error", f"图文搜索「{keyword}」失败，跳过该词继续：{exc}")
+                await asyncio.sleep(jitter(2.5, 5.0))
                 continue
-            self.on_log("ok", f"「{keyword}」动态搜索结束 · 本词 {page_hits} 条 · 已采集 {len(catalog)}")
-            await asyncio.sleep(jitter(1.2, 2.6))
+            self.on_log("ok", f"「{keyword}」图文搜索结束 · 本词 {page_hits} 条 · 已采集 {len(catalog)}")
+            await asyncio.sleep(jitter(3.0, 6.0))
         self.on_log("ok", f"动态采集 {len(catalog)} 条 · {out_dir}")
         return catalog
 
@@ -674,6 +689,7 @@ class KeywordSampler:
             "picture_count": len(src.get("pictures") or hit.get("pictures") or []),
             "keyword": hit.get("keyword") or "",
             "jump_url": src.get("jump_url") or hit.get("jump_url") or "",
+            "kind": src.get("dyn_type") or hit.get("kind") or "",
         }
 
     async def _collect_one_dynamic(
@@ -683,9 +699,30 @@ class KeywordSampler:
         hit: dict[str, Any],
     ) -> dict[str, Any] | None:
         dyn_id = str(hit.get("dyn_id") or "")
-        item = await client.get_dynamic_detail(dyn_id)
-        if not item:
-            self.on_log("warn", f"动态详情为空 {dyn_id}，按搜索卡片写入")
+        kind = str(hit.get("kind") or graphic_kind(hit.get("raw") if isinstance(hit.get("raw"), dict) else {}, dyn_id, str(hit.get("jump_url") or "")))
+        extracted: dict[str, Any] = {}
+        if kind == "column":
+            payload = await client.get_article_view(dyn_id)
+            if payload:
+                extracted = extract_article(payload)
+        else:
+            try:
+                item = await client.get_dynamic_detail(dyn_id)
+            except BiliError as exc:
+                if exc.retryable:
+                    raise
+                item = {}
+            if item:
+                extracted = extract_dynamic(item)
+            if not (extracted.get("text") or extracted.get("pictures")):
+                payload = await client.get_article_view(dyn_id)
+                if payload:
+                    extracted = extract_article(payload)
+                    kind = "column"
+        if not extracted.get("dyn_id"):
+            comment_type = 12 if kind == "column" else 17
+            label = "专栏" if kind == "column" else "动态"
+            self.on_log("warn", f"{label}详情为空 {dyn_id}，按搜索卡片写入")
             extracted = {
                 "dyn_id": dyn_id,
                 "mid": hit.get("mid") or "",
@@ -698,19 +735,27 @@ class KeywordSampler:
                 "comment": hit.get("comments") or 0,
                 "forward": hit.get("forwards") or 0,
                 "comment_id": dyn_id,
-                "comment_type": 17,
-                "jump_url": hit.get("jump_url") or f"https://t.bilibili.com/{dyn_id}",
+                "comment_type": comment_type,
+                "jump_url": hit.get("jump_url") or graphic_jump_url(hit.get("raw") or {}, dyn_id),
             }
-        else:
-            extracted = extract_dynamic(item)
-            if not extracted.get("dyn_id"):
-                extracted["dyn_id"] = dyn_id
-            extracted["mid"] = extracted.get("mid") or hit.get("mid") or str(pick(item, "modules", "module_author", "mid") or "")
-            extracted["author_name"] = (
-                extracted.get("author_name")
-                or hit.get("author_name")
-                or str(pick(item, "modules", "module_author", "name") or "")
-            )
+        extracted.pop("content_html", None)
+        if not extracted.get("dyn_id"):
+            extracted["dyn_id"] = dyn_id
+        extracted["mid"] = extracted.get("mid") or hit.get("mid") or ""
+        extracted["author_name"] = extracted.get("author_name") or hit.get("author_name") or ""
+        if kind == "column":
+            if extracted.get("dyn_type") != "search":
+                extracted["dyn_type"] = extracted.get("dyn_type") or "article"
+            extracted["comment_type"] = 12
+            extracted["comment_id"] = extracted.get("comment_id") or dyn_id
+            if not extracted.get("jump_url"):
+                extracted["jump_url"] = f"https://www.bilibili.com/read/cv{dyn_id}"
+        if not extracted.get("text"):
+            extracted["text"] = hit.get("text") or ""
+        if not extracted.get("pictures"):
+            extracted["pictures"] = hit.get("pictures") or []
+        if not extracted.get("pub_ts"):
+            extracted["pub_ts"] = hit.get("pub_ts") or 0
         mid = str(extracted.get("mid") or hit.get("mid") or "unknown")
         name = str(extracted.get("author_name") or hit.get("author_name") or mid)
         acc_dir = account_dir(LIBRARY_DIR, mid, name)
@@ -726,7 +771,7 @@ class KeywordSampler:
             transcribe_mode="none",
             media_keep=config.media_keep or "keep",
             ocr_enabled=bool(config.ocr_enabled),
-            resume=config.resume,
+            resume=bool(config.resume) and not bool(hit.get("_refetch_stub")),
             job_id=config.job_id,
             rclone_remote=config.rclone_remote or self.settings.rclone_remote,
             rclone_root=config.rclone_root or self.settings.rclone_root,
