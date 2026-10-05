@@ -7,6 +7,7 @@ import json
 import os
 import random
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
@@ -546,11 +547,12 @@ class BiliClient:
             params["pubtime_begin_s"] = int(pubtime_begin_s)
         if pubtime_end_s is not None:
             params["pubtime_end_s"] = int(pubtime_end_s)
+        search_referer = f"https://search.bilibili.com/video?keyword={urllib.parse.quote(keyword, safe='')}"
         data = await self.get_json(
             "https://api.bilibili.com/x/web-interface/wbi/search/type",
             params=params,
             wbi=True,
-            referer=f"https://search.bilibili.com/video?keyword={keyword}",
+            referer=search_referer,
         )
         if data.get("code") != 0:
             # Fall back to the unsigned endpoint used by some clients.
@@ -558,7 +560,7 @@ class BiliClient:
                 "https://api.bilibili.com/x/web-interface/search/type",
                 params={k: v for k, v in params.items() if k not in {"__refresh__", "platform", "web_location"}},
                 wbi=False,
-                referer=f"https://search.bilibili.com/video?keyword={keyword}",
+                referer=search_referer,
             )
         if data.get("code") != 0:
             raise BiliError(
@@ -568,6 +570,124 @@ class BiliClient:
             )
         payload = data.get("data") or {}
         return payload if isinstance(payload, dict) else {}
+
+    async def _pace_search(self, page: int = 1) -> None:
+        """Extra wait on typed search. Moderate: ~1–2.4s, a bit longer after page 8."""
+        wait = jitter(1.0, 2.0)
+        if int(page) >= 8:
+            wait += jitter(0.25, 0.7)
+        await asyncio.sleep(wait)
+
+    async def search_dynamics_page(
+        self,
+        keyword: str,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        order: str = "pubdate",
+    ) -> dict[str, Any]:
+        """One page of site-wide dynamic (twitter) search. Returns raw ``data``."""
+        params: dict[str, Any] = {
+            "search_type": "twitter",
+            "keyword": keyword,
+            "page": max(1, int(page)),
+            "page_size": max(1, min(50, int(page_size))),
+            "order": order or "pubdate",
+            "__refresh__": "true",
+            "platform": "pc",
+            "web_location": "1430654",
+        }
+        search_referer = f"https://search.bilibili.com/all?keyword={urllib.parse.quote(keyword, safe='')}&search_type=twitter"
+        data = await self.get_json(
+            "https://api.bilibili.com/x/web-interface/wbi/search/type",
+            params=params,
+            wbi=True,
+            referer=search_referer,
+        )
+        if data.get("code") != 0:
+            data = await self.get_json(
+                "https://api.bilibili.com/x/web-interface/search/type",
+                params={k: v for k, v in params.items() if k not in {"__refresh__", "platform", "web_location"}},
+                wbi=False,
+                referer=search_referer,
+            )
+        if data.get("code") != 0:
+            raise BiliError(
+                f"动态搜索失败（{keyword} p{page}）：{data.get('message') or data.get('code')}",
+                data.get("code"),
+                data.get("code") in RISK_CODES or is_soft_api_failure(data),
+            )
+        payload = data.get("data") or {}
+        return payload if isinstance(payload, dict) else {}
+
+    async def iter_search_dynamics(
+        self,
+        keyword: str,
+        *,
+        order: str = "pubdate",
+        max_pages: int = 50,
+        page_size: int = 20,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yield raw dynamic search rows until empty page, numPages, or max_pages."""
+        for page in range(1, max(1, int(max_pages)) + 1):
+            if should_cancel and should_cancel():
+                return
+            payload = await self.search_dynamics_page(
+                keyword,
+                page=page,
+                page_size=page_size,
+                order=order,
+            )
+            rows = payload.get("result") or []
+            if not isinstance(rows, list) or not rows:
+                return
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                dyn_id = str(row.get("id") or row.get("twitter_id") or row.get("dynamic_id") or "").strip()
+                if dyn_id:
+                    yield row
+            num_pages = int(payload.get("numPages") or payload.get("numpages") or 0)
+            if num_pages and page >= num_pages:
+                return
+            await self._pace_search(page)
+
+    async def get_dynamic_detail(self, dyn_id: str) -> dict[str, Any]:
+        """Polymer dynamic card for one id_str (comments / pictures / stats)."""
+        dyn_id = str(dyn_id or "").strip()
+        if not dyn_id:
+            return {}
+        params: dict[str, Any] = {
+            "id": dyn_id,
+            "timezone_offset": -480,
+            "platform": "web",
+            "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,forwardListHidden,decorationCard,commentsNum,onlyfansAssetsV2,combination,htmlNewStyle,uturnLastComment",
+            "web_location": 333.999,
+            **DM_IMG,
+        }
+        data = await self.get_json(
+            "https://api.bilibili.com/x/polymer/web-dynamic/v1/detail",
+            params=params,
+            wbi=True,
+            referer=f"https://t.bilibili.com/{dyn_id}",
+        )
+        if data.get("code") != 0:
+            raise BiliError(
+                data.get("message") or f"动态详情失败 {dyn_id}",
+                data.get("code"),
+                data.get("code") in RISK_CODES or is_soft_api_failure(data),
+            )
+        payload = data.get("data") or {}
+        if not isinstance(payload, dict):
+            return {}
+        item = payload.get("item") or payload.get("items")
+        if isinstance(item, list) and item:
+            first = item[0]
+            return first if isinstance(first, dict) else {}
+        if isinstance(item, dict):
+            return item
+        return payload if payload.get("id_str") or payload.get("modules") else {}
 
     async def iter_search_videos(
         self,
@@ -605,8 +725,7 @@ class BiliClient:
             num_pages = int(payload.get("numPages") or payload.get("numpages") or 0)
             if num_pages and page >= num_pages:
                 return
-            # Soft pacing between search pages (search is rate-limited hard).
-            await asyncio.sleep(jitter(0.8, 1.6))
+            await self._pace_search(page)
 
     async def get_related(self, bvid: str, limit: int = 20) -> list[dict[str, Any]]:
         """Algorithmic recommendation neighbours; the edges of the snowball graph."""

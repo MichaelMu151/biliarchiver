@@ -191,6 +191,30 @@ def whisper_available() -> bool:
         return False
 
 
+def pyav_whisper_compatible() -> tuple[bool, str]:
+    """faster-whisper 1.x still calls av.open(..., metadata_errors='ignore').
+
+    PyAV 19 removed that kwarg. Some 19.x wheels also leave ``av.open`` bound to
+    the builtin ``open``, which raises the same TypeError and looks like a
+    healthy Whisper install until the first real file is decoded.
+    """
+    try:
+        import builtins
+        import av
+    except Exception as exc:
+        return False, f"无法 import av：{exc}"
+    version = str(getattr(av, "__version__", "?") or "?")
+    if av.open is builtins.open:
+        return False, f"av {version} 的 open 被绑成了内置 open"
+    try:
+        av.open("/tmp/__bili_av_probe__.mp3", mode="r", metadata_errors="ignore")
+    except TypeError as exc:
+        return False, f"av {version} 不接受 metadata_errors：{exc}"
+    except Exception:
+        return True, version
+    return True, version
+
+
 def _get_whisper_model(model_size: str, device: str = "auto", compute_type: str = "auto"):
     global _MODEL, _MODEL_KEY
     from faster_whisper import WhisperModel
@@ -353,19 +377,6 @@ async def build_transcript(
             from bili.settings import load_settings
 
             cloud_model = whisper_model_for_backend(whisper_model, compute_backend)
-            if audio_path and Path(audio_path).exists() and gpu_worker_url:
-                try:
-                    result = await transcribe_remote(
-                        url=gpu_worker_url,
-                        token=gpu_worker_token,
-                        audio_path=audio_path,
-                        model=cloud_model,
-                        language=whisper_language,
-                        on_log=on_log,
-                    )
-                except Exception as exc:
-                    detail = str(exc).strip() or type(exc).__name__
-                    on_log("warn", f"本机 SFTP 转写失败 {bvid}：{detail}，改由 GPU 直拉音频")
             if not result.get("markdown"):
                 try:
                     settings = load_settings()
@@ -373,6 +384,7 @@ async def build_transcript(
                     _, audio_urls = select_stream_candidates(play, settings.video_quality)
                     if not audio_urls:
                         raise RuntimeError("playurl 没有音频地址")
+                    on_log("info", f"云端 GPU 直拉音频转写 {bvid}")
                     result = await transcribe_remote_from_bili(
                         bvid=bvid,
                         urls=audio_urls,
@@ -384,7 +396,20 @@ async def build_transcript(
                     )
                 except Exception as exc:
                     detail = str(exc).strip() or type(exc).__name__
-                    on_log("warn", f"GPU 直拉转写失败 {bvid}：{detail}")
+                    on_log("warn", f"GPU 直拉转写失败 {bvid}：{detail}，改走 SFTP 备选")
+            if not result.get("markdown") and audio_path and Path(audio_path).exists():
+                try:
+                    result = await transcribe_remote(
+                        url=gpu_worker_url,
+                        token=gpu_worker_token,
+                        audio_path=audio_path,
+                        model=cloud_model,
+                        language=whisper_language,
+                        on_log=on_log,
+                    )
+                except Exception as exc:
+                    detail = str(exc).strip() or type(exc).__name__
+                    on_log("warn", f"本机 SFTP 转写失败 {bvid}：{detail}")
             if not result.get("markdown"):
                 on_log("warn", f"云端 GPU 未激活或没有可用音频，已把 {bvid} 写入 cloud_job.json")
         elif audio_path and Path(audio_path).exists() and whisper_available():
@@ -411,6 +436,17 @@ async def build_transcript(
         result["status"] = "pending"
         result.setdefault("segments", [])
         result["markdown"] = result.get("markdown") or ""
+        # Do not overwrite an existing OCR slide transcript with an empty Whisper
+        # stub — OCR fallback (or a later backfill) still needs the prior text.
+        if not folder_has_spoken_transcript(folder) and folder_transcript_has_text(folder):
+            prior = folder_transcript_source(folder)
+            if "rapidocr" in prior.lower() or "ocr" in prior.lower():
+                return {
+                    "status": "pending",
+                    "source": result.get("source") or "",
+                    "segments": [],
+                    "markdown": "",
+                }
         _write_transcript_outputs(folder, result)
         return result
     return {"status": "pending", "source": "", "segments": [], "markdown": ""}

@@ -14,9 +14,25 @@ from bili.client import BiliClient
 from bili.runtime import run_quiet
 from bili.util import abs_url, write_json, write_text
 
-OCR_FRAME_INTERVAL = 2.0
-OCR_FRAME_MAX = 180
+# 1s captures denser PPT/slides; raise the frame cap so long videos are not
+# truncated earlier than the old 2s×180 (=6 min) coverage.
+OCR_FRAME_INTERVAL = 1.0
+OCR_FRAME_MAX = 900
+# Live toggle: set True (or touch /tmp/bili_skip_video_ocr) to skip Whisper→OCR fallback.
+SKIP_VIDEO_OCR = False
+_SKIP_VIDEO_OCR_SENTINEL = Path("/tmp/bili_skip_video_ocr")
 LogFn = Callable[[str, str], None]
+
+
+def video_ocr_enabled() -> bool:
+    if SKIP_VIDEO_OCR:
+        return False
+    try:
+        if _SKIP_VIDEO_OCR_SENTINEL.exists():
+            return False
+    except OSError:
+        pass
+    return True
 
 
 def ocr_available() -> bool:
@@ -277,13 +293,15 @@ def extract_video_frames(
     dest_dir: Path,
     *,
     ffmpeg_path: str,
-    interval: float = OCR_FRAME_INTERVAL,
-    max_frames: int = OCR_FRAME_MAX,
+    interval: float | None = None,
+    max_frames: int | None = None,
 ) -> list[Path]:
     dest_dir.mkdir(parents=True, exist_ok=True)
     for old in dest_dir.glob("frame_*.jpg"):
         old.unlink(missing_ok=True)
-    rate = 1.0 / max(interval, 0.2)
+    use_interval = float(OCR_FRAME_INTERVAL if interval is None else interval)
+    use_max = int(OCR_FRAME_MAX if max_frames is None else max_frames)
+    rate = 1.0 / max(use_interval, 0.2)
     cmd = [
         ffmpeg_path,
         "-y",
@@ -292,7 +310,7 @@ def extract_video_frames(
         "-vf",
         f"fps={rate:.6f}",
         "-frames:v",
-        str(max(1, max_frames)),
+        str(max(1, use_max)),
         "-q:v",
         "4",
         str(dest_dir / "frame_%04d.jpg"),
@@ -308,7 +326,7 @@ async def transcribe_video_ocr(
     video_path: str,
     folder: Path,
     ffmpeg_path: str,
-    interval: float = OCR_FRAME_INTERVAL,
+    interval: float | None = None,
     min_confidence: float = 0.55,
     compute_backend: str = "local",
     gpu_worker_url: str = "",
@@ -318,6 +336,10 @@ async def transcribe_video_ocr(
 ) -> dict[str, Any]:
     """OCR on-screen text every ``interval`` seconds and return a transcript payload."""
     log = on_log or (lambda *_a, **_k: None)
+    if not video_ocr_enabled():
+        log("warn", "已跳过画面 OCR（有音频优先 Whisper；稍后补跑）")
+        return {"status": "pending", "source": "", "segments": [], "markdown": ""}
+    use_interval = float(OCR_FRAME_INTERVAL if interval is None else interval)
     video = Path(video_path)
     if not video.is_file():
         return {"status": "pending", "source": "", "segments": [], "markdown": ""}
@@ -327,7 +349,13 @@ async def transcribe_video_ocr(
     if not ffmpeg:
         log("warn", "没有 ffmpeg，无法从视频截帧做 OCR")
         return {"status": "pending", "source": "", "segments": [], "markdown": ""}
-    use_remote = compute_backend == "cloud" and bool(gpu_worker_url)
+    # Prefer local RapidOCR for frame OCR when available; keep cloud GPU for Whisper.
+    # Uploading hundreds of 1s frames over the AutoDL tunnel is much slower.
+    use_remote = (
+        compute_backend == "cloud"
+        and bool(gpu_worker_url)
+        and not ocr_available()
+    )
     if not use_remote and not ocr_available():
         log("warn", "未安装 RapidOCR，无声视频无法做画面文字识别")
         return {"status": "pending", "source": "", "segments": [], "markdown": ""}
@@ -338,7 +366,7 @@ async def transcribe_video_ocr(
             video,
             frames_dir,
             ffmpeg_path=ffmpeg,
-            interval=interval,
+            interval=use_interval,
         )
     except Exception as exc:
         log("warn", f"截帧失败：{exc}")
@@ -346,12 +374,12 @@ async def transcribe_video_ocr(
     if not paths:
         log("warn", "视频截帧得到 0 张图")
         return {"status": "pending", "source": "", "segments": [], "markdown": ""}
-    log("info", f"无对白，改为每 {interval:g} 秒截帧 OCR · {len(paths)} 张")
+    log("info", f"无对白，改为每 {use_interval:g} 秒截帧 OCR · {len(paths)} 张")
     frame_rows: list[dict[str, Any]] = []
     for index, path in enumerate(paths):
         if should_cancel and should_cancel():
             raise asyncio.CancelledError()
-        start = index * interval
+        start = index * use_interval
         text = ""
         try:
             if use_remote:
@@ -369,7 +397,7 @@ async def transcribe_video_ocr(
         except Exception as exc:
             log("warn", f"画面 OCR 失败 {path.name}：{exc}")
         frame_rows.append({"start": start, "file": path.name, "text": text})
-    segments = merge_frame_ocr_segments(frame_rows, interval=interval)
+    segments = merge_frame_ocr_segments(frame_rows, interval=use_interval)
     before = sum(1 for row in frame_rows if str(row.get("text") or "").strip())
     if before and len(segments) < before:
         log("info", f"画面文字去重：{before} 条采样 → {len(segments)} 段")
@@ -377,7 +405,7 @@ async def transcribe_video_ocr(
         folder / "ocr_frames.json",
         {
             "schema_version": 1,
-            "interval": interval,
+            "interval": use_interval,
             "engine": "RapidOCR-cloud" if use_remote else "RapidOCR",
             "frames": frame_rows,
         },
@@ -388,7 +416,7 @@ async def transcribe_video_ocr(
         return {"status": "pending", "source": "", "segments": [], "markdown": ""}
     from bili.transcribe import segments_to_markdown
 
-    source = f"rapidocr frames · {interval:g}s · {len(segments)} slides"
+    source = f"rapidocr frames · {use_interval:g}s · {len(segments)} slides"
     markdown = segments_to_markdown(segments, source)
     log("ok", f"画面 OCR 转写完成 {len(segments)} 段")
     return {

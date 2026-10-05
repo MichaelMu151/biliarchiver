@@ -10,8 +10,8 @@ from bili.paths import SETTINGS_PATH, ensure_dirs
 
 DEFAULTS: dict[str, Any] = {
     "cookie": "",
-    "min_interval": 0.8,
-    "max_interval": 1.8,
+    "min_interval": 1.0,
+    "max_interval": 2.1,
     "max_retries": 5,
     "comment_max_pages": 0,
     "include_sub_replies": True,
@@ -46,8 +46,8 @@ DEFAULTS: dict[str, Any] = {
 @dataclass
 class AppSettings:
     cookie: str = ""
-    min_interval: float = 0.8
-    max_interval: float = 1.8
+    min_interval: float = 1.0
+    max_interval: float = 2.1
     max_retries: int = 5
     comment_max_pages: int = 0
     include_sub_replies: bool = True

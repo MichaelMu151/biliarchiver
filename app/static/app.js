@@ -2,8 +2,8 @@ const titles = {
   guide: ["使用指南", "四种采集分开用。每种都能从头开始，也能续跑中断的那一次。"],
   task: ["按 UP 主采集", "完整归档，或先用「选题预览」只采标题/标签/动态再人工筛选。"],
   academic: ["学术滚雪球", "从种子视频沿相关推荐扩样本，过门禁的才写入分析库。"],
-  keyword: ["关键词采样", "全站搜索关键词，按标题/时间/互动门禁后采集转写与评论。"],
-  transcribe: ["按视频号采集", "只处理你列出的 BV：不扩散推荐，也不过门禁。"],
+  keyword: ["关键词采样", "全站搜索同一组关键词：导出带标题的 BV 列表，并可采集动态。不自动转写。"],
+  transcribe: ["按视频号采集", "只处理你列出的 BV：评论、弹幕、转写与媒体，不扩散、不过门禁。"],
   monitor: ["运行监控", "看进度和日志。中断的任务在这里续跑；换条件请回到采集页从头开始。"],
   results: ["采集结果", "浏览账号快照、视频 Markdown 和动态 OCR。"],
   corpus: ["分析数据集", "作者、视频、评论、推荐边和门禁漏斗，可导出 CSV。"],
@@ -57,15 +57,17 @@ function showPage(name) {
   if (name === "results") loadResults();
   if (name === "corpus") loadCorpus();
   if (name === "settings") loadSettings();
-  if (name === "transcribe") {
-    loadMissingBvids();
-    fillResumePick("transcribe-resume-pick", "transcribe", "transcribe-resume-hint");
-  }
   if (name === "task") fillResumePick("task-resume-pick", ["archive", "scout"], "task-resume-hint");
   if (name === "academic") fillResumePick("academic-resume-pick", "academic", "academic-resume-hint");
   if (name === "keyword") {
     fillResumePick("keyword-resume-pick", "keyword", "keyword-resume-hint");
+    enforceKeywordChoices();
     updateKeywordHints();
+  }
+  if (name === "transcribe") {
+    loadMissingBvids();
+    fillResumePick("transcribe-resume-pick", "transcribe", "transcribe-resume-hint");
+    enforceTranscribeChoices();
   }
   if (name === "monitor") loadJobHistory();
 }
@@ -83,6 +85,7 @@ document.querySelectorAll(".choice-card input").forEach((input) => {
     enforceCompatibleChoices(input.name);
     enforceAcademicChoices(input.name);
     enforceKeywordChoices(input.name);
+    enforceTranscribeChoices(input.name);
     updatePlanSummary();
     updateAcademicHints();
     updateKeywordHints();
@@ -160,28 +163,35 @@ function enforceAcademicChoices(changedName) {
   }
 }
 
-function enforceKeywordChoices(changedName) {
+function enforceKeywordChoices(_changedName) {
   if (!$("keyword-start")) return;
-  const wantTranscript = $("kw-transcript")?.checked !== false;
-  if ($("kw-transcribe-card")) $("kw-transcribe-card").hidden = !wantTranscript;
-  if (!wantTranscript) return;
-  const media = radioValue("kw-media-mode") || "audio";
-  const transcript = radioValue("kw-transcribe-mode") || "official_then_whisper";
-  const needsAudio = ["whisper", "official_then_whisper"].includes(transcript);
-  if (changedName === "kw-transcribe-mode" && needsAudio && !["audio", "video"].includes(media)) {
-    setRadio("kw-media-mode", "audio");
-    toast("关键词采样已改为下载音频，才能跑 Whisper");
-  } else if (changedName === "kw-media-mode" && needsAudio && !["audio", "video"].includes(media)) {
-    setRadio("kw-transcribe-mode", "official");
-    toast("未下载音频时，关键词采样改为只取官方字幕");
-  }
+  const wantDyn = $("kw-crawl-dyn")?.checked !== false;
+  if ($("kw-dyn-card")) $("kw-dyn-card").hidden = !wantDyn;
+  if (wantDyn) updateKeywordHints();
 }
 
 function updateKeywordHints() {
-  // Keep date_to empty = until now; no dedicated hint node required.
   if ($("kw-comments") && $("kw-comment-mode")) {
     $("kw-comment-mode").disabled = !$("kw-comments").checked;
     $("kw-comment-pages").disabled = !$("kw-comments").checked;
+  }
+}
+
+function enforceTranscribeChoices(changedName) {
+  if (!$("transcribe-start")) return;
+  const media = radioValue("tr-media-mode") || "video";
+  const transcript = radioValue("tr-transcribe-mode") || "official_then_whisper";
+  const needsAudio = ["whisper", "official_then_whisper"].includes(transcript);
+  if (changedName === "tr-transcribe-mode" && needsAudio && !["audio", "video"].includes(media)) {
+    setRadio("tr-media-mode", "audio");
+    toast("已改为下载音频，才能跑 Whisper");
+  } else if (changedName === "tr-media-mode" && needsAudio && !["audio", "video"].includes(media)) {
+    setRadio("tr-transcribe-mode", "official");
+    toast("未下载音频时，改为只取官方字幕");
+  }
+  if ($("tr-comments") && $("tr-comment-mode")) {
+    $("tr-comment-mode").disabled = !$("tr-comments").checked;
+    $("tr-comment-pages").disabled = !$("tr-comments").checked;
   }
 }
 
@@ -553,11 +563,9 @@ $("academic-start")?.addEventListener("click", async () => {
 
 $("keyword-start")?.addEventListener("click", async () => {
   try {
-    const wantTranscript = $("kw-transcript")?.checked !== false;
-    let transcribe = wantTranscript ? (radioValue("kw-transcribe-mode") || "official_then_whisper") : "none";
-    let media = wantTranscript ? (radioValue("kw-media-mode") || "audio") : "link";
-    if (["whisper", "official_then_whisper"].includes(transcribe) && !["audio", "video"].includes(media)) {
-      media = "audio";
+    if (!$("kw-export-videos")?.checked && !$("kw-crawl-dyn")?.checked) {
+      toast("请至少勾选「导出视频列表」或「采集动态」");
+      return;
     }
     const res = await api("/api/jobs/keyword", {
       method: "POST",
@@ -578,15 +586,16 @@ $("keyword-start")?.addEventListener("click", async () => {
         min_engagement: Number($("kw-min-eng").value || 0),
         category_allow: $("kw-allow").value,
         category_deny: $("kw-deny").value,
-        crawl_transcript: wantTranscript,
+        export_video_list: Boolean($("kw-export-videos")?.checked),
+        crawl_dynamics: Boolean($("kw-crawl-dyn")?.checked),
+        dyn_min_likes: Number($("kw-dyn-likes")?.value || 0),
+        dyn_min_comments: Number($("kw-dyn-comments")?.value || 0),
+        dyn_min_forwards: Number($("kw-dyn-forwards")?.value || 0),
         crawl_comments: Boolean($("kw-comments")?.checked),
         comment_with_replies: ($("kw-comment-mode")?.value || "tree") === "tree",
-        comment_max_pages: Number($("kw-comment-pages").value || 0),
-        crawl_danmaku: Boolean($("kw-danmaku")?.checked),
-        transcribe_mode: transcribe,
-        media_mode: media,
-        media_keep: radioValue("kw-media-keep") || "delete_after_text",
-        compute_backend: radioValue("kw-compute-backend") || "cloud",
+        comment_max_pages: Number($("kw-comment-pages")?.value || 0),
+        ocr_enabled: Boolean($("kw-ocr")?.checked),
+        compute_backend: $("kw-compute-backend")?.value || "local",
         resume: false,
       },
     });
@@ -626,17 +635,26 @@ $("transcribe-fill-missing")?.addEventListener("click", async () => {
 
 $("transcribe-start")?.addEventListener("click", async () => {
   try {
+    const transcribeMode = radioValue("tr-transcribe-mode") || "official_then_whisper";
+    let media = radioValue("tr-media-mode") || "video";
+    if (["whisper", "official_then_whisper"].includes(transcribeMode) && !["audio", "video"].includes(media)) {
+      media = "audio";
+    }
     const res = await api("/api/jobs/transcribe", {
       method: "POST",
       body: {
         bvids_text: $("transcribe-bvids").value,
-        transcribe_mode: "official_then_whisper",
-        media_mode: "video",
-        media_keep: "upload_then_delete",
+        transcribe_mode: transcribeMode,
+        media_mode: media,
+        media_keep: radioValue("tr-media-keep") || "upload_then_delete",
         resume: Boolean($("tr-resume")?.checked),
         compute_backend: radioValue("tr-compute-backend") || "cloud",
-        crawl_comments: false,
-        attach_run_id: "5ba1f9a96259",
+        crawl_comments: Boolean($("tr-comments")?.checked),
+        comment_with_replies: ($("tr-comment-mode")?.value || "tree") === "tree",
+        comment_max_pages: Number($("tr-comment-pages")?.value || 0),
+        crawl_danmaku: Boolean($("tr-danmaku")?.checked),
+        ocr_enabled: Boolean($("tr-ocr")?.checked),
+        attach_run_id: "",
       },
     });
     currentJobId = res.id;
@@ -764,16 +782,18 @@ function applyProgress(p) {
     $("m-uids-label").textContent = transcribe ? "进度" : keyword ? "节点" : academic ? "节点" : "账号";
   }
   if ($("m-videos-label")) {
-    $("m-videos-label").textContent = transcribe ? "完成" : keyword || academic ? "通过" : "视频";
+    $("m-videos-label").textContent = transcribe ? "完成" : keyword ? "列表" : academic ? "通过" : "视频";
   }
   if ($("m-dyn-label")) {
-    $("m-dyn-label").textContent = transcribe ? "失败" : keyword || academic ? "剪枝" : "动态";
+    $("m-dyn-label").textContent = transcribe ? "失败" : keyword ? "动态" : academic ? "剪枝" : "动态";
   }
   $("m-status").textContent = translateStatus(p.stage || "running");
   $("m-uids").textContent = `${done} / ${total}`;
-  $("m-videos-n").textContent = listed ? (p.passed || p.videos_done || 0) : (p.videos_done || 0);
-  $("m-dyn-n").textContent = listed ? (p.pruned || 0) : (p.dynamics_done || 0);
-  const extra = keyword && p.searched ? ` · 已搜 ${p.searched} · 候选 ${p.candidates || 0}` : "";
+  $("m-videos-n").textContent = listed ? (p.passed || p.videos_done || p.candidates || 0) : (p.videos_done || 0);
+  $("m-dyn-n").textContent = keyword ? (p.dynamics_done || 0) : listed ? (p.pruned || 0) : (p.dynamics_done || 0);
+  const extra = keyword && p.searched
+    ? ` · 已搜 ${p.searched} · 候选 ${p.candidates || 0}` + (p.keyword_export ? ` · ${p.keyword_export}` : "")
+    : "";
   $("m-current").textContent = (p.current || "") + extra;
   const percent = Math.min(100, (done / total) * 100);
   $("progress-bar").style.width = percent + "%";
@@ -977,6 +997,8 @@ loadCapabilities();
 syncChoiceCards();
 updatePlanSummary();
 updateAcademicHints();
+enforceKeywordChoices();
+enforceTranscribeChoices();
 $("m-ocr").addEventListener("change", updatePlanSummary);
 $("bark-test")?.addEventListener("click", async () => {
   try {

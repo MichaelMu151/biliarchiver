@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=20261004c" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261005a" />
 </head>
 <body>
   <div class="app">
@@ -24,8 +24,8 @@
         <p class="nav-label">四种采集</p>
         <button data-page="task"><span class="nav-title">按 UP 主采集</span><span class="nav-hint">指定账号，按时间整库归档</span></button>
         <button data-page="academic"><span class="nav-title">学术滚雪球</span><span class="nav-hint">从种子沿相关推荐扩样本</span></button>
-        <button data-page="keyword"><span class="nav-title">关键词采样</span><span class="nav-hint">全站搜索关键词，门禁后转写</span></button>
-        <button data-page="transcribe"><span class="nav-title">按视频号采集</span><span class="nav-hint">只处理你列出的 BV，不再扩散</span></button>
+        <button data-page="keyword"><span class="nav-title">关键词采样</span><span class="nav-hint">全站搜视频列表 + 动态，不自动转写</span></button>
+        <button data-page="transcribe"><span class="nav-title">按视频号采集</span><span class="nav-hint">按 BV 列表采评论 / 弹幕 / 转写</span></button>
         <p class="nav-label">查看与设置</p>
         <button data-page="monitor"><span class="nav-title">运行监控</span><span class="nav-hint">进度、日志、续跑与取消</span></button>
         <button data-page="results"><span class="nav-title">采集结果</span></button>
@@ -122,7 +122,7 @@
             <div><b>④ 完整视频归档</b><p>媒体选“下载完整视频”。音频和视频流可断点续传，有 ffmpeg 时自动合并 MP4。</p></div>
             <div><b>⑤ 图片 OCR</b><p>开启“动态图片 OCR”。图片会先校正方向和尺寸，再输出正文、置信度和文字坐标。</p></div>
             <div><b>⑦ Whisper / OCR 算力</b><p>完整归档和文字研究可以选本机，或把音频和动态图片送到已激活的云端 GPU 工作机。这不是第四种档案类型。</p></div>
-            <div><b>⑧ 四种采集别混用</b><p><strong>按 UP 主</strong>：整库归档指定账号。<strong>学术滚雪球</strong>：从种子沿相关推荐扩，过门禁才写入 <code>corpus.db</code>。<strong>关键词采样</strong>：全站搜索关键词，按标题/时间/互动门禁后采集。<strong>按视频号</strong>：只处理你粘贴的 BV，不扩散、不过门禁。中断后都用「续跑选中任务」，不要另开新任务号。</p></div>
+            <div><b>⑧ 四种采集别混用</b><p><strong>按 UP 主</strong>：整库归档指定账号。<strong>学术滚雪球</strong>：从种子沿相关推荐扩，过门禁才写入 <code>corpus.db</code>。<strong>关键词采样</strong>：全站搜索同一组关键词，导出带标题的 BV 列表，并可按同样时间窗采集动态；不自动转写。<strong>按视频号</strong>：把筛过的 BV 贴进来采评论、弹幕、Whisper。中断后都用「续跑选中任务」，不要另开新任务号。</p></div>
           </div>
         </article>
 
@@ -132,7 +132,7 @@
             <ul>
               <li>WBI 签名 + <code>buvid3</code> + <code>bili_ticket</code></li>
               <li>真实浏览器 UA / Referer，关闭系统代理干扰</li>
-              <li>请求间隔随机抖动；遇到 -412 / -352 指数退避</li>
+              <li>请求间隔随机抖动（默认约 1.0–2.1 秒）；搜索翻页额外 1–2 秒；遇到 -412 / -352 指数退避</li>
               <li>单账号串行，失败单项记错继续下一个</li>
               <li>默认不要把间隔调到 0.2 秒以下</li>
             </ul>
@@ -521,9 +521,9 @@
       <section id="page-keyword" class="page" hidden>
         <article class="card">
           <p class="step-kicker">关键词采样</p>
-          <h3>全站搜索 → 门禁 → 转写 / 评论 / 弹幕</h3>
-          <p>按关键词走 B 站搜索接口发现视频（不是相关推荐）。可设发布时间起止、标题硬约束，以及播放 / 点赞 / 弹幕 / 评论等门禁；通过后按需采集台词、评论树与弹幕。适合「八小时工作制」这类短时间窗热点议题。</p>
-          <p class="hint">写入分析库的 <code>discovery=keyword</code>。中断后选同一任务续跑，会跳过已完成的搜索入队阶段，继续采队列里剩下的 BV。</p>
+          <h3>全站搜索 → 导出 BV 列表 / 采集动态</h3>
+          <p>同一组关键词分别搜<strong>视频</strong>和<strong>动态</strong>。视频过标题、时间、互动门禁后只导出带标题的列表，<strong>不自动转写</strong>。动态与视频共用时间窗，但用单独的点赞/评论/转发门槛，命中的照单采集（正文、图片 OCR、评论）。筛完标题后，把 <code>bvids.txt</code> 贴进「按视频号采集」。</p>
+          <p class="hint">结果在 <code>data/exports/keyword_任务号/</code>。两个勾选可只出列表、只爬动态，或两项都做。中断后选同一任务续跑。</p>
         </article>
 
         <article class="card">
@@ -554,9 +554,9 @@
               </select>
             </label>
             <label>每词最多翻页<input id="kw-pages" type="number" min="1" max="50" value="30" /></label>
-            <label>采集上限（通过门禁）<input id="kw-nodes" type="number" min="1" max="1000" value="200" /></label>
+            <label>视频列表上限<input id="kw-nodes" type="number" min="1" max="1000" value="200" /></label>
           </div>
-          <p class="hint">结束日期留空表示直到现在。搜索页之间会自动限速；上限是「通过门禁并采集」的条数，不是搜索命中总数。</p>
+          <p class="hint">结束日期留空表示直到现在。搜索页之间会自动限速。上限只约束导出的视频条数；动态在时间窗内照单采集（另有安全上限）。</p>
         </article>
 
         <article class="card">
@@ -583,11 +583,26 @@
 
         <article class="card">
           <p class="step-kicker">步骤 3</p>
-          <h3>采什么</h3>
+          <h3>本轮做什么</h3>
           <div class="checks">
-            <label class="choice-card selected"><input type="checkbox" id="kw-transcript" checked /> 采集视频转写（字幕 / Whisper）</label>
-            <label class="choice-card selected"><input type="checkbox" id="kw-comments" checked /> 采集评论</label>
-            <label class="choice-card"><input type="checkbox" id="kw-danmaku" /> 采集弹幕</label>
+            <label class="choice-card selected"><input type="checkbox" id="kw-export-videos" checked /> 导出视频列表（BV + 标题，不转写）</label>
+            <label class="choice-card selected"><input type="checkbox" id="kw-crawl-dyn" checked /> 采集匹配动态（全站搜索动态）</label>
+          </div>
+          <p class="hint">可以只出列表、只爬动态，或两项都勾。视频转写请到「按视频号采集」贴 <code>bvids.txt</code>。</p>
+        </article>
+
+        <article class="card" id="kw-dyn-card">
+          <p class="step-kicker">步骤 4</p>
+          <h3>动态门槛与采集</h3>
+          <p class="muted">动态不套用视频标题词。时间窗与步骤 1 相同。门槛全 0 即时间窗内照单全收。</p>
+          <div class="grid-3" style="margin-top:8px">
+            <label>动态最低点赞<input id="kw-dyn-likes" type="number" min="0" value="0" /></label>
+            <label>动态最低评论<input id="kw-dyn-comments" type="number" min="0" value="0" /></label>
+            <label>动态最低转发<input id="kw-dyn-forwards" type="number" min="0" value="0" /></label>
+          </div>
+          <div class="checks" style="margin-top:12px">
+            <label class="choice-card selected"><input type="checkbox" id="kw-comments" checked /> 采集动态评论</label>
+            <label class="choice-card selected"><input type="checkbox" id="kw-ocr" checked /> 动态图片 OCR</label>
           </div>
           <div class="grid-3" style="margin-top:12px">
             <label>评论结构
@@ -597,76 +612,21 @@
               </select>
             </label>
             <label>评论最大页数（0=全部）<input id="kw-comment-pages" type="number" min="0" max="200" value="0" /></label>
-          </div>
-          <p class="hint">「评论树」会展开楼中楼，适合话语分析；「仅一级」更快、更省。页数 0 表示按设置里的默认翻完。</p>
-        </article>
-
-        <article class="card" id="kw-transcribe-card">
-          <p class="step-kicker">步骤 4</p>
-          <h3>转写与算力</h3>
-          <div class="choice-grid" id="kw-transcribe-choices">
-            <label class="choice-card">
-              <input type="radio" name="kw-transcribe-mode" value="official" />
-              <span><strong>只取官方字幕</strong><small>不下载音频。没有字幕就空着。</small></span>
-            </label>
-            <label class="choice-card selected">
-              <input type="radio" name="kw-transcribe-mode" value="official_then_whisper" checked />
-              <span><strong>官方字幕 + Whisper 兜底</strong><small>推荐。适合热点讨论口播。</small></span>
-              <em>推荐</em>
-            </label>
-            <label class="choice-card">
-              <input type="radio" name="kw-transcribe-mode" value="whisper" />
-              <span><strong>全部 Whisper</strong><small>口径统一，更慢。</small></span>
+            <label>OCR 算力
+              <select id="kw-compute-backend">
+                <option value="local" selected>本机 RapidOCR</option>
+                <option value="cloud">云端 GPU</option>
+              </select>
             </label>
           </div>
-          <div class="choice-grid" id="kw-media-choices" style="margin-top:12px">
-            <label class="choice-card">
-              <input type="radio" name="kw-media-mode" value="link" />
-              <span><strong>不下载媒体</strong><small>只能拿官方字幕。</small></span>
-            </label>
-            <label class="choice-card selected">
-              <input type="radio" name="kw-media-mode" value="audio" checked />
-              <span><strong>下载音频</strong><small>给 Whisper 用。</small></span>
-              <em>推荐</em>
-            </label>
-            <label class="choice-card">
-              <input type="radio" name="kw-media-mode" value="video" />
-              <span><strong>下载完整视频</strong><small>占空间。</small></span>
-            </label>
-          </div>
-          <div class="choice-grid" id="kw-keep-choices" style="margin-top:12px">
-            <label class="choice-card selected">
-              <input type="radio" name="kw-media-keep" value="delete_after_text" checked />
-              <span><strong>提取后删除媒体</strong><small>留下转写、评论、弹幕。</small></span>
-              <em>推荐</em>
-            </label>
-            <label class="choice-card">
-              <input type="radio" name="kw-media-keep" value="upload_then_delete" />
-              <span><strong>先传 Google Drive 再删</strong><small>需先配置 rclone。</small></span>
-            </label>
-            <label class="choice-card">
-              <input type="radio" name="kw-media-keep" value="keep" />
-              <span><strong>媒体留在本机</strong></span>
-            </label>
-          </div>
-          <div class="choice-grid" id="kw-compute-choices" style="margin-top:12px">
-            <label class="choice-card">
-              <input type="radio" name="kw-compute-backend" value="local" />
-              <span><strong>Whisper 跑本机</strong></span>
-            </label>
-            <label class="choice-card selected">
-              <input type="radio" name="kw-compute-backend" value="cloud" checked />
-              <span><strong>Whisper 跑云端 GPU</strong><small>先到设置接入 AutoDL。</small></span>
-              <em>推荐</em>
-            </label>
-          </div>
+          <p class="hint">「评论树」会展开楼中楼。本机 OCR 不必接 AutoDL。</p>
         </article>
 
         <article class="card launch-card">
           <div>
             <p class="step-kicker">确认任务</p>
             <h3>开始或续跑关键词采样</h3>
-            <p class="muted">请先登录。连续风控会停在队列里；用续跑接着同一任务号。</p>
+            <p class="muted">请先登录。本轮只出列表和/或动态，不自动转写。连续风控会停住；用续跑接着同一任务号。</p>
             <div class="resume-box">
               <label for="keyword-resume-pick">续跑哪一次</label>
               <select id="keyword-resume-pick"></select>
@@ -685,8 +645,8 @@
         <article class="card">
           <p class="step-kicker">按视频号采集</p>
           <h3>只处理你列出的 BV，不再扩散</h3>
-          <p>这不是按 UP 主整库，也不是滚雪球：不会扩相关推荐，也不过门禁。每一条 BV 下载视频、转写（官方字幕，没有再 Whisper），没有人声才 2 秒抽帧 OCR。适合补漏、重跑某一批视频。进度在「运行监控」。</p>
-          <p class="hint">先停掉旧卡、新开实例，到「设置与登录」一键接入 AutoDL，确认 GPU 工作机就绪后再点开始。</p>
+          <p>把关键词采样导出的 <code>bvids.txt</code>、或任何 BV 列表贴进来。不过门禁、不扩推荐。可采评论、弹幕、官方字幕 + Whisper，无声画面再 OCR。云端默认 GPU 直拉音频；SFTP 只作备选。Google Drive 上传仍可用。</p>
+          <p class="hint">云端 Whisper 请先到「设置与登录」接入 AutoDL。空间策略选「上传云盘后删除」时需配好 rclone。</p>
         </article>
         <article class="card">
           <div class="row-between">
@@ -695,21 +655,83 @@
           </div>
           <label for="transcribe-bvids">BV 号或视频链接，一行一个也可混排</label>
           <textarea id="transcribe-bvids" rows="10" placeholder="BV1xxxxxxxx&#10;https://www.bilibili.com/video/BV1yyyyyyyyyy"></textarea>
-          <p class="hint" id="transcribe-missing-hint">上方按钮会填入学术滚雪球里过门但还没有台词的视频。这是新开一批 BV，不是续跑旧任务。</p>
+          <p class="hint" id="transcribe-missing-hint">上方按钮会填入分析库里过门但还没有台词的视频。这是新开一批 BV，不是续跑旧任务。</p>
         </article>
         <article class="card">
-          <h3>怎么转</h3>
-          <div class="choice-grid">
+          <p class="step-kicker">步骤 2</p>
+          <h3>采集模块</h3>
+          <div class="checks">
+            <label class="choice-card selected"><input type="checkbox" id="tr-comments" checked /> 采集评论（含楼中楼）</label>
+            <label class="choice-card"><input type="checkbox" id="tr-danmaku" /> 采集弹幕</label>
+            <label class="choice-card selected"><input type="checkbox" id="tr-ocr" checked /> 无声画面 OCR</label>
+          </div>
+          <div class="grid-3" style="margin-top:12px">
+            <label>评论结构
+              <select id="tr-comment-mode">
+                <option value="tree" selected>评论树（热评 + 楼中楼）</option>
+                <option value="list">仅一级评论列表</option>
+              </select>
+            </label>
+            <label>评论最大页数（0=全部）<input id="tr-comment-pages" type="number" min="0" max="200" value="0" /></label>
+          </div>
+        </article>
+        <article class="card">
+          <p class="step-kicker">步骤 3</p>
+          <h3>转写与媒体</h3>
+          <div class="choice-grid" id="tr-transcribe-choices">
+            <label class="choice-card">
+              <input type="radio" name="tr-transcribe-mode" value="official" />
+              <span><strong>只取官方字幕</strong><small>不跑 Whisper。</small></span>
+            </label>
             <label class="choice-card selected">
               <input type="radio" name="tr-transcribe-mode" value="official_then_whisper" checked />
-              <span><strong>官方字幕 + Whisper + 画面 OCR</strong><small>默认。无声 PPT/录屏会抽帧识别并去掉重复幻灯片。</small></span>
+              <span><strong>官方字幕 + Whisper 兜底</strong><small>无声 PPT 再走画面 OCR。</small></span>
               <em>推荐</em>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="tr-transcribe-mode" value="whisper" />
+              <span><strong>全部 Whisper</strong><small>口径统一，更慢。</small></span>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="tr-transcribe-mode" value="none" />
+              <span><strong>不转写</strong><small>只采评论 / 弹幕 / 元数据。</small></span>
+            </label>
+          </div>
+          <div class="choice-grid" id="tr-media-choices" style="margin-top:12px">
+            <label class="choice-card">
+              <input type="radio" name="tr-media-mode" value="link" />
+              <span><strong>不下载媒体</strong><small>只能拿官方字幕。</small></span>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="tr-media-mode" value="audio" />
+              <span><strong>下载音频</strong><small>给 Whisper 用。</small></span>
+            </label>
+            <label class="choice-card selected">
+              <input type="radio" name="tr-media-mode" value="video" checked />
+              <span><strong>下载完整视频</strong><small>画面 OCR 需要。</small></span>
+              <em>推荐</em>
+            </label>
+          </div>
+          <div class="choice-grid" id="tr-keep-choices" style="margin-top:12px">
+            <label class="choice-card">
+              <input type="radio" name="tr-media-keep" value="delete_after_text" />
+              <span><strong>提取后删除媒体</strong><small>留下转写、评论、弹幕。</small></span>
+            </label>
+            <label class="choice-card selected">
+              <input type="radio" name="tr-media-keep" value="upload_then_delete" checked />
+              <span><strong>先传 Google Drive 再删</strong><small>需先配置 rclone。</small></span>
+              <em>推荐</em>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="tr-media-keep" value="keep" />
+              <span><strong>媒体留在本机</strong></span>
             </label>
           </div>
           <div class="choice-grid" style="margin-top:12px">
             <label class="choice-card selected">
               <input type="radio" name="tr-compute-backend" value="cloud" checked />
-              <span><strong>云端 GPU</strong><small>large-v3。必须先接入 AutoDL。</small></span>
+              <span><strong>云端 GPU</strong><small>GPU 直拉音频；SFTP 备选。</small></span>
+              <em>推荐</em>
             </label>
             <label class="choice-card">
               <input type="radio" name="tr-compute-backend" value="local" />
@@ -1004,6 +1026,6 @@
     </main>
   </div>
     <div id="toast" role="status" aria-live="polite"></div>
-  <script src="/static/app.js?v=20261004c"></script>
+  <script src="/static/app.js?v=20261005a"></script>
 </body>
 </html>

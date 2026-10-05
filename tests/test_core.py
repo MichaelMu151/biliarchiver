@@ -172,6 +172,48 @@ class NotifyTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("尚未填写", message)
 
+    def test_gpu_worker_ready_rejects_incompatible_pyav(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from bili.gpu_remote import gpu_worker_ready
+
+        class FakeResp:
+            status_code = 200
+
+            def json(self) -> dict:
+                return {
+                    "ok": True,
+                    "whisper": True,
+                    "av_ok": False,
+                    "av": "av 19.0.1 不接受 metadata_errors",
+                    "ocr": True,
+                    "device": "cuda",
+                }
+
+        fake = MagicMock()
+        fake.get.return_value = FakeResp()
+        fake.__enter__.return_value = fake
+        fake.__exit__.return_value = False
+        with patch("bili.gpu_remote.httpx.Client", return_value=fake):
+            ok, message = gpu_worker_ready("http://127.0.0.1:6006", "token")
+        self.assertFalse(ok)
+        self.assertIn("PyAV", message)
+
+    def test_whisper_pins_reject_pyav_19(self) -> None:
+        from bili.autodl import REMOTE_PULL_PY
+        from bili.paths import ROOT
+        from bili.transcribe import pyav_whisper_compatible
+
+        text = (ROOT / "requirements-ai.txt").read_text(encoding="utf-8")
+        gpu = (ROOT / "requirements-gpu-windows.txt").read_text(encoding="utf-8")
+        self.assertIn("av>=12.0.0,<19", text)
+        self.assertIn("faster-whisper==1.2.1", text)
+        self.assertIn("av>=12.0.0,<19", gpu)
+        self.assertIn('"2400"', REMOTE_PULL_PY)
+        ok, detail = pyav_whisper_compatible()
+        self.assertIsInstance(ok, bool)
+        self.assertTrue(detail)
+
     def test_parses_autodl_ssh_command(self) -> None:
         from bili.autodl import parse_ssh_command
 
@@ -683,6 +725,100 @@ class KeywordSampleTests(unittest.TestCase):
         ok, reason, _ = evaluate_keyword_gate(hit_low, cfg, stage="listing")
         self.assertFalse(ok)
         self.assertEqual(reason, "min_views")
+
+    def test_dynamic_gate_uses_separate_thresholds_and_shared_dates(self) -> None:
+        from bili.keyword_sample import KeywordSampleConfig, evaluate_dynamic_gate, normalize_dynamic_search_hit
+        from bili.util import parse_date_boundary
+
+        begin = parse_date_boundary("2026-09-01")
+        cfg = KeywordSampleConfig(
+            job_id="t",
+            date_from="2026-09-01",
+            dyn_min_likes=10,
+            dyn_min_comments=2,
+            dyn_min_forwards=0,
+        )
+        hit = normalize_dynamic_search_hit(
+            {
+                "id": "1234567890",
+                "uid": "1",
+                "uname": "tester",
+                "content": "<em>八小时</em>工时讨论",
+                "ctime": begin + 86400,
+                "like": 20,
+                "comment": 5,
+                "retweet": 1,
+            },
+            keyword="八小时",
+        )
+        ok, reason, _ = evaluate_dynamic_gate(hit, cfg)
+        self.assertTrue(ok, reason)
+        self.assertEqual(hit["dyn_id"], "1234567890")
+        self.assertIn("八小时", hit["text"])
+
+        cold = dict(hit)
+        cold["likes"] = 1
+        ok, reason, _ = evaluate_dynamic_gate(cold, cfg)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "dyn_min_likes")
+
+        old = dict(hit)
+        old["pub_ts"] = begin - 10
+        ok, reason, _ = evaluate_dynamic_gate(old, cfg)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "too_old")
+
+    def test_keyword_defaults_are_list_export_not_transcribe(self) -> None:
+        from bili.keyword_sample import KeywordSampleConfig
+
+        cfg = KeywordSampleConfig(job_id="t")
+        self.assertTrue(cfg.export_video_list)
+        self.assertTrue(cfg.crawl_dynamics)
+        self.assertEqual(cfg.transcribe_mode, "none")
+        self.assertEqual(cfg.media_mode, "link")
+
+    def test_keyword_catalog_keeps_titles_and_bvids(self) -> None:
+        from bili.export import write_keyword_catalog
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "keyword_x"
+            write_keyword_catalog(
+                out,
+                "abc123",
+                keywords=["八小时"],
+                videos=[
+                    {
+                        "bvid": "BV1TEST12345",
+                        "title": "聊聊八小时工作制",
+                        "author_name": "up",
+                        "views": 100,
+                        "likes": 3,
+                        "replies": 2,
+                        "pubdate_iso": "2026-09-02",
+                        "page_url": "https://www.bilibili.com/video/BV1TEST12345",
+                    }
+                ],
+            )
+            bvids = (out / "bvids.txt").read_text(encoding="utf-8")
+            md = (out / "videos.md").read_text(encoding="utf-8")
+            self.assertIn("BV1TEST12345", bvids)
+            self.assertIn("聊聊八小时工作制", md)
+            self.assertIn("不自动转写", md)
+
+    def test_cloud_whisper_prefers_gpu_pull_then_sftp(self) -> None:
+        import inspect
+
+        from bili.gpu_remote import transcribe_remote
+        from bili.transcribe import build_transcript
+
+        src = inspect.getsource(build_transcript)
+        pull = src.find("await transcribe_remote_from_bili")
+        sftp = src.find("await transcribe_remote(")
+        self.assertGreaterEqual(pull, 0)
+        self.assertGreater(sftp, pull)
+        remote_src = inspect.getsource(transcribe_remote)
+        self.assertIn("ssh_transcribe_audio", remote_src)
+        self.assertIn("session_alive", remote_src)
 
     def test_autodl_channels_are_disjoint(self) -> None:
         from bili.autodl import channel_catalog, normalize_autodl_role

@@ -23,7 +23,7 @@ from bili.export import (
 from bili.gpu_remote import whisper_model_for_backend
 from bili.labor_lexicon import match_labor
 from bili.media import fetch_media
-from bili.ocr import OCR_FRAME_INTERVAL, collect_images_and_ocr, transcribe_video_ocr
+from bili.ocr import OCR_FRAME_INTERVAL, collect_images_and_ocr, transcribe_video_ocr, video_ocr_enabled
 from bili.paths import EXPORT_DIR, LIBRARY_DIR, ensure_dirs
 from bili.pipeline import PipelineState
 from bili.settings import AppSettings
@@ -108,6 +108,8 @@ def extract_dynamic(item: dict[str, Any]) -> dict[str, Any]:
         jump = f"https://t.bilibili.com/{dyn_id}"
     return {
         "dyn_id": dyn_id,
+        "mid": str(author.get("mid") or ""),
+        "author_name": str(author.get("name") or ""),
         "dyn_type": item.get("type") or "",
         "pub_ts": int(author.get("pub_ts") or 0),
         "text": text.strip(),
@@ -1229,6 +1231,7 @@ class Crawler:
                 if (
                     not transcript_has_text(part_transcript)
                     and config.transcribe_mode in {"whisper", "official_then_whisper"}
+                    and video_ocr_enabled()
                 ):
                     video_path = media_info.get("local_video") or ""
                     if not video_path or not Path(video_path).is_file():
@@ -1264,6 +1267,12 @@ class Crawler:
                         if transcript_has_text(ocr_transcript):
                             _write_transcript_outputs(part_folder, ocr_transcript)
                             part_transcript = ocr_transcript
+                elif (
+                    not transcript_has_text(part_transcript)
+                    and config.transcribe_mode in {"whisper", "official_then_whisper"}
+                    and not video_ocr_enabled()
+                ):
+                    self.on_log("warn", f"Whisper 无结果，已跳过画面 OCR {bvid}（稍后补跑）")
                 part_pipeline.mark(
                     "transcript",
                     transcript_signature,

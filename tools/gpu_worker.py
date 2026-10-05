@@ -20,7 +20,13 @@ from fastapi.responses import JSONResponse
 
 from bili.ocr import _run_ocr, ocr_available
 from bili.runtime import probe_compute
-from bili.transcribe import transcribe_local, warmup_whisper, whisper_available, whisper_loaded_key
+from bili.transcribe import (
+    pyav_whisper_compatible,
+    transcribe_local,
+    warmup_whisper,
+    whisper_available,
+    whisper_loaded_key,
+)
 
 app = FastAPI(title="BiliArchiver GPU Worker", version="1.0.0")
 WORKER_TOKEN = ""
@@ -41,9 +47,12 @@ def _check_token(authorization: str | None) -> None:
 async def health(authorization: str | None = Header(default=None)) -> dict:
     _check_token(authorization)
     gpu = probe_compute()
+    av_ok, av_detail = pyav_whisper_compatible()
     return {
         "ok": True,
         "whisper": whisper_available(),
+        "av_ok": av_ok,
+        "av": av_detail,
         "ocr": ocr_available(),
         "device": gpu.get("device") or "cpu",
         "gpu_name": gpu.get("gpu_name") or "",

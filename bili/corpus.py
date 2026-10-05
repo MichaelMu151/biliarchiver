@@ -867,6 +867,14 @@ class Corpus:
 
     # -- dynamics / transcripts --------------------------------------------
 
+    def has_dynamic(self, dyn_id: str) -> bool:
+        key = str(dyn_id or "").strip()
+        if not key:
+            return False
+        with self.connect() as conn:
+            row = conn.execute("SELECT 1 FROM dynamics WHERE dyn_id=? LIMIT 1", (key,)).fetchone()
+        return bool(row)
+
     def upsert_dynamic(
         self,
         dyn: dict[str, Any],

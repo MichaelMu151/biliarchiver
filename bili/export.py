@@ -342,3 +342,101 @@ def _rel(base: Path, target: str | None) -> str:
         return str(Path(target).resolve().relative_to(base.resolve()))
     except Exception:
         return target
+
+
+def write_keyword_catalog(
+    out_dir: Path,
+    job_id: str,
+    *,
+    keywords: list[str],
+    videos: list[dict[str, Any]],
+    dynamics: list[dict[str, Any]] | None = None,
+) -> Path:
+    """Export keyword-discovery results for screening: BV+title list, optional dynamics."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    video_fields = [
+        "bvid",
+        "title",
+        "author_name",
+        "mid",
+        "pubdate_iso",
+        "duration",
+        "views",
+        "likes",
+        "replies",
+        "danmaku",
+        "tname",
+        "keyword",
+        "page_url",
+        "description_short",
+    ]
+    vid_path = out_dir / "videos.csv"
+    with vid_path.open("w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.DictWriter(fh, fieldnames=video_fields)
+        writer.writeheader()
+        for row in videos:
+            writer.writerow({key: row.get(key, "") for key in video_fields})
+
+    bvid_path = out_dir / "bvids.txt"
+    write_text(bvid_path, "\n".join(str(row.get("bvid") or "") for row in videos if row.get("bvid")) + ("\n" if videos else ""))
+
+    md_lines = [
+        f"# 关键词采样列表 · 任务 {job_id}",
+        "",
+        f"关键词：{' / '.join(keywords) if keywords else '（无）'}",
+        "",
+        "本目录**只导出候选列表**，不自动转写。把 `bvids.txt` 贴进「按视频号采集」即可补评论、弹幕、Whisper。",
+        "",
+        f"视频候选 **{len(videos)}** 条。",
+        "",
+        "| BV | 标题 | UP | 播放 | 点赞 | 评论 | 日期 |",
+        "| --- | --- | --- | ---: | ---: | ---: | --- |",
+    ]
+    for row in videos:
+        title = str(row.get("title") or "").replace("|", "\\|")
+        author = str(row.get("author_name") or "").replace("|", "\\|")
+        bvid = str(row.get("bvid") or "")
+        url = row.get("page_url") or (f"https://www.bilibili.com/video/{bvid}" if bvid else "")
+        md_lines.append(
+            f"| [{bvid}]({url}) | {title} | {author} | {row.get('views') or 0} | "
+            f"{row.get('likes') or 0} | {row.get('replies') or 0} | {row.get('pubdate_iso') or ''} |"
+        )
+    write_text(out_dir / "videos.md", "\n".join(md_lines) + "\n")
+
+    dyn_rows = list(dynamics or [])
+    if dyn_rows:
+        dyn_fields = [
+            "dyn_id",
+            "mid",
+            "author_name",
+            "pub_time_iso",
+            "text",
+            "like",
+            "comment",
+            "forward",
+            "picture_count",
+            "keyword",
+            "jump_url",
+        ]
+        with (out_dir / "dynamics.csv").open("w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.DictWriter(fh, fieldnames=dyn_fields)
+            writer.writeheader()
+            for row in dyn_rows:
+                writer.writerow({key: row.get(key, "") for key in dyn_fields})
+
+    readme = f"""# 关键词采样 · 任务 {job_id}
+
+关键词：{' / '.join(keywords) if keywords else '（无）'}
+
+| 文件 | 内容 |
+| --- | --- |
+| `videos.csv` | 过视频门禁的候选：BV、标题、UP、互动数 |
+| `videos.md` | 同一份，方便在编辑器里筛选 |
+| `bvids.txt` | 只有 BV 号，可直接贴进「按视频号采集」 |
+| `dynamics.csv` | 过动态门禁并已采集的动态（若勾选了爬动态） |
+
+本任务**不自动开转写**。筛完标题后，用 `bvids.txt` 开「按视频号采集」。
+"""
+    write_text(out_dir / "README.md", readme)
+    write_json(out_dir / "videos.json", videos)
+    return out_dir

@@ -83,9 +83,17 @@ def gpu_worker_ready(url: str, token: str = "", timeout: float = 6.0) -> tuple[b
     whisper = data.get("whisper")
     if whisper is False:
         return False, "工作机没有 faster-whisper，请在 GPU 机器执行 pip install -r requirements-ai.txt"
+    if data.get("av_ok") is False:
+        return False, (
+            "工作机 PyAV 与 faster-whisper 不兼容"
+            + (f"（{data.get('av')}）" if data.get("av") else "")
+            + "。请重新接入采集转写通道，会自动把 av 钉到 <19。"
+        )
     device = data.get("device") or "unknown"
     ocr = "OCR 可用" if data.get("ocr") else "OCR 未装"
-    return True, f"已连接 {base} · 设备 {device} · {ocr}"
+    av = data.get("av") or ""
+    av_note = f" · av {av}" if av and data.get("av_ok") else ""
+    return True, f"已连接 {base} · 设备 {device} · {ocr}{av_note}"
 
 
 def local_app_url() -> str:
@@ -162,16 +170,42 @@ async def transcribe_remote(
     language: str,
     on_log,
 ) -> dict[str, Any]:
-    base = normalize_worker_url(url)
-    if not base:
-        raise RuntimeError("未配置 GPU 工作机地址")
+    """SFTP fallback: copy audio over the live SSH, then curl the worker on GPU localhost.
+
+    Prefer ``transcribe_remote_from_bili`` (GPU pulls from Bilibili). This path is
+    only used when the direct pull failed and a local audio file already exists.
+    HTTP to the Mac's tunnel URL is last-resort: that port often goes stale.
+    """
     path = Path(audio_path)
     if not path.is_file():
         raise RuntimeError("没有可上传的本地音频")
-    on_log("info", f"经已有 AutoDL 隧道传音频：{path.name} ({path.stat().st_size} 字节)")
+
+    def emit(message: str, level: str = "info") -> None:
+        on_log(level, message)
+
+    from bili.autodl import SESSION, session_alive, ssh_transcribe_audio
+
+    if session_alive():
+        emit(f"SFTP 备选：经已有 SSH 传 {path.name}，在 GPU 本机转写（不走本机隧道）")
+        data = await asyncio.to_thread(
+            ssh_transcribe_audio,
+            SESSION.client,
+            path,
+            token,
+            model,
+            language,
+            emit,
+        )
+        data["status"] = "done"
+        return data
+
+    base = normalize_worker_url(url)
+    if not base:
+        raise RuntimeError("未配置 GPU 工作机地址，且 AutoDL SSH 未接入")
+    emit(f"SSH 未接入，经本机隧道传音频：{path.name} ({path.stat().st_size} 字节)")
     remote_path = await asyncio.to_thread(_sftp_put_audio, path, on_log)
-    on_log("info", f"已传到工作机，开始转写 {path.name}")
-    timeout = httpx.Timeout(30.0, read=1200.0, write=60.0, pool=30.0)
+    emit(f"已传到工作机，开始转写 {path.name}")
+    timeout = httpx.Timeout(30.0, read=2400.0, write=60.0, pool=30.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         response = await client.post(
             f"{base}/v1/transcribe_path",

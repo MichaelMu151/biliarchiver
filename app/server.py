@@ -724,7 +724,11 @@ class TranscribeJobIn(BaseModel):
     media_keep: str = "upload_then_delete"
     resume: bool = True
     compute_backend: str = "cloud"
-    crawl_comments: bool = False
+    crawl_comments: bool = True
+    comment_with_replies: bool = True
+    comment_max_pages: int = 0
+    crawl_danmaku: bool = False
+    ocr_enabled: bool = True
     attach_run_id: str = ""
 
 
@@ -772,7 +776,7 @@ async def create_transcribe_job(body: TranscribeJobIn) -> dict[str, Any]:
     transcribe_mode, compute_backend = resolve_compute(body.transcribe_mode, body.compute_backend)
     if transcribe_mode in LOCAL_WHISPER and body.media_mode not in {"audio", "video"}:
         raise HTTPException(400, "语音识别需要音频：请把媒体策略改为“下载音频”或“下载视频”")
-    if needs_remote_models(transcribe_mode, compute_backend, True):
+    if needs_remote_models(transcribe_mode, compute_backend, bool(body.ocr_enabled)):
         settings_now = load_settings()
         ok, message = gpu_worker_ready(settings_now.gpu_worker_url, settings_now.gpu_worker_token)
         if not ok:
@@ -784,6 +788,8 @@ async def create_transcribe_job(body: TranscribeJobIn) -> dict[str, Any]:
         ok, message = rclone_drive_ready(settings_now.rclone_remote)
         if not ok:
             raise HTTPException(400, message)
+    if body.comment_max_pages < 0 or body.comment_max_pages > 200:
+        raise HTTPException(400, "评论页数请放在 0–200（0=全部）")
     job_id = uuid.uuid4().hex[:12]
     settings = load_settings()
     config = {
@@ -805,13 +811,15 @@ async def create_transcribe_job(body: TranscribeJobIn) -> dict[str, Any]:
         "time_range": "all",
         "seeds_per_uid": 0,
         "crawl_comments": bool(body.crawl_comments),
-        "crawl_danmaku": False,
+        "comment_with_replies": bool(body.comment_with_replies),
+        "comment_max_pages": int(body.comment_max_pages or 0),
+        "crawl_danmaku": bool(body.crawl_danmaku),
         "transcribe_mode": transcribe_mode,
         "media_mode": body.media_mode,
         "media_keep": body.media_keep,
         "resume": bool(body.resume),
         "compute_backend": compute_backend,
-        "ocr_enabled": True,
+        "ocr_enabled": bool(body.ocr_enabled),
         "attach_run_id": (body.attach_run_id or "").strip(),
         "rclone_remote": settings.rclone_remote,
         "rclone_root": settings.rclone_root,
@@ -841,16 +849,17 @@ class KeywordJobIn(BaseModel):
     min_engagement: float = 0.0
     category_allow: str = ""
     category_deny: str = "游戏,动画,番剧,国创,音乐,舞蹈,影视,娱乐,鬼畜,运动,汽车,时尚,美食,搞笑"
+    export_video_list: bool = True
+    crawl_dynamics: bool = True
+    dyn_min_likes: int = 0
+    dyn_min_comments: int = 0
+    dyn_min_forwards: int = 0
     crawl_comments: bool = True
     comment_with_replies: bool = True
     comment_max_pages: int = 0
-    crawl_danmaku: bool = False
-    crawl_transcript: bool = True
-    transcribe_mode: str = "official_then_whisper"
-    media_mode: str = "audio"
-    media_keep: str = "delete_after_text"
+    ocr_enabled: bool = True
     resume: bool = True
-    compute_backend: str = "cloud"
+    compute_backend: str = "local"
 
 
 @app.post("/api/jobs/keyword")
@@ -865,31 +874,21 @@ async def create_keyword_job(body: KeywordJobIn) -> dict[str, Any]:
     if int(body.duration) not in {0, 1, 2, 3, 4}:
         raise HTTPException(400, "时长筛选项无效")
     if body.max_nodes < 1 or body.max_nodes > 1000:
-        raise HTTPException(400, "采集上限请放在 1–1000")
+        raise HTTPException(400, "列表上限请放在 1–1000")
     if body.max_pages_per_keyword < 1 or body.max_pages_per_keyword > 50:
         raise HTTPException(400, "每个关键词翻页上限请放在 1–50")
     if body.comment_max_pages < 0 or body.comment_max_pages > 200:
         raise HTTPException(400, "评论页数请放在 0–200（0=全部）")
-    if body.media_mode not in {"none", "link", "audio", "video"}:
-        raise HTTPException(400, "媒体策略无效")
-    transcribe_mode = body.transcribe_mode if body.crawl_transcript else "none"
-    if transcribe_mode not in TRANSCRIBE_MODES:
-        raise HTTPException(400, "转写策略无效")
-    transcribe_mode, compute_backend = resolve_compute(transcribe_mode, body.compute_backend)
-    if transcribe_mode in LOCAL_WHISPER and body.media_mode not in {"audio", "video"}:
-        raise HTTPException(400, "语音识别需要音频：请把媒体策略改为“下载音频”或“下载视频”")
-    if needs_remote_models(transcribe_mode, compute_backend, False):
+    if not body.export_video_list and not body.crawl_dynamics:
+        raise HTTPException(400, "请至少勾选「导出视频列表」或「采集动态」")
+    compute_backend = (body.compute_backend or "local").strip() or "local"
+    if compute_backend not in {"local", "cloud"}:
+        compute_backend = "local"
+    if body.crawl_dynamics and body.ocr_enabled and compute_backend == "cloud":
         settings_now = load_settings()
         ok, message = gpu_worker_ready(settings_now.gpu_worker_url, settings_now.gpu_worker_token)
         if not ok:
-            raise HTTPException(400, "请先到设置里接入 AutoDL GPU。\n" + message)
-    if body.media_keep not in KEEP_POLICIES:
-        raise HTTPException(400, "空间策略无效")
-    if body.media_keep == "upload_then_delete":
-        settings_now = load_settings()
-        ok, message = rclone_drive_ready(settings_now.rclone_remote)
-        if not ok:
-            raise HTTPException(400, message)
+            raise HTTPException(400, "云端 OCR 需要先接入 AutoDL GPU。也可改选本机 OCR。\n" + message)
     from bili.util import parse_date_boundary
 
     if body.date_from and parse_date_boundary(body.date_from) is None:
@@ -906,7 +905,9 @@ async def create_keyword_job(body: KeywordJobIn) -> dict[str, Any]:
     config = body.model_dump()
     config["kind"] = "keyword"
     config["keywords"] = keywords
-    config["transcribe_mode"] = transcribe_mode
+    config["transcribe_mode"] = "none"
+    config["media_mode"] = "link"
+    config["media_keep"] = "keep"
     config["compute_backend"] = compute_backend
     config["rclone_remote"] = settings.rclone_remote
     config["rclone_root"] = settings.rclone_root
@@ -1186,7 +1187,9 @@ async def _execute_job(job: JobRuntime) -> None:
             "info",
             "关键词采样启动 · "
             + " / ".join(job.config.get("keywords") or [])
-            + f" · 上限 {job.config.get('max_nodes')}",
+            + f" · 列表上限 {job.config.get('max_nodes')}"
+            + (" · 导出视频列表" if job.config.get("export_video_list", True) else "")
+            + (" · 采集动态" if job.config.get("crawl_dynamics", True) else ""),
         )
         await bark("start", {"uids_total": job.config.get("max_nodes") or 0, "kind": "keyword"})
         sampler = KeywordSampler(
@@ -1217,14 +1220,19 @@ async def _execute_job(job: JobRuntime) -> None:
             min_engagement=float(job.config.get("min_engagement") or 0),
             category_allow=job.config.get("category_allow") or "",
             category_deny=job.config.get("category_deny") or "",
+            export_video_list=bool(job.config.get("export_video_list", True)),
+            crawl_dynamics=bool(job.config.get("crawl_dynamics", True)),
+            dyn_min_likes=int(job.config.get("dyn_min_likes") or 0),
+            dyn_min_comments=int(job.config.get("dyn_min_comments") or 0),
+            dyn_min_forwards=int(job.config.get("dyn_min_forwards") or 0),
             crawl_comments=bool(job.config.get("crawl_comments", True)),
             comment_with_replies=bool(job.config.get("comment_with_replies", True)),
             comment_max_pages=int(job.config.get("comment_max_pages") or 0),
-            crawl_danmaku=bool(job.config.get("crawl_danmaku", False)),
-            transcribe_mode=job.config.get("transcribe_mode") or "official_then_whisper",
-            media_mode=job.config.get("media_mode") or "audio",
-            media_keep=job.config.get("media_keep") or "delete_after_text",
-            ocr_enabled=bool(job.config.get("ocr_enabled", False)),
+            crawl_danmaku=False,
+            transcribe_mode="none",
+            media_mode="link",
+            media_keep=job.config.get("media_keep") or "keep",
+            ocr_enabled=bool(job.config.get("ocr_enabled", True)),
             resume=bool(job.config.get("resume", True)),
             compute_backend=job.config.get("compute_backend") or "local",
             rclone_remote=job.config.get("rclone_remote") or settings.rclone_remote,
@@ -1301,6 +1309,8 @@ async def _execute_job(job: JobRuntime) -> None:
             rclone_remote=job.config.get("rclone_remote") or settings.rclone_remote,
             rclone_root=job.config.get("rclone_root") or settings.rclone_root,
             skip_gate=transcribe_job,
+            comment_max_pages=int(job.config.get("comment_max_pages") or 0),
+            comment_with_replies=bool(job.config.get("comment_with_replies", True)),
         )
         try:
             await academic.run(cfg_ac, on_progress=on_progress)

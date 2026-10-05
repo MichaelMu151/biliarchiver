@@ -1,4 +1,7 @@
 -r requirements.txt
-faster-whisper
+faster-whisper==1.2.1
+# faster-whisper 1.x still calls av.open(..., metadata_errors="ignore").
+# PyAV 19 removed that kwarg (and some 19.x wheels leave av.open broken).
+av>=12.0.0,<19
 rapidocr
 onnxruntime

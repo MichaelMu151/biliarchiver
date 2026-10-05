@@ -1,25 +1,27 @@
-"""Keyword sampling: search → gate → collect (transcript / comments / danmaku).
+"""Keyword sampling: site-wide search → video list export and/or dynamics crawl.
 
-Unlike academic snowball (recommendation graph) or archive-by-UP (full space),
-this lane discovers videos via Bilibili typed search, applies hard title / date
-filters plus engagement gates, then reuses the normal video crawl pipeline.
+Discovery only: does not auto-start Whisper. Paste ``bvids.txt`` into
+「按视频号采集」 after screening titles. Dynamics use the same keywords and
+date window, with a separate engagement gate.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
-from bili.academic import CIRCUIT_LIMIT, extract_tags, split_terms
+from bili.academic import CIRCUIT_LIMIT, split_terms
 from bili.client import RISK_CODES, BiliClient, BiliError
-from bili.corpus import Corpus, FrontierItem
-from bili.crawler import Crawler, JobConfig
-from bili.export import account_dir
-from bili.paths import LIBRARY_DIR
+from bili.corpus import Corpus
+from bili.crawler import Crawler, JobConfig, extract_dynamic
+from bili.export import account_dir, write_keyword_catalog
+from bili.paths import EXPORT_DIR, LIBRARY_DIR
 from bili.settings import AppSettings
-from bili.util import parse_date_boundary, pick, strip_html
+from bili.util import jitter, parse_date_boundary, pick, strip_html, ts_iso
 
 SEARCH_ORDERS = {"totalrank", "pubdate", "click", "dm", "stow", "scores"}
 DURATION_CHOICES = {0, 1, 2, 3, 4}
@@ -47,14 +49,19 @@ class KeywordSampleConfig:
     min_engagement: float = 0.0
     category_allow: str = ""
     category_deny: str = DEFAULT_DENY
-    crawl_comments: bool = True
-    comment_with_replies: bool = True  # False = top-level list only
-    comment_max_pages: int = 0  # 0 = all pages (subject to settings)
+    export_video_list: bool = True
+    crawl_dynamics: bool = True
+    dyn_min_likes: int = 0
+    dyn_min_comments: int = 0
+    dyn_min_forwards: int = 0
+    crawl_comments: bool = True  # dynamics comments when crawl_dynamics
+    comment_with_replies: bool = True
+    comment_max_pages: int = 0
     crawl_danmaku: bool = False
-    transcribe_mode: str = "official_then_whisper"
-    media_mode: str = "audio"
-    media_keep: str = "delete_after_text"
-    ocr_enabled: bool = False
+    transcribe_mode: str = "none"
+    media_mode: str = "link"
+    media_keep: str = "keep"
+    ocr_enabled: bool = True
     resume: bool = True
     compute_backend: str = "local"
     rclone_remote: str = ""
@@ -75,6 +82,34 @@ def parse_keywords(raw: str) -> list[str]:
     return out
 
 
+def _as_int(value: Any, default: int = 0) -> int:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip().replace(",", "")
+    if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+        return int(text)
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_duration_seconds(value: Any) -> int:
+    """Search results use either seconds or ``mm:ss`` / ``hh:mm:ss``."""
+    if isinstance(value, str) and ":" in value:
+        parts = [int(part) for part in value.split(":") if part.strip().isdigit()]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        return 0
+    return _as_int(value)
+
+
 def normalize_search_hit(row: dict[str, Any], *, keyword: str = "") -> dict[str, Any]:
     """Flatten a search-result row into gate-friendly fields."""
     title = strip_html(str(row.get("title") or ""))
@@ -83,21 +118,14 @@ def normalize_search_hit(row: dict[str, Any], *, keyword: str = "") -> dict[str,
     aid = row.get("aid") or row.get("id")
     mid = str(row.get("mid") or "")
     author = str(row.get("author") or "")
-    pubdate = int(row.get("pubdate") or 0)
+    pubdate = _as_int(row.get("pubdate"))
     # Search payload field names vary across API revisions.
-    views = int(row.get("play") or row.get("view") or 0)
-    likes = int(row.get("like") or row.get("likes") or 0)
-    danmaku = int(row.get("video_review") or row.get("danmaku") or 0)
-    replies = int(row.get("review") or row.get("reply") or row.get("comment") or 0)
-    favorites = int(row.get("favorites") or row.get("stow") or 0)
-    duration = int(row.get("duration") or 0)
-    if isinstance(row.get("duration"), str) and ":" in str(row.get("duration")):
-        # Some payloads return "mm:ss" / "hh:mm:ss".
-        parts = [int(p) for p in str(row["duration"]).split(":") if str(p).isdigit()]
-        if len(parts) == 2:
-            duration = parts[0] * 60 + parts[1]
-        elif len(parts) == 3:
-            duration = parts[0] * 3600 + parts[1] * 60 + parts[2]
+    views = _as_int(row.get("play") or row.get("view"))
+    likes = _as_int(row.get("like") or row.get("likes"))
+    danmaku = _as_int(row.get("video_review") or row.get("danmaku"))
+    replies = _as_int(row.get("review") or row.get("reply") or row.get("comment"))
+    favorites = _as_int(row.get("favorites") or row.get("stow"))
+    duration = _as_duration_seconds(row.get("duration"))
     tname = str(row.get("typename") or row.get("tname") or "")
     tid = str(row.get("typeid") or row.get("tid") or "")
     return {
@@ -205,6 +233,91 @@ def evaluate_keyword_gate(
     return True, "pass", checks
 
 
+def normalize_dynamic_search_hit(row: dict[str, Any], *, keyword: str = "") -> dict[str, Any]:
+    """Flatten a twitter/dynamic search row."""
+    dyn_id = str(row.get("id") or row.get("twitter_id") or row.get("dynamic_id") or "").strip()
+    mid = str(row.get("mid") or row.get("uid") or "")
+    uname = strip_html(str(row.get("uname") or row.get("author") or ""))
+    text = strip_html(str(row.get("content") or row.get("title") or row.get("description") or ""))
+    pub_ts = _as_int(row.get("ctime") or row.get("pubdate") or row.get("pub_ts"))
+    likes = _as_int(row.get("like") or row.get("likes"))
+    comments = _as_int(row.get("comment") or row.get("review") or row.get("replies"))
+    forwards = _as_int(row.get("retweet") or row.get("repost") or row.get("forward") or row.get("share"))
+    pics: list[str] = []
+    raw_pic = row.get("twitter_pic") or row.get("cover") or ""
+    if isinstance(raw_pic, str) and raw_pic.strip():
+        pics = [part.strip() for part in raw_pic.split(",") if part.strip()]
+    elif isinstance(raw_pic, list):
+        pics = [str(part) for part in raw_pic if part]
+    return {
+        "dyn_id": dyn_id,
+        "mid": mid,
+        "author_name": uname,
+        "text": text,
+        "pub_ts": pub_ts,
+        "likes": likes,
+        "comments": comments,
+        "forwards": forwards,
+        "pictures": pics,
+        "keyword": keyword,
+        "jump_url": f"https://t.bilibili.com/{dyn_id}" if dyn_id else "",
+        "raw": row,
+    }
+
+
+def evaluate_dynamic_gate(
+    hit: dict[str, Any],
+    config: KeywordSampleConfig,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Time window + separate dynamic engagement. No video title/category gates."""
+    pub_ts = int(hit.get("pub_ts") or 0)
+    likes = int(hit.get("likes") or hit.get("like") or 0)
+    comments = int(hit.get("comments") or hit.get("comment") or 0)
+    forwards = int(hit.get("forwards") or hit.get("forward") or 0)
+    begin = parse_date_boundary(config.date_from, end_of_day=False)
+    end = parse_date_boundary(config.date_to, end_of_day=True)
+    checks = {
+        "dyn_id": hit.get("dyn_id"),
+        "pub_ts": pub_ts,
+        "likes": likes,
+        "comments": comments,
+        "forwards": forwards,
+        "text": str(hit.get("text") or "")[:80],
+    }
+    if begin and pub_ts and pub_ts < begin:
+        return False, "too_old", checks
+    if end and pub_ts and pub_ts > end:
+        return False, "too_new", checks
+    if likes < int(config.dyn_min_likes or 0):
+        return False, "dyn_min_likes", checks
+    if comments < int(config.dyn_min_comments or 0):
+        return False, "dyn_min_comments", checks
+    if forwards < int(config.dyn_min_forwards or 0):
+        return False, "dyn_min_forwards", checks
+    return True, "pass", checks
+
+
+def _catalog_row(hit: dict[str, Any]) -> dict[str, Any]:
+    pubdate = int(hit.get("pubdate") or 0)
+    return {
+        "bvid": hit.get("bvid") or "",
+        "title": hit.get("title") or "",
+        "author_name": hit.get("author_name") or "",
+        "mid": hit.get("mid") or "",
+        "pubdate": pubdate,
+        "pubdate_iso": ts_iso(pubdate)[:10] if pubdate else "",
+        "duration": hit.get("duration") or 0,
+        "views": hit.get("views") or 0,
+        "likes": hit.get("likes") or 0,
+        "replies": hit.get("replies") or 0,
+        "danmaku": hit.get("danmaku") or 0,
+        "tname": hit.get("tname") or "",
+        "keyword": hit.get("keyword") or "",
+        "page_url": f"https://www.bilibili.com/video/{hit.get('bvid') or ''}",
+        "description_short": str(hit.get("description") or "").replace("\n", " ")[:160],
+    }
+
+
 class KeywordSampler:
     def __init__(
         self,
@@ -229,11 +342,18 @@ class KeywordSampler:
             self.cancelled = True
         return self.cancelled or self.crawler._is_cancelled()
 
+    def _export_dir(self, job_id: str) -> Path:
+        folder = EXPORT_DIR / f"keyword_{job_id}"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
     async def run(
         self,
         config: KeywordSampleConfig,
         on_progress: Callable[[dict[str, Any]], Any] | None = None,
     ) -> dict[str, Any]:
+        if not config.export_video_list and not config.crawl_dynamics:
+            raise ValueError("请至少勾选「导出视频列表」或「采集动态」")
         keywords = list(config.keywords or [])
         if not keywords:
             keywords = parse_keywords(config.keywords_text)
@@ -252,6 +372,7 @@ class KeywordSampler:
         if begin and end and begin > end:
             raise ValueError("开始日期不能晚于结束日期")
 
+        out_dir = self._export_dir(config.job_id)
         client = BiliClient(self.settings, on_log=self.on_log)
         progress: dict[str, Any] = {
             "stage": "search",
@@ -261,15 +382,18 @@ class KeywordSampler:
             "pruned": 0,
             "searched": 0,
             "candidates": 0,
+            "dynamics_done": 0,
+            "dyn_pruned": 0,
             "current": "",
             "max_nodes": config.max_nodes,
             "keywords": keywords,
+            "keyword_export": str(out_dir),
         }
 
         async def emit() -> None:
             stats = self.corpus.frontier_stats(config.job_id)
             progress["frontier"] = stats
-            progress["nodes_done"] = int(stats.get("done") or 0)
+            progress["nodes_done"] = int(progress.get("videos_done") or 0) + int(progress.get("dynamics_done") or 0)
             if on_progress:
                 maybe = on_progress(dict(progress))
                 if hasattr(maybe, "__await__"):
@@ -286,84 +410,38 @@ class KeywordSampler:
                 "date_to": config.date_to,
                 "order": config.order,
                 "max_nodes": config.max_nodes,
-                "min_views": config.min_views,
-                "min_likes": config.min_likes,
-                "min_danmaku": config.min_danmaku,
-                "min_replies": config.min_replies,
-                "min_engagement": config.min_engagement,
-                "category_allow": config.category_allow,
-                "category_deny": config.category_deny,
-                "crawl_comments": config.crawl_comments,
-                "comment_with_replies": config.comment_with_replies,
-                "crawl_danmaku": config.crawl_danmaku,
+                "export_video_list": config.export_video_list,
+                "crawl_dynamics": config.crawl_dynamics,
+                "dyn_min_likes": config.dyn_min_likes,
+                "dyn_min_comments": config.dyn_min_comments,
+                "dyn_min_forwards": config.dyn_min_forwards,
             },
             label="关键词采样",
         )
-        if config.resume:
-            restored = self.corpus.requeue_visiting(config.job_id)
-            if restored:
-                self.on_log("info", f"已把中断的 {restored} 个节点放回队列")
-
-        consecutive_risk = 0
+        catalog: list[dict[str, Any]] = []
+        dyn_catalog: list[dict[str, Any]] = []
         try:
             await client.bootstrap()
-            stats0 = self.corpus.frontier_stats(config.job_id)
-            if not stats0.get("pending") and not stats0.get("done") and not stats0.get("pruned"):
-                candidates = await self._search_candidates(client, config, keywords, begin, end, progress, emit)
-                progress["candidates"] = len(candidates)
-                if not candidates:
-                    self.on_log("warn", "无候选可入队，本轮结束。")
-                    progress["stage"] = "done"
-                    await emit()
-                    return progress
-                items = [
-                    FrontierItem(bvid=row["bvid"], depth=0, seed_bvid=row["bvid"])
-                    for row in candidates
-                ]
-                added = self.corpus.enqueue(config.job_id, items)
-                self.on_log("ok", f"搜索去重后候选 {len(candidates)} · 新入队 {added}")
-                # Persist listing-side prune reasons already recorded during search.
+            if config.export_video_list:
+                catalog = self._load_video_catalog(out_dir)
+                if catalog and config.resume:
+                    self.on_log("info", f"续跑：复用已导出视频列表 {len(catalog)} 条")
+                else:
+                    hits = await self._search_candidates(client, config, keywords, begin, end, progress, emit)
+                    catalog = [_catalog_row(hit) for hit in hits]
+                    self._persist_video_listings(config, catalog)
+                write_keyword_catalog(out_dir, config.job_id, keywords=keywords, videos=catalog, dynamics=dyn_catalog)
+                progress["candidates"] = len(catalog)
+                progress["passed"] = len(catalog)
+                progress["videos_done"] = len(catalog)
+                self.on_log("ok", f"视频列表已导出 {len(catalog)} 条 · {out_dir}")
                 await emit()
-            else:
-                self.on_log("info", "续跑：跳过搜索阶段，继续处理队列")
 
-            while not self._stop():
-                stats = self.corpus.frontier_stats(config.job_id)
-                done = int(stats.get("done") or 0)
-                if done >= int(config.max_nodes):
-                    self.on_log("warn", f"已达采集上限 {config.max_nodes}，停止")
-                    break
-                item = self.corpus.next_pending(config.job_id)
-                if item is None:
-                    break
-                progress["stage"] = f"video {item.bvid}"
-                progress["current"] = item.bvid
-                await emit()
-                try:
-                    collected = await self._visit(client, config, item)
-                    consecutive_risk = 0
-                    if collected:
-                        progress["videos_done"] = int(progress.get("videos_done") or 0) + 1
-                        progress["passed"] = int(progress.get("passed") or 0) + 1
-                    else:
-                        progress["pruned"] = int(progress.get("pruned") or 0) + 1
-                except Exception as exc:
-                    self.corpus.mark_frontier(config.job_id, item.bvid, "error", str(exc))
-                    risk = isinstance(exc, BiliError) and (exc.retryable or exc.code in RISK_CODES)
-                    if risk:
-                        consecutive_risk += 1
-                        self.on_log(
-                            "error",
-                            f"{item.bvid} 风控：{exc}（连续 {consecutive_risk}/{CIRCUIT_LIMIT}）",
-                        )
-                        if consecutive_risk >= CIRCUIT_LIMIT:
-                            self.on_log("error", "连续风控，停止本轮。队列已保存，稍后用同一任务续跑。")
-                            self.cancelled = True
-                            break
-                    else:
-                        consecutive_risk = 0
-                        self.on_log("error", f"{item.bvid} 失败：{exc}")
-                await emit()
+            if config.crawl_dynamics and not self._stop():
+                dyn_catalog = await self._crawl_keyword_dynamics(
+                    client, config, keywords, begin, progress, emit, out_dir
+                )
+                write_keyword_catalog(out_dir, config.job_id, keywords=keywords, videos=catalog, dynamics=dyn_catalog)
 
             progress["stage"] = "cancelled" if self.cancelled else "done"
             await emit()
@@ -372,6 +450,48 @@ class KeywordSampler:
             status = "cancelled" if self.cancelled else "done"
             self.corpus.finish_run(config.job_id, status)
             await client.close()
+
+    def _load_video_catalog(self, out_dir: Path) -> list[dict[str, Any]]:
+        path = out_dir / "videos.json"
+        if not path.is_file():
+            return []
+        try:
+            rows = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        return [row for row in rows if isinstance(row, dict) and row.get("bvid")] if isinstance(rows, list) else []
+
+    def _persist_video_listings(self, config: KeywordSampleConfig, catalog: list[dict[str, Any]]) -> None:
+        for row in catalog:
+            bvid = str(row.get("bvid") or "")
+            if not bvid:
+                continue
+            try:
+                self.corpus.upsert_video(
+                    {
+                        "bvid": bvid,
+                        "aid": None,
+                        "mid": row.get("mid") or "",
+                        "author_name": row.get("author_name") or "",
+                        "title": row.get("title") or "",
+                        "description": row.get("description_short") or "",
+                        "tname": row.get("tname") or "",
+                        "pubdate": row.get("pubdate") or 0,
+                        "duration": row.get("duration") or 0,
+                        "view_count": row.get("views") or 0,
+                        "like_count": row.get("likes") or 0,
+                        "reply_count": row.get("replies") or 0,
+                        "danmaku_count": row.get("danmaku") or 0,
+                        "discovery": "keyword",
+                        "depth": 0,
+                        "pass_filter": True,
+                        "reject_reason": "",
+                        "run_id": config.job_id,
+                        "page_url": row.get("page_url") or f"https://www.bilibili.com/video/{bvid}",
+                    }
+                )
+            except Exception as exc:
+                self.on_log("warn", f"数据集写入 {bvid} 失败（CSV 仍已导出）：{exc}")
 
     async def _search_candidates(
         self,
@@ -386,13 +506,12 @@ class KeywordSampler:
         seen: set[str] = set()
         kept: list[dict[str, Any]] = []
         must = split_terms(config.title_must_terms)
-        # Hard stop search early once we have enough strong candidates.
-        target = max(int(config.max_nodes) * 3, int(config.max_nodes))
+        target = max(1, int(config.max_nodes or 200))
 
         for keyword in keywords:
             if self._stop() or len(kept) >= target:
                 break
-            self.on_log("info", f"搜索「{keyword}」…")
+            self.on_log("info", f"搜索视频「{keyword}」…")
             progress["stage"] = f"search:{keyword}"
             progress["current"] = keyword
             await emit()
@@ -410,14 +529,17 @@ class KeywordSampler:
                 ):
                     if self._stop() or len(kept) >= target:
                         break
-                    hit = normalize_search_hit(raw, keyword=keyword)
+                    try:
+                        hit = normalize_search_hit(raw, keyword=keyword)
+                    except Exception as exc:
+                        self.on_log("warn", f"跳过一条无法解析的搜索结果：{exc}")
+                        continue
                     bvid = hit["bvid"]
                     progress["searched"] = int(progress.get("searched") or 0) + 1
                     page_hits += 1
                     if not bvid or bvid in seen:
                         continue
                     seen.add(bvid)
-                    # Listing-stage soft gate: title + date + cheap stats.
                     passed, reason, checks = evaluate_keyword_gate(hit, config, stage="listing")
                     if not passed:
                         self.corpus.record_gate_decision(config.job_id, bvid, False, reason, checks, 0)
@@ -428,12 +550,11 @@ class KeywordSampler:
                         progress["candidates"] = len(kept)
                         await emit()
             except Exception as exc:
-                # One keyword failing must not abort the whole multi-keyword job.
                 self.on_log("error", f"搜索「{keyword}」失败，跳过该词继续：{exc}")
-                await asyncio.sleep(1.2)
+                await asyncio.sleep(jitter(1.2, 2.4))
                 continue
-            self.on_log("ok", f"「{keyword}」搜索结束 · 本词处理 {page_hits} 条 · 累计候选 {len(kept)} / 已见 {len(seen)}")
-            await asyncio.sleep(0.4)
+            self.on_log("ok", f"「{keyword}」视频搜索结束 · 本词 {page_hits} 条 · 累计候选 {len(kept)}")
+            await asyncio.sleep(jitter(1.2, 2.6))
 
         if must:
             self.on_log(
@@ -442,117 +563,178 @@ class KeywordSampler:
                 + "、".join(must),
             )
         if not kept:
-            self.on_log("warn", "搜索结束但没有通过标题/时间/门禁的候选。请放宽标题词、日期或互动门槛后重试。")
-        return kept[: max(0, target)]
+            self.on_log("warn", "搜索结束但没有通过标题/时间/门禁的视频候选。")
+        return kept[:target]
 
-    async def _visit(self, client: BiliClient, config: KeywordSampleConfig, item: FrontierItem) -> bool:
-        detail = await client.get_view_detail(item.bvid)
-        view = detail.get("View") if isinstance(detail.get("View"), dict) else {}
-        if not view.get("bvid") and not view.get("aid"):
-            self.corpus.record_gate_decision(config.job_id, item.bvid, False, "no_view", {}, 0)
-            self.corpus.mark_frontier(config.job_id, item.bvid, "error", "no_view")
-            return False
-        view["bvid"] = view.get("bvid") or item.bvid
-        tags = extract_tags(detail)
-        stat = view.get("stat") if isinstance(view.get("stat"), dict) else {}
-        hit = {
-            "bvid": item.bvid,
-            "title": view.get("title") or "",
-            "description": view.get("desc") or "",
-            "tname": view.get("tname") or "",
-            "tid": view.get("tid") or "",
-            "pubdate": view.get("pubdate") or 0,
-            "views": pick(view, "stat", "view") or 0,
-            "likes": pick(view, "stat", "like") or 0,
-            "danmaku": pick(view, "stat", "danmaku") or 0,
-            "replies": pick(view, "stat", "reply") or 0,
+    async def _crawl_keyword_dynamics(
+        self,
+        client: BiliClient,
+        config: KeywordSampleConfig,
+        keywords: list[str],
+        begin: int | None,
+        progress: dict[str, Any],
+        emit: Callable[[], Any],
+        out_dir: Path,
+    ) -> list[dict[str, Any]]:
+        seen: set[str] = set()
+        catalog: list[dict[str, Any]] = []
+        consecutive_risk = 0
+        dyn_order = "pubdate" if config.order == "pubdate" else "totalrank"
+        safety_cap = 3000
+
+        for keyword in keywords:
+            if self._stop() or len(catalog) >= safety_cap:
+                break
+            self.on_log("info", f"搜索动态「{keyword}」…")
+            progress["stage"] = f"dyn-search:{keyword}"
+            progress["current"] = keyword
+            await emit()
+            page_hits = 0
+            try:
+                async for raw in client.iter_search_dynamics(
+                    keyword,
+                    order=dyn_order,
+                    max_pages=int(config.max_pages_per_keyword or 30),
+                    should_cancel=self._stop,
+                ):
+                    if self._stop() or len(catalog) >= safety_cap:
+                        break
+                    try:
+                        hit = normalize_dynamic_search_hit(raw, keyword=keyword)
+                    except Exception as exc:
+                        self.on_log("warn", f"跳过一条无法解析的动态搜索结果：{exc}")
+                        continue
+                    dyn_id = str(hit.get("dyn_id") or "")
+                    page_hits += 1
+                    progress["searched"] = int(progress.get("searched") or 0) + 1
+                    if not dyn_id or dyn_id in seen:
+                        continue
+                    seen.add(dyn_id)
+                    pub_ts = int(hit.get("pub_ts") or 0)
+                    if begin and pub_ts and pub_ts < begin and dyn_order == "pubdate":
+                        self.on_log("info", f"「{keyword}」动态已早于时间窗，停止翻页")
+                        break
+                    passed, reason, checks = evaluate_dynamic_gate(hit, config)
+                    if not passed:
+                        progress["dyn_pruned"] = int(progress.get("dyn_pruned") or 0) + 1
+                        progress["pruned"] = int(progress.get("pruned") or 0) + 1
+                        continue
+                    if config.resume and self.corpus.has_dynamic(dyn_id):
+                        self.on_log("info", f"复用动态 {dyn_id}")
+                        catalog.append(self._dyn_catalog_row(hit))
+                        progress["dynamics_done"] = len(catalog)
+                        continue
+                    progress["stage"] = f"dynamic {dyn_id}"
+                    progress["current"] = dyn_id
+                    await emit()
+                    try:
+                        row = await self._collect_one_dynamic(client, config, hit)
+                        consecutive_risk = 0
+                        if row:
+                            catalog.append(row)
+                            progress["dynamics_done"] = len(catalog)
+                    except Exception as exc:
+                        risk = isinstance(exc, BiliError) and (exc.retryable or exc.code in RISK_CODES)
+                        if risk:
+                            consecutive_risk += 1
+                            self.on_log(
+                                "error",
+                                f"动态 {dyn_id} 风控：{exc}（连续 {consecutive_risk}/{CIRCUIT_LIMIT}）",
+                            )
+                            if consecutive_risk >= CIRCUIT_LIMIT:
+                                self.on_log("error", "连续风控，停止动态采集。稍后用同一任务续跑。")
+                                self.cancelled = True
+                                break
+                        else:
+                            consecutive_risk = 0
+                            self.on_log("error", f"动态 {dyn_id} 失败：{exc}")
+                    await asyncio.sleep(jitter(0.45, 1.05))
+            except Exception as exc:
+                self.on_log("error", f"动态搜索「{keyword}」失败，跳过该词继续：{exc}")
+                await asyncio.sleep(jitter(1.2, 2.4))
+                continue
+            self.on_log("ok", f"「{keyword}」动态搜索结束 · 本词 {page_hits} 条 · 已采集 {len(catalog)}")
+            await asyncio.sleep(jitter(1.2, 2.6))
+        self.on_log("ok", f"动态采集 {len(catalog)} 条 · {out_dir}")
+        return catalog
+
+    def _dyn_catalog_row(self, hit: dict[str, Any], extracted: dict[str, Any] | None = None) -> dict[str, Any]:
+        src = extracted or hit
+        pub_ts = int(src.get("pub_ts") or hit.get("pub_ts") or 0)
+        text = str(src.get("text") or hit.get("text") or "").replace("\n", " ")
+        return {
+            "dyn_id": src.get("dyn_id") or hit.get("dyn_id") or "",
+            "mid": src.get("mid") or hit.get("mid") or "",
+            "author_name": src.get("author_name") or hit.get("author_name") or "",
+            "pub_time_iso": ts_iso(pub_ts) if pub_ts else "",
+            "text": text[:500],
+            "like": src.get("like") or hit.get("likes") or 0,
+            "comment": src.get("comment") or hit.get("comments") or 0,
+            "forward": src.get("forward") or hit.get("forwards") or 0,
+            "picture_count": len(src.get("pictures") or hit.get("pictures") or []),
+            "keyword": hit.get("keyword") or "",
+            "jump_url": src.get("jump_url") or hit.get("jump_url") or "",
         }
-        passed, reason, checks = evaluate_keyword_gate(hit, config, tags=tags, stage="detail")
-        self.corpus.record_gate_decision(config.job_id, item.bvid, passed, reason, checks, 0)
-        owner = view.get("owner") if isinstance(view.get("owner"), dict) else {}
-        mid = str(owner.get("mid") or "")
-        name = owner.get("name") or mid or "unknown"
-        if not passed:
-            self.corpus.upsert_video(
-                {
-                    "bvid": item.bvid,
-                    "aid": view.get("aid"),
-                    "mid": mid,
-                    "author_name": name,
-                    "title": view.get("title"),
-                    "description": view.get("desc"),
-                    "tid": view.get("tid"),
-                    "tname": view.get("tname"),
-                    "pubdate": view.get("pubdate"),
-                    "duration": view.get("duration"),
-                    "view_count": stat.get("view"),
-                    "like_count": stat.get("like"),
-                    "reply_count": stat.get("reply"),
-                    "danmaku_count": stat.get("danmaku"),
-                    "tags": tags,
-                    "discovery": "keyword",
-                    "depth": 0,
-                    "parent_bvid": None,
-                    "seed_bvid": item.seed_bvid,
-                    "pass_filter": False,
-                    "reject_reason": reason,
-                    "run_id": config.job_id,
-                    "page_url": f"https://www.bilibili.com/video/{item.bvid}",
-                }
-            )
-            self.corpus.mark_frontier(config.job_id, item.bvid, "pruned", reason)
-            self.on_log("warn", f"剪枝 {item.bvid} · {reason}")
-            return False
 
-        # Temporarily override global comment settings for this crawl.
-        prev_pages = self.settings.comment_max_pages
-        prev_sub = self.settings.include_sub_replies
-        self.settings.comment_max_pages = int(config.comment_max_pages or 0)
-        self.settings.include_sub_replies = bool(config.comment_with_replies)
-        try:
-            acc_dir = account_dir(LIBRARY_DIR, mid or "unknown", name)
-            job = JobConfig(
-                uids=[mid] if mid else [],
-                time_range="all",
-                crawl_profile=False,
-                crawl_videos=True,
-                crawl_dynamics=False,
-                crawl_comments=bool(config.crawl_comments),
-                crawl_danmaku=bool(config.crawl_danmaku),
-                media_mode=config.media_mode or "audio",
-                transcribe_mode=config.transcribe_mode or "official_then_whisper",
-                media_keep=config.media_keep,
-                ocr_enabled=bool(config.ocr_enabled),
-                resume=config.resume,
-                job_id=config.job_id,
-                rclone_remote=config.rclone_remote or self.settings.rclone_remote,
-                rclone_root=config.rclone_root or self.settings.rclone_root,
-                compute_backend=config.compute_backend,
-                discovery="keyword",
-                comment_max_pages=int(config.comment_max_pages or 0),
-                include_sub_replies=bool(config.comment_with_replies),
+    async def _collect_one_dynamic(
+        self,
+        client: BiliClient,
+        config: KeywordSampleConfig,
+        hit: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        dyn_id = str(hit.get("dyn_id") or "")
+        item = await client.get_dynamic_detail(dyn_id)
+        if not item:
+            self.on_log("warn", f"动态详情为空 {dyn_id}，按搜索卡片写入")
+            extracted = {
+                "dyn_id": dyn_id,
+                "mid": hit.get("mid") or "",
+                "author_name": hit.get("author_name") or "",
+                "dyn_type": "search",
+                "pub_ts": hit.get("pub_ts") or 0,
+                "text": hit.get("text") or "",
+                "pictures": hit.get("pictures") or [],
+                "like": hit.get("likes") or 0,
+                "comment": hit.get("comments") or 0,
+                "forward": hit.get("forwards") or 0,
+                "comment_id": dyn_id,
+                "comment_type": 17,
+                "jump_url": hit.get("jump_url") or f"https://t.bilibili.com/{dyn_id}",
+            }
+        else:
+            extracted = extract_dynamic(item)
+            if not extracted.get("dyn_id"):
+                extracted["dyn_id"] = dyn_id
+            extracted["mid"] = extracted.get("mid") or hit.get("mid") or str(pick(item, "modules", "module_author", "mid") or "")
+            extracted["author_name"] = (
+                extracted.get("author_name")
+                or hit.get("author_name")
+                or str(pick(item, "modules", "module_author", "name") or "")
             )
-            await self.crawler._crawl_video(
-                client,
-                job,
-                mid,
-                acc_dir,
-                {"bvid": item.bvid, "title": view.get("title"), "_detail": detail},
-            )
-        finally:
-            self.settings.comment_max_pages = prev_pages
-            self.settings.include_sub_replies = prev_sub
-
-        self.corpus.set_video_topology(
-            item.bvid,
+        mid = str(extracted.get("mid") or hit.get("mid") or "unknown")
+        name = str(extracted.get("author_name") or hit.get("author_name") or mid)
+        acc_dir = account_dir(LIBRARY_DIR, mid, name)
+        job = JobConfig(
+            uids=[mid] if mid else [],
+            time_range="all",
+            crawl_profile=False,
+            crawl_videos=False,
+            crawl_dynamics=True,
+            crawl_comments=bool(config.crawl_comments),
+            crawl_danmaku=False,
+            media_mode="link",
+            transcribe_mode="none",
+            media_keep=config.media_keep or "keep",
+            ocr_enabled=bool(config.ocr_enabled),
+            resume=config.resume,
+            job_id=config.job_id,
+            rclone_remote=config.rclone_remote or self.settings.rclone_remote,
+            rclone_root=config.rclone_root or self.settings.rclone_root,
+            compute_backend=config.compute_backend,
             discovery="keyword",
-            depth=0,
-            parent_bvid=None,
-            seed_bvid=item.seed_bvid,
-            pass_filter=True,
-            reject_reason="",
-            run_id=config.job_id,
+            comment_max_pages=int(config.comment_max_pages or 0),
+            include_sub_replies=bool(config.comment_with_replies),
         )
-        self.corpus.mark_frontier(config.job_id, item.bvid, "done")
-        self.on_log("ok", f"采集完成 {item.bvid} · {view.get('title') or ''}")
-        return True
+        await self.crawler._crawl_dynamic(client, job, mid, acc_dir, extracted)
+        return self._dyn_catalog_row(hit, extracted)
+

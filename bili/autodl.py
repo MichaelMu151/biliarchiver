@@ -575,12 +575,12 @@ def ssh_transcribe_audio(
         emit(f"转写前 nvidia-smi {smi}", "info")
     auth = (token or "").strip().replace("'", "")
     cmd = (
-        "curl -sS --max-time 1200 "
+        "curl -sS --max-time 2400 "
         f"-H 'Authorization: Bearer {auth}' "
         f"-F 'path={remote}' -F 'model={model or 'large-v3'}' -F 'language={language or 'auto'}' "
         f"http://127.0.0.1:{WORKER_PORT}/v1/transcribe_path"
     )
-    out = _run(client, cmd, emit if log else (lambda *_a: None), timeout=1260, chatter=False, get_pty=False)
+    out = _run(client, cmd, emit if log else (lambda *_a: None), timeout=2460, chatter=False, get_pty=False)
     text = (out or "").strip()
     start = text.find("{")
     end = text.rfind("}")
@@ -622,7 +622,7 @@ for url in job.get("urls") or []:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp, open(raw, "wb") as fh:
+        with urllib.request.urlopen(req, timeout=300) as resp, open(raw, "wb") as fh:
             while True:
                 chunk = resp.read(256 * 1024)
                 if not chunk:
@@ -659,7 +659,7 @@ model = job.get("model") or "large-v3"
 language = job.get("language") or "auto"
 curl = subprocess.run(
     [
-        "curl", "-sS", "--max-time", "1200",
+        "curl", "-sS", "--max-time", "2400",
         "-H", "Authorization: Bearer " + (job.get("token") or ""),
         "-F", "path=" + dest,
         "-F", "model=" + model,
@@ -751,7 +751,7 @@ def ssh_fetch_and_transcribe(
         client,
         f"{shlex.quote(python)} -u /tmp/bili_pull_transcribe.py /tmp/bili_pull_job.json",
         emit if log else (lambda *_a: None),
-        timeout=1500,
+        timeout=2700,
         chatter=False,
         get_pty=False,
     )
@@ -1105,6 +1105,69 @@ def _ensure_cuda12_runtime(client: Any, python: str, log: LogFn) -> None:
     log("CUDA 12 cublas 已就绪。", "ok")
 
 
+def _pyav_probe_command(python: str, remote_dir: str) -> str:
+    """Run the same PyAV check the GPU worker uses for /health."""
+    return (
+        f"cd {shlex.quote(remote_dir)} && {shlex.quote(python)} -c "
+        + shlex.quote(
+            "from bili.transcribe import pyav_whisper_compatible\n"
+            "ok, detail = pyav_whisper_compatible()\n"
+            "print('AV_DETAIL', detail)\n"
+            "print('AV_METADATA_OK' if ok else 'AV_METADATA_MISSING')\n"
+        )
+    )
+
+
+def _ensure_pyav_for_whisper(client: Any, python: str, remote_dir: str, log: LogFn) -> None:
+    """faster-whisper decode_audio calls av.open(..., metadata_errors='ignore').
+
+    PyAV 19 removed that kwarg; pin to av>=12,<19. Some 19.x installs also leave
+    av.open bound to builtins.open, which crashes the same way.
+    """
+    probe = _run(
+        client,
+        _pyav_probe_command(python, remote_dir),
+        log,
+        timeout=30,
+        check=False,
+        chatter=False,
+        get_pty=False,
+    )
+    if "AV_METADATA_OK" in probe and "AV_METADATA_MISSING" not in probe:
+        version = ""
+        for line in probe.splitlines():
+            if line.startswith("AV_DETAIL "):
+                version = line.split(" ", 1)[-1].strip()
+                break
+        log(f"PyAV 与 faster-whisper 兼容（av {version or '?'}），跳过调整。", "ok")
+        return
+    log(
+        "当前 PyAV 与 faster-whisper 不兼容（缺 metadata_errors，或 av.open 损坏）。"
+        "正在安装 av>=12,<19…",
+        "warn",
+    )
+    _run(
+        client,
+        f"{shlex.quote(python)} -m pip install --force-reinstall 'av>=12.0.0,<19'",
+        log,
+        timeout=600,
+    )
+    again = _run(
+        client,
+        _pyav_probe_command(python, remote_dir),
+        log,
+        timeout=30,
+        check=False,
+        chatter=False,
+        get_pty=False,
+    )
+    if "AV_METADATA_OK" not in again or "AV_METADATA_MISSING" in again:
+        raise RuntimeError(
+            "调整 av 后仍无法通过 faster-whisper 音频探测。远程输出：\n" + again[-600:]
+        )
+    log("PyAV 已调整到与 Whisper 兼容的版本。", "ok")
+
+
 def _prefetch_whisper_model(client: Any, python: str, remote_dir: str, model: str, log: LogFn) -> None:
     size = model or "large-v3"
     log(f"正在用镜像 {HF_MIRROR} 预下载 Whisper {size}（约 3GB，只需一次）…", "info")
@@ -1175,6 +1238,8 @@ def _bootstrap_collect(
         emit,
         timeout=1800,
     )
+    emit("正在检查 PyAV 是否兼容 faster-whisper…", "info")
+    _ensure_pyav_for_whisper(client, python, remote_dir, emit)
     emit("正在安装 CUDA 12 运行库（ctranslate2 需要 libcublas.so.12；CUDA 13 镜像也适用）…", "info")
     _ensure_cuda12_runtime(client, python, emit)
     ffmpeg = _run(

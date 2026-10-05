@@ -50,6 +50,8 @@ class AcademicConfig:
     rclone_remote: str = ""
     rclone_root: str = "BiliArchiver"
     skip_gate: bool = False
+    comment_max_pages: int = 0
+    comment_with_replies: bool = True
 
 
 def parse_academic_seeds(raw: str) -> tuple[list[str], list[str]]:
@@ -352,13 +354,15 @@ class AcademicCrawler:
             media_mode=config.media_mode or "audio",
             transcribe_mode=config.transcribe_mode or "official_then_whisper",
             media_keep=config.media_keep,
-            ocr_enabled=bool(config.ocr_enabled) or config.skip_gate,
+            ocr_enabled=bool(config.ocr_enabled),
             resume=config.resume,
             job_id=config.job_id,
             rclone_remote=config.rclone_remote or self.settings.rclone_remote,
             rclone_root=config.rclone_root or self.settings.rclone_root,
             compute_backend=config.compute_backend,
             discovery="seed" if item.depth == 0 else "snowball",
+            comment_max_pages=int(config.comment_max_pages or 0),
+            include_sub_replies=bool(config.comment_with_replies),
         )
         await self.crawler._crawl_video(
             client,
