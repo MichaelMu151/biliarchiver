@@ -72,7 +72,8 @@
 | **Cookie** | 浏览器登录 B 站后，网站发给你电脑的一串「通行证」。复制给本程序后，采集器可以**以你的身份**读评论等，只保存在本机。 |
 | **转写 / 字幕** | 把视频里说的话变成文字。优先用 B 站官方字幕；没有时可用 Whisper 语音识别（较慢）。 |
 | **Whisper** | 开源语音识别模型。Intel Mac 上很慢；有 NVIDIA 显卡或云端 GPU 会快很多。 |
-| **SQLite / corpus.db** | 一种单文件数据库。用 DB Browser、pandas、R 等打开，一行一条评论或视频，方便统计。 |
+| **SQLite / corpus.db** | 工作库：续爬队列、门禁过程、旧版字段。用 DB Browser、pandas、R 等打开。 |
+| **research.db** | 合并后的分析库（`data/merge/research.db`）：视频 / 评论 / 弹幕 / 转写 / 发现日志。新爬取的结构化结果会写进这里；论文分析优先用它。 |
 | **rclone** | 命令行工具，把本机文件夹同步到 Google Drive 等网盘。 |
 | **AutoDL** | 租 GPU 的云平台。接入时先选**通道**：**采集转写**只同步约 13 个工作机文件并预热 Whisper；**主题分析**只同步 2 个脚本跑 BGE/BERTopic，不加载语音模型。爬虫仍在你电脑。 |
 | **Bark** | iPhone 上的一个推送 App。任务跑很久时，手机会收到「又完成一条视频」之类的提醒。 |
@@ -108,7 +109,8 @@
 | 内容 | 路径 | 会不会上传 GitHub |
 | --- | --- | --- |
 | 采集的 Markdown、JSONL | `data/library/` | **不会**（已在 .gitignore） |
-| 分析库 | `data/corpus.db` | **不会** |
+| 工作库（续爬 / 门禁） | `data/corpus.db` | **不会** |
+| 合并分析库 | `data/merge/research.db` | **不会** |
 | Cookie、Bark Key、SSH 密码 | `data/settings.json` | **不会** |
 
 **千万不要**把 `data/` 文件夹或 Cookie 发到群里、邮件、GitHub Issue。
@@ -271,7 +273,7 @@ BiliArchiver 已启动 → http://127.0.0.1:8765
 
 ### 5.8 分析数据集
 
-看 `corpus.db` 里有多少视频/评论、门禁漏斗、执行 SQL、导出 CSV。给**统计软件**用。
+看 `corpus.db` / `research.db` 里有多少视频/评论、门禁漏斗、执行 SQL、导出 CSV。给**统计软件**用。结构化分析优先打开 `data/merge/research.db`。
 
 ### 5.9 设置与登录
 
@@ -616,7 +618,7 @@ BV1yyyyyyyyyy
 
 ### 10.2 填写要点
 
-1. 左侧点 **关键词采样**。左下角应能看到界面版本号（例如 `界面 20261005d`）。看不到就强刷，或清掉 `127.0.0.1` 的网站数据。
+1. 左侧点 **关键词采样**。左下角应能看到界面版本号（例如 `界面 20261006a`）。看不到就强刷，或清掉 `127.0.0.1` 的网站数据。
 2. **搜索关键词**：一行一个或逗号分隔，例如 `八小时`、`8小时`、`双休`（视频与图文**共用**这一组词）。
 3. **标题约束（视频侧，推荐）**：例如 `8小时,八小时,双休,单休`——标题至少命中其一才进列表。图文不套这组标题词。
 4. **发布时间**：填开始日期；结束可留空表示「到现在」。**图文与视频共用**此时间窗。
@@ -656,13 +658,31 @@ data/exports/keyword_<12位任务号>/
 
 ### 11.1 打开页面
 
-左侧 **分析数据集**。库文件路径：
+左侧 **分析数据集** 默认连工作库：
 
 ```
 data/corpus.db
 ```
 
-与 `data/app.db`（任务进度）不同，**做论文用 corpus.db**。
+合并后的研究库（实体表 + 发现日志，新爬取也会写入）在：
+
+```
+data/merge/research.db
+```
+
+| 库 | 用途 |
+| --- | --- |
+| `data/app.db` | 界面任务进度 |
+| `data/corpus.db` | 续爬队列、门禁过程、旧拓扑字段 |
+| `data/merge/research.db` | **论文分析优先**：视频 / 评论 / 弹幕 / 转写 / 批次发现日志 |
+
+界面「分析数据集」页目前仍打开 `corpus.db`。查 `research.db` 时用 DB Browser、pandas，或：
+
+```bash
+sqlite3 data/merge/research.db
+```
+
+视频评论用 `comments.bvid`（且 `target_kind='video'`）；动态评论用 `target_kind='dynamic'` 且 `target_id = dyn_id`。按某次任务筛样本时，先从 `video_discovery_log` 按 `batch_id` 取出 `bvid`，再连评论或转写，避免同一视频被多种方法发现时把评论算重。
 
 ### 11.2 复制粘贴这些 SQL（点「执行」）
 

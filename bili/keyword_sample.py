@@ -498,6 +498,7 @@ class KeywordSampler:
                         "pass_filter": True,
                         "reject_reason": "",
                         "run_id": config.job_id,
+                        "keyword": row.get("keyword") or "",
                         "page_url": row.get("page_url") or f"https://www.bilibili.com/video/{bvid}",
                     }
                 )
@@ -756,6 +757,7 @@ class KeywordSampler:
             extracted["pictures"] = hit.get("pictures") or []
         if not extracted.get("pub_ts"):
             extracted["pub_ts"] = hit.get("pub_ts") or 0
+        extracted["keyword"] = hit.get("keyword") or ""
         mid = str(extracted.get("mid") or hit.get("mid") or "unknown")
         name = str(extracted.get("author_name") or hit.get("author_name") or mid)
         acc_dir = account_dir(LIBRARY_DIR, mid, name)

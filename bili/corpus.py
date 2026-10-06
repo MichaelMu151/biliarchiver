@@ -23,6 +23,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from bili.analysis_hygiene import ensure_analysis_columns
 from bili.paths import CORPUS_DB_PATH, ensure_dirs
+from bili.research_sink import ResearchSink
 from bili.util import now_iso, ts_iso
 
 SCHEMA_VERSION = 3
@@ -446,10 +447,16 @@ class FrontierItem:
 class Corpus:
     """Writer/reader for the analysis dataset."""
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(self, path: Path | None = None, *, research_path: Path | None = None) -> None:
         ensure_dirs()
         self.path = Path(path or CORPUS_DB_PATH)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if research_path is not None:
+            self.research = ResearchSink(research_path)
+        elif self.path.resolve() == CORPUS_DB_PATH.resolve():
+            self.research = ResearchSink()
+        else:
+            self.research = None
         with self.connect() as conn:
             conn.executescript(SCHEMA)
             # Existing DBs created before schema v3 need ALTER TABLE columns.
@@ -494,6 +501,10 @@ class Corpus:
                     "note": "",
                 },
             )
+        if self.research is not None:
+            keywords = config.get("keywords") if isinstance(config, dict) else None
+            keyword_text = ",".join(str(item) for item in keywords) if isinstance(keywords, list) else ""
+            self.research.ensure_batch(run_id, kind, label, keyword_text)
 
     def finish_run(self, run_id: str, status: str, note: str = "") -> None:
         with self.connect() as conn:
@@ -501,6 +512,8 @@ class Corpus:
                 "UPDATE collection_runs SET status=?, finished_at=?, note=? WHERE run_id=?",
                 (status, now_iso(), note, run_id),
             )
+        if self.research is not None:
+            self.research.finish_batch(run_id, status)
 
     # -- authors ------------------------------------------------------------
 
@@ -537,6 +550,8 @@ class Corpus:
                 + ",".join(f"{c}=excluded.{c}" for c in columns if c not in {"mid", "first_seen"}),
                 payload,
             )
+        if self.research is not None:
+            self.research.upsert_creator(payload)
 
     def add_author_snapshot(self, row: dict[str, Any], run_id: str = "") -> None:
         payload = {
@@ -630,6 +645,10 @@ class Corpus:
                     if isinstance(p, dict) and _as_int(p.get("cid"))
                 ],
             )
+        if self.research is not None:
+            research_row = dict(payload)
+            research_row["keyword"] = row.get("keyword") or ""
+            self.research.upsert_video(research_row, pages if isinstance(pages, list) else [])
 
     def set_video_topology(self, bvid: str, **fields: Any) -> None:
         allowed = {
@@ -654,6 +673,14 @@ class Corpus:
         updates["bvid"] = bvid
         with self.connect() as conn:
             conn.execute(f"UPDATE videos SET {assignments} WHERE bvid=:bvid", updates)
+        if self.research is not None and updates.get("run_id") and "pass_filter" in updates:
+            self.research.note_gate(
+                str(updates.get("run_id") or ""),
+                bvid,
+                bool(updates.get("pass_filter")),
+                str(updates.get("reject_reason") or ""),
+                int(updates.get("depth") or 0),
+            )
 
     def record_gate_decision(
         self,
@@ -681,6 +708,8 @@ class Corpus:
                     "decided_at": now_iso(),
                 },
             )
+        if self.research is not None:
+            self.research.note_gate(run_id, bvid, passed, reason, depth)
 
     def add_edges(self, run_id: str, src_bvid: str, dst_bvids: Sequence[str]) -> None:
         stamp = now_iso()
@@ -828,6 +857,8 @@ class Corpus:
         columns = tuple(payloads[0])
         with self.connect() as conn:
             conn.executemany(_upsert_sql("comments", columns, ("rpid",)), payloads)
+        if self.research is not None:
+            self.research.upsert_comments(payloads)
         return len(payloads)
 
     def upsert_danmaku(self, rows: Iterable[dict[str, Any]], *, run_id: str = "") -> int:
@@ -863,6 +894,8 @@ class Corpus:
         columns = tuple(payloads[0])
         with self.connect() as conn:
             conn.executemany(_upsert_sql("danmaku", columns, ("danmaku_id",)), payloads)
+        if self.research is not None:
+            self.research.upsert_danmaku(payloads)
         return len(payloads)
 
     # -- dynamics / transcripts --------------------------------------------
@@ -901,7 +934,7 @@ class Corpus:
         payload = {
             "dyn_id": dyn_id,
             "mid": str(dyn.get("mid") or ""),
-            "author_name": author_name,
+            "author_name": author_name or str(dyn.get("author_name") or ""),
             "dyn_type": dyn.get("dyn_type") or "",
             "pub_ts": pub_ts,
             "pub_time_iso": ts_iso(pub_ts),
@@ -917,6 +950,8 @@ class Corpus:
             "captured_at": dyn.get("captured_at") or now_iso(),
         }
         columns = tuple(payload)
+        research_payload = dict(payload)
+        research_payload["keyword"] = dyn.get("keyword") or ""
         image_rows = []
         for index, block in enumerate(blocks):
             lines = block.get("lines") or []
@@ -944,6 +979,8 @@ class Corpus:
                 "VALUES(?,?,?,?,?,?,?)",
                 image_rows,
             )
+        if self.research is not None:
+            self.research.upsert_dynamic(research_payload)
 
     def upsert_transcript(
         self,
@@ -993,6 +1030,8 @@ class Corpus:
                 "(bvid,cid,position,start_ms,end_ms,text,text_length) VALUES(?,?,?,?,?,?,?)",
                 seg_rows,
             )
+        if self.research is not None:
+            self.research.upsert_transcript(row, seg_rows)
         return len(seg_rows)
 
     # -- reading ------------------------------------------------------------

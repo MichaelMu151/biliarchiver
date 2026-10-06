@@ -910,6 +910,97 @@ class KeywordSampleTests(unittest.TestCase):
         self.assertEqual(normalize_autodl_role("bertopic"), "analyze")
 
 
+class ResearchSinkTests(unittest.TestCase):
+    def test_keyword_video_and_dynamic_write_to_research_schema(self) -> None:
+        from bili.corpus import Corpus
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corpus_path = Path(tmp) / "corpus.db"
+            research_path = Path(tmp) / "research.db"
+            db = Corpus(corpus_path, research_path=research_path)
+            db.start_run("job1", "keyword", {"keywords": ["八小时"]}, label="关键词采样")
+            db.upsert_video(
+                {
+                    "bvid": "BV1xx411c7mD",
+                    "mid": "123",
+                    "author_name": "测试UP",
+                    "title": "八小时工作制",
+                    "view_count": 10,
+                    "discovery": "keyword",
+                    "keyword": "八小时",
+                    "pass_filter": True,
+                    "run_id": "job1",
+                }
+            )
+            db.upsert_dynamic(
+                {
+                    "dyn_id": "53268770",
+                    "mid": "123",
+                    "author_name": "测试UP",
+                    "text": "专栏正文",
+                    "like": 2,
+                    "comment": 1,
+                    "forward": 0,
+                    "keyword": "八小时",
+                },
+                run_id="job1",
+            )
+            db.upsert_comments(
+                [{"rpid": "1", "message": "评论", "mid": "9", "uname": "用户"}],
+                target_kind="video",
+                target_id="BV1xx411c7mD",
+                bvid="BV1xx411c7mD",
+                run_id="job1",
+            )
+            db.upsert_transcript(
+                bvid="BV1xx411c7mD",
+                cid=1,
+                page=1,
+                payload={"source": "whisper", "text": "口播全文", "segments": [{"text": "口播全文", "start": 0, "end": 1}]},
+                run_id="job1",
+            )
+            db.finish_run("job1", "done")
+
+            import sqlite3
+
+            conn = sqlite3.connect(research_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                batch = conn.execute("SELECT method, search_keyword, status FROM collection_batches WHERE batch_id='job1'").fetchone()
+                self.assertEqual(batch["method"], "keyword")
+                self.assertEqual(batch["search_keyword"], "八小时")
+                self.assertEqual(batch["status"], "done")
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0], 1)
+                disc = conn.execute("SELECT matched_via_keyword, gate_result FROM video_discovery_log WHERE bvid='BV1xx411c7mD'").fetchone()
+                self.assertEqual(disc["matched_via_keyword"], "八小时")
+                self.assertEqual(disc["gate_result"], "pass")
+                dyn = conn.execute("SELECT matched_via_keyword FROM dynamic_discovery_log WHERE dyn_id='53268770'").fetchone()
+                self.assertEqual(dyn["matched_via_keyword"], "八小时")
+                self.assertEqual(conn.execute("SELECT content FROM comments WHERE rpid='1'").fetchone()[0], "评论")
+                self.assertEqual(conn.execute("SELECT full_text FROM transcripts WHERE bvid='BV1xx411c7mD'").fetchone()[0], "口播全文")
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM transcript_segments").fetchone()[0], 1)
+            finally:
+                conn.close()
+
+    def test_nested_dynamic_write_does_not_deadlock(self) -> None:
+        from bili.research_sink import ResearchSink
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sink = ResearchSink(Path(tmp) / "research.db")
+            sink.ensure_batch("job2", "keyword", "关键词采样", "告洋状")
+            sink.upsert_dynamic(
+                {
+                    "dyn_id": "1",
+                    "mid": "2",
+                    "author_name": "UP",
+                    "text": "图文",
+                    "run_id": "job2",
+                    "keyword": "告洋状",
+                    "captured_at": "2026-10-06T12:00:00+08:00",
+                }
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
 

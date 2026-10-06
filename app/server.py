@@ -50,7 +50,7 @@ from bili.util import parse_uids
 prepare_process()
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-UI_BUILD = "20261005d"
+UI_BUILD = "20261006a"
 ensure_dirs()
 store = Store()
 corpus = Corpus()
