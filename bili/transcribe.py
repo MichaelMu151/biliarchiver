@@ -275,8 +275,9 @@ def transcribe_local(
         language=None if language == "auto" else language,
         beam_size=5,
         temperature=0,
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 250},
+        # VAD（silero+onnxruntime）版本一变就报 process() takes no keyword arguments，
+        # 先关掉保证转写不断，后续再单独升级 VAD 链。
+        vad_filter=False,
         condition_on_previous_text=False,
         no_speech_threshold=0.6,
     )
