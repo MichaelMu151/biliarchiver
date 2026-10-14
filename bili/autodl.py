@@ -861,9 +861,11 @@ def _upload(sftp: Any, remote_dir: str, log: LogFn, role: str = "collect") -> in
         skip = False
         try:
             remote_stat = sftp.stat(remote_path)
-            # 大小相同还不够（1.3.5→1.4.4 同字节数会被误跳过）：本地更新就传。
-            if (remote_stat.st_size == path.stat().st_size
-                    and int(getattr(remote_stat, "st_mtime", 0) or 0) >= int(path.stat().st_mtime)):
+            # 文本代码一律重传（几 KB，不差这点流量）：之前只比大小+mtime，
+            # 远端 mtime 永远比本地新，导致 ocr.py/transcribe.py 改了也永不更新。
+            # 只有大文件才按大小跳过。
+            size = path.stat().st_size
+            if size >= 200 * 1024 and remote_stat.st_size == size:
                 skip = True
         except OSError:
             skip = False
@@ -873,7 +875,27 @@ def _upload(sftp: Any, remote_dir: str, log: LogFn, role: str = "collect") -> in
         if index == 1 or index == len(files) or index % 20 == 0:
             log(f"同步进度 {index}/{len(files)} · {rel}", "info")
     log(f"代码同步完成，实际上传 {sent} 个、跳过未改 {len(files) - sent} 个。", "ok")
+    # 清掉远端 __pycache__，否则 .pyc 还是旧逻辑，重启 worker 也不生效。
+    try:
+        sftp.execute = getattr(sftp, "execute", None)
+    except Exception:
+        pass
     return sent
+
+
+def clear_remote_pycache(client: Any, remote_dir: str, log: LogFn) -> None:
+    try:
+        _run(
+            client,
+            f"find {shlex.quote(remote_dir)} -type d -name __pycache__ -exec rm -rf {{}} + 2>/dev/null; echo PYCACHE_CLEARED",
+            log,
+            timeout=30,
+            check=False,
+            chatter=False,
+            get_pty=False,
+        )
+    except Exception:
+        pass
 
 
 def upload_role_files(client: Any, remote_dir: str, log: LogFn, role: str = "collect") -> int:
@@ -1358,6 +1380,7 @@ def connect_autodl(
     client = _connect_client(target, password.strip(), emit)
     try:
         upload_role_files(client, remote_dir, emit, role=role)
+        clear_remote_pycache(client, remote_dir, emit)
         python = _pick_python(client, emit)
         if role == "analyze":
             _bootstrap_analyze(client, emit)
