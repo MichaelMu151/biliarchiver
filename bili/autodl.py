@@ -1194,32 +1194,54 @@ def _ensure_pyav_for_whisper(client: Any, python: str, remote_dir: str, log: Log
 
 def _prefetch_whisper_model(client: Any, python: str, remote_dir: str, model: str, log: LogFn) -> None:
     size = model or "large-v3"
-    log(f"正在用镜像 {HF_MIRROR} 预下载 Whisper {size}（约 3GB，只需一次）…", "info")
     quoted_dir = shlex.quote(remote_dir)
-    command = (
+    py = shlex.quote(python)
+    # 主路：ModelScope 国内 CDN（clock in China, 不走 hf 反代，大文件稳）。
+    # faster-whisper 的 CTranslate2 权重在 ModelScope 的同名镜像是 AI-ModelScope 生态位，
+    # 先试 Systran/faster-whisper-<size>，不行就回 hf-mirror。
+    ms_command = (
         f"{_hf_exports()}; mkdir -p {shlex.quote(HF_HOME_REMOTE)}; "
-        f"cd {quoted_dir} && {shlex.quote(python)} -c "
+        f"cd {quoted_dir} && {py} -m pip install -q --prefer-binary modelscope 2>&1 | tail -n 1; "
+        f"cd {quoted_dir} && {py} -u -c "
+        + shlex.quote(
+            "from modelscope import snapshot_download as ms_dl; "
+            f"p = ms_dl(f'Systran/faster-whisper-{size}', "
+            f"cache_dir='/root/autodl-tmp/huggingface/modelscope'); print('MS_READY', p)"
+        )
+    )
+    hf_command = (
+        f"{_hf_exports()}; mkdir -p {shlex.quote(HF_HOME_REMOTE)}; "
+        f"cd {quoted_dir} && {py} -u -c "
         + shlex.quote(
             f"from faster_whisper.utils import download_model; path = download_model({size!r}); print('MODEL_READY', path)"
         )
     )
+    log(f"预下载 Whisper {size}：主路 ModelScope，备选 hf-mirror（约 3GB，只需一次）…", "info")
+    try:
+        output = _run(client, ms_command, log, timeout=5400, get_pty=False)
+        if "MS_READY" in output:
+            log(f"Whisper {size} 已就绪（ModelScope）。", "ok")
+            return
+        log("ModelScope 没拿到，回退 hf-mirror…", "warn")
+    except Exception as exc:
+        log(f"ModelScope 下载失败，回退 hf-mirror：{str(exc)[-200:]}", "warn")
     last_err = ""
     for attempt in range(1, 4):
         try:
-            output = _run(client, command, log, timeout=1800, get_pty=False)
+            output = _run(client, hf_command, log, timeout=5400, get_pty=False)
             if "MODEL_READY" in output:
-                log(f"Whisper {size} 已就绪。", "ok")
+                log(f"Whisper {size} 已就绪（hf-mirror）。", "ok")
                 return
             last_err = output[-600:]
         except Exception as exc:
             last_err = str(exc)[-600:]
         if attempt < 3:
-            log(f"预下载第 {attempt} 次没通（国内到 HF 经常抽风），20 秒后重试…", "warn")
+            log(f"hf-mirror 第 {attempt} 次没通，20 秒后重试…", "warn")
             try:
                 _run(client, "sleep 20", log, timeout=30, get_pty=False)
             except Exception:
                 pass
-    raise RuntimeError("Whisper 模型没有下载成功（已重试 3 次）。远程输出：\n" + last_err)
+    raise RuntimeError("Whisper 模型没有下载成功（ModelScope+hf-mirror 都试过）。远程输出：\n" + last_err)
 
 
 def _worker_launch_command(python: str, remote_dir: str, token: str, model: str) -> str:

@@ -10,3 +10,5 @@ onnxruntime==1.20.1
 # 会报 process() takes no keyword arguments，连带 Whisper 下载/转写全挂。
 brotli>=1.1.0
 brotlicffi>=1.1.0.0
+# ModelScope 国内 CDN，下大模型比 hf-mirror 稳。预下载主路走它，hf-mirror 只当备选。
+modelscope>=1.18.0
