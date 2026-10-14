@@ -1181,10 +1181,23 @@ def _prefetch_whisper_model(client: Any, python: str, remote_dir: str, model: st
             f"from faster_whisper.utils import download_model; path = download_model({size!r}); print('MODEL_READY', path)"
         )
     )
-    output = _run(client, command, log, timeout=1800, get_pty=False)
-    if "MODEL_READY" not in output:
-        raise RuntimeError("Whisper 模型没有下载成功。远程输出：\n" + output[-600:])
-    log(f"Whisper {size} 已就绪。", "ok")
+    last_err = ""
+    for attempt in range(1, 4):
+        try:
+            output = _run(client, command, log, timeout=1800, get_pty=False)
+            if "MODEL_READY" in output:
+                log(f"Whisper {size} 已就绪。", "ok")
+                return
+            last_err = output[-600:]
+        except Exception as exc:
+            last_err = str(exc)[-600:]
+        if attempt < 3:
+            log(f"预下载第 {attempt} 次没通（国内到 HF 经常抽风），20 秒后重试…", "warn")
+            try:
+                _run(client, "sleep 20", log, timeout=30, get_pty=False)
+            except Exception:
+                pass
+    raise RuntimeError("Whisper 模型没有下载成功（已重试 3 次）。远程输出：\n" + last_err)
 
 
 def _worker_launch_command(python: str, remote_dir: str, token: str, model: str) -> str:
