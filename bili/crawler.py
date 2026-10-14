@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 
 from bili.client import BiliClient
+from bili.comment_media import download_comment_images
 from bili.corpus import Corpus
 from bili.export import (
     account_dir,
@@ -248,6 +249,7 @@ class JobConfig:
     mode: str = "archive"
     # Optional per-job comment controls (None → fall back to AppSettings).
     comment_max_pages: int | None = None
+    comment_min_likes: int | None = None
     include_sub_replies: bool | None = None
 
 
@@ -265,6 +267,32 @@ class Crawler:
         if self.should_cancel():
             self.cancelled = True
         return self.cancelled
+
+    def _comment_opts(self, config: JobConfig) -> tuple[int, bool, int, bool]:
+        """max_pages, include_sub, min_likes, save_comment_images."""
+        max_pages = (
+            int(config.comment_max_pages)
+            if config.comment_max_pages is not None
+            else int(self.settings.comment_max_pages)
+        )
+        include_sub = (
+            bool(config.include_sub_replies)
+            if config.include_sub_replies is not None
+            else bool(self.settings.include_sub_replies)
+        )
+        min_likes = (
+            int(config.comment_min_likes)
+            if config.comment_min_likes is not None
+            else int(getattr(self.settings, "comment_min_likes", 0) or 0)
+        )
+        save_images = bool(getattr(self.settings, "comment_images_enabled", False))
+        return max(0, max_pages), include_sub, max(0, min_likes), save_images
+
+    def _comment_signature(self, max_pages: int, include_sub: bool, min_likes: int, save_images: bool) -> str:
+        return (
+            f"v5:pages={max_pages}:sub={int(include_sub)}"
+            f":cimg={int(save_images)}:minlike={min_likes}"
+        )
 
     def _corpus_guard(self, label: str, action: Callable[[Corpus], Any]) -> None:
         """Dataset writes must never be able to break the archive pipeline."""
@@ -1161,17 +1189,8 @@ class Crawler:
         comment_count = 0
         if config.crawl_comments:
             comments_path = folder / "comments.jsonl"
-            max_pages = (
-                int(config.comment_max_pages)
-                if config.comment_max_pages is not None
-                else int(self.settings.comment_max_pages)
-            )
-            include_sub = (
-                bool(config.include_sub_replies)
-                if config.include_sub_replies is not None
-                else bool(self.settings.include_sub_replies)
-            )
-            signature = f"v2:pages={max_pages}:sub={int(include_sub)}"
+            max_pages, include_sub, min_likes, save_cimg = self._comment_opts(config)
+            signature = self._comment_signature(max_pages, include_sub, min_likes, save_cimg)
             if config.resume and pipeline.completed("comments", signature, [comments_path]):
                 comment_count = _line_count(comments_path)
                 self.on_log("info", f"复用评论 {bvid} · {comment_count} 条")
@@ -1184,8 +1203,17 @@ class Crawler:
                         1,
                         max_pages=max_pages,
                         include_sub=include_sub,
+                        min_likes=min_likes,
                     ),
                 )
+                if save_cimg and comment_count:
+                    await download_comment_images(
+                        client,
+                        folder,
+                        comments_path,
+                        enabled=True,
+                        on_log=self.on_log,
+                    )
                 pipeline.mark("comments", signature, "done", count=comment_count)
 
         danmaku_count = 0
@@ -1666,24 +1694,15 @@ class Crawler:
         comment_count = 0
         if config.crawl_comments and dyn.get("comment_id"):
             path = folder / "comments.jsonl"
-            max_pages = (
-                int(config.comment_max_pages)
-                if config.comment_max_pages is not None
-                else int(self.settings.comment_max_pages)
-            )
-            include_sub = (
-                bool(config.include_sub_replies)
-                if config.include_sub_replies is not None
-                else bool(self.settings.include_sub_replies)
-            )
-            signature = f"v2:pages={max_pages}:sub={int(include_sub)}"
+            max_pages, include_sub, min_likes, save_cimg = self._comment_opts(config)
+            signature = self._comment_signature(max_pages, include_sub, min_likes, save_cimg)
             oid = str(dyn.get("comment_id") or dyn.get("dyn_id") or "")
             ctype = int(dyn.get("comment_type") or 17)
             if ctype == 17 and oid.isdigit() and len(oid) < 15:
                 ctype = 12
             if ctype == 12:
                 # Older runs stored column comments under dynamic type 17 and marked them done.
-                signature = f"v3:type=12:pages={max_pages}:sub={int(include_sub)}"
+                signature = f"v5:type=12:pages={max_pages}:sub={int(include_sub)}:cimg={int(save_cimg)}:minlike={min_likes}"
             if config.resume and pipeline.completed("comments", signature, [path]):
                 comment_count = _line_count(path)
             else:
@@ -1695,8 +1714,17 @@ class Crawler:
                         ctype,
                         max_pages=max_pages,
                         include_sub=include_sub,
+                        min_likes=min_likes,
                     ),
                 )
+                if save_cimg and comment_count:
+                    await download_comment_images(
+                        client,
+                        folder,
+                        path,
+                        enabled=True,
+                        on_log=self.on_log,
+                    )
                 pipeline.mark("comments", signature, "done", count=comment_count)
         md_path = write_dynamic_markdown(folder, dyn, ocr_blocks, comment_count)
         row = {

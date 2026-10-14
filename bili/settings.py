@@ -13,12 +13,14 @@ DEFAULTS: dict[str, Any] = {
     "min_interval": 1.0,
     "max_interval": 2.1,
     "max_retries": 5,
-    "comment_max_pages": 0,
+    "comment_max_pages": 5,
+    "comment_min_likes": 5,
     "include_sub_replies": True,
     "danmaku_mode": "full",
     "media_mode": "link",
     "transcribe_mode": "official",
     "ocr_enabled": True,
+    "comment_images_enabled": False,
     "whisper_model": "small",
     "whisper_language": "auto",
     "whisper_device": "auto",
@@ -49,12 +51,14 @@ class AppSettings:
     min_interval: float = 1.0
     max_interval: float = 2.1
     max_retries: int = 5
-    comment_max_pages: int = 0
+    comment_max_pages: int = 5
+    comment_min_likes: int = 5
     include_sub_replies: bool = True
     danmaku_mode: str = "full"
     media_mode: str = "link"
     transcribe_mode: str = "official"
     ocr_enabled: bool = True
+    comment_images_enabled: bool = False
     whisper_model: str = "small"
     whisper_language: str = "auto"
     whisper_device: str = "auto"

@@ -30,6 +30,7 @@ TEXT_KEEP = {
     "ocr.json",
     "meta.json",
     "comments.jsonl",
+    "comment_images.json",
     "danmaku.jsonl",
     "cloud_job.json",
     "storage.json",
@@ -174,6 +175,9 @@ def _iter_bulky_files(folder: Path, *, images: bool = True, media: bool = True) 
         if media and (suffix in MEDIA_SUFFIXES or path.name.endswith(".tmp") or path.name.endswith(".part")):
             found.append(path)
         elif images and suffix in IMAGE_SUFFIXES:
+            # Keep user-uploaded comment attachments; reclaim only targets dynamic OCR images/.
+            if "comment_images" in path.parts:
+                continue
             found.append(path)
     return found
 

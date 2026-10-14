@@ -92,6 +92,42 @@ def graphic_jump_url(row: dict[str, Any] | None, dyn_id: str = "") -> str:
     return f"https://www.bilibili.com/read/cv{dyn_id}"
 
 
+def extract_comment_picture_urls(content: dict[str, Any] | None) -> list[str]:
+    """User-uploaded comment pictures only (not platform emote stickers)."""
+    if not isinstance(content, dict):
+        return []
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: Any) -> None:
+        url = abs_url(str(raw or "").strip())
+        if not url or url in seen:
+            return
+        seen.add(url)
+        urls.append(url)
+
+    pictures = content.get("pictures")
+    if isinstance(pictures, list):
+        for item in pictures:
+            if isinstance(item, str):
+                _add(item)
+            elif isinstance(item, dict):
+                for key in ("img_src", "src", "url", "image_url", "img"):
+                    if item.get(key):
+                        _add(item.get(key))
+                        break
+    # Rare alternate field used by some reply payloads.
+    picture = content.get("picture")
+    if isinstance(picture, dict):
+        for key in ("img_src", "src", "url"):
+            if picture.get(key):
+                _add(picture.get(key))
+                break
+    elif isinstance(picture, str):
+        _add(picture)
+    return urls
+
+
 def graphic_kind(row: dict[str, Any] | None, dyn_id: str = "", jump_url: str = "") -> str:
     """``column`` = 专栏 (cv); ``opus`` = 动态 / 图文 opus."""
     row = row or {}
@@ -459,10 +495,12 @@ class BiliClient:
         *,
         max_pages: int = 0,
         include_sub: bool = True,
+        min_likes: int = 0,
     ) -> AsyncIterator[dict[str, Any]]:
         offset = ""
         page = 0
         seen: set[str] = set()
+        min_likes = max(0, int(min_likes or 0))
         while True:
             page += 1
             if max_pages and page > max_pages:
@@ -497,7 +535,9 @@ class BiliClient:
             if not replies:
                 break
             for reply in replies:
-                async for row in self._walk_reply(oid, ctype, reply, include_sub, seen):
+                async for row in self._walk_reply(
+                    oid, ctype, reply, include_sub, seen, min_likes=min_likes
+                ):
                     yield row
             cursor = payload.get("cursor") or {}
             if cursor.get("is_end"):
@@ -515,18 +555,28 @@ class BiliClient:
         reply: dict[str, Any],
         include_sub: bool,
         seen: set[str],
+        *,
+        min_likes: int = 0,
     ) -> AsyncIterator[dict[str, Any]]:
         row = self._comment_row(reply, oid, ctype, parent="")
         rpid = row.get("rpid")
-        if rpid and rpid not in seen:
+        root_likes = int(row.get("like") or 0)
+        keep_root = root_likes >= min_likes
+        if rpid and rpid not in seen and keep_root:
             seen.add(rpid)
             yield row
+        # Low-like roots: skip expanding 楼中楼 (biggest comment crawl cost).
+        if not keep_root:
+            return
         children = reply.get("replies") or []
         for child in children:
             crow = self._comment_row(child, oid, ctype, parent=rpid or "", root=rpid or "")
             if crow.get("rpid") and crow["rpid"] not in seen:
-                seen.add(crow["rpid"])
-                yield crow
+                if int(crow.get("like") or 0) >= min_likes:
+                    seen.add(crow["rpid"])
+                    yield crow
+                else:
+                    seen.add(crow["rpid"])
         rcount = int(reply.get("rcount") or 0)
         if include_sub and rcount > len(children) and rpid:
             pn = 1
@@ -545,7 +595,8 @@ class BiliClient:
                     crow = self._comment_row(child, oid, ctype, parent=rpid, root=rpid)
                     if crow.get("rpid") and crow["rpid"] not in seen:
                         seen.add(crow["rpid"])
-                        yield crow
+                        if int(crow.get("like") or 0) >= min_likes:
+                            yield crow
                 page = pick(data, "data", "page") or {}
                 count = int(page.get("count") or 0)
                 if pn * 20 >= count:
@@ -566,6 +617,7 @@ class BiliClient:
         api_parent = str(reply.get("parent") or "")
         resolved_root = root or (api_root if api_root not in {"", "0"} else "")
         resolved_parent = api_parent if api_parent not in {"", "0"} else parent
+        pictures = extract_comment_picture_urls(content)
         return {
             "oid": str(oid),
             "type": ctype,
@@ -582,6 +634,9 @@ class BiliClient:
             "rcount": reply.get("rcount") or 0,
             "ctime": reply.get("ctime") or 0,
             "ip_location": reply.get("reply_control", {}).get("location") or "",
+            "pictures": pictures,
+            "picture_count": len(pictures),
+            "picture_files": [],
         }
 
     async def search_videos_page(

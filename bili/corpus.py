@@ -26,7 +26,7 @@ from bili.paths import CORPUS_DB_PATH, ensure_dirs
 from bili.research_sink import ResearchSink
 from bili.util import now_iso, ts_iso
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -204,6 +204,9 @@ CREATE TABLE IF NOT EXISTS comments (
   reply_count INTEGER,
   pub_ts INTEGER,
   pub_time_iso TEXT,
+  picture_count INTEGER DEFAULT 0,
+  picture_urls TEXT,
+  picture_files TEXT,
   -- Soft noise flags from tools/corpus_hygiene.py
   is_noise INTEGER DEFAULT 0,
   noise_reason TEXT,
@@ -825,6 +828,10 @@ class Corpus:
                 # parent of a reply is its root.
                 root = parent
             pub_ts = _as_int(raw.get("ctime"), 0) or 0
+            pictures = raw.get("pictures") if isinstance(raw.get("pictures"), list) else []
+            picture_files = raw.get("picture_files") if isinstance(raw.get("picture_files"), list) else []
+            picture_urls = [str(u) for u in pictures if u]
+            picture_file_paths = [str(u) for u in picture_files if u]
             payloads.append(
                 {
                     "rpid": rpid,
@@ -848,6 +855,9 @@ class Corpus:
                     "reply_count": _as_int(raw.get("rcount"), 0),
                     "pub_ts": pub_ts,
                     "pub_time_iso": ts_iso(pub_ts),
+                    "picture_count": _as_int(raw.get("picture_count"), len(picture_urls)) or len(picture_urls),
+                    "picture_urls": json.dumps(picture_urls, ensure_ascii=False) if picture_urls else "",
+                    "picture_files": json.dumps(picture_file_paths, ensure_ascii=False) if picture_file_paths else "",
                     "run_id": run_id,
                     "captured_at": stamp,
                 }

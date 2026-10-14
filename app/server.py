@@ -50,7 +50,7 @@ from bili.util import parse_uids
 prepare_process()
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-UI_BUILD = "20261006a"
+UI_BUILD = "20261012a"
 ensure_dirs()
 store = Store()
 corpus = Corpus()
@@ -124,7 +124,9 @@ class SettingsIn(BaseModel):
     max_interval: float | None = None
     max_retries: int | None = None
     comment_max_pages: int | None = None
+    comment_min_likes: int | None = None
     include_sub_replies: bool | None = None
+    comment_images_enabled: bool | None = None
     danmaku_mode: str | None = None
     media_mode: str | None = None
     transcribe_mode: str | None = None
@@ -247,6 +249,7 @@ async def put_settings(body: SettingsIn) -> dict[str, Any]:
         raise HTTPException(400, "请求间隔必须 ≥ 0.2 秒，且最大间隔不能小于最小间隔")
     current.max_retries = min(10, max(1, int(current.max_retries)))
     current.comment_max_pages = max(0, int(current.comment_max_pages))
+    current.comment_min_likes = max(0, int(getattr(current, "comment_min_likes", 0) or 0))
     current.ocr_min_confidence = min(0.95, max(0.1, float(current.ocr_min_confidence)))
     if current.whisper_device not in {"auto", "cpu", "cuda"}:
         raise HTTPException(400, "Whisper 设备无效")
@@ -677,7 +680,10 @@ class AcademicJobIn(BaseModel):
     min_engagement: float = 0.003
     category_allow: str = ""
     category_deny: str = "游戏,动画,番剧,国创,音乐,舞蹈,影视,娱乐,鬼畜,运动,汽车,时尚,美食"
-    tag_terms: str = "就业,学历,失业,薪资,找工作,文凭,体制内,内卷,大厂,职场"
+    tag_terms: str = (
+        "就业,失业,薪资,工资,找工作,体制内,内卷,大厂,职场,加班,打工人,"
+        "996,双休,裁员,劳动法,社畜,牛马,工厂,流水线"
+    )
     keyword: str = ""
     time_range: str = "1y"
     seeds_per_uid: int = 8
@@ -699,8 +705,8 @@ async def create_academic_job(body: AcademicJobIn) -> dict[str, Any]:
         raise HTTPException(400, "时间范围无效")
     if body.max_depth < 0 or body.max_depth > 4:
         raise HTTPException(400, "深度请放在 0–4")
-    if body.max_nodes < 1 or body.max_nodes > 500:
-        raise HTTPException(400, "节点上限请放在 1–500")
+    if body.max_nodes < 1 or body.max_nodes > 800:
+        raise HTTPException(400, "节点上限请放在 1–800")
     if body.media_mode not in {"none", "link", "audio", "video"}:
         raise HTTPException(400, "媒体策略无效")
     if body.transcribe_mode not in TRANSCRIBE_MODES:

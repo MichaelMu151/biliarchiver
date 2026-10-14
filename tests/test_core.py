@@ -567,6 +567,7 @@ class AcademicCorpusTests(unittest.TestCase):
             category_deny="",
             tag_terms="",
             keyword="乡村振兴",
+            require_labor_lexicon=False,
             time_range="1y",
         )
         now = int(time.time())
@@ -999,6 +1000,56 @@ class ResearchSinkTests(unittest.TestCase):
                     "captured_at": "2026-10-06T12:00:00+08:00",
                 }
             )
+
+
+class CommentPictureTests(unittest.TestCase):
+    def test_extract_comment_picture_urls(self) -> None:
+        from bili.client import extract_comment_picture_urls
+
+        urls = extract_comment_picture_urls(
+            {
+                "message": "见图",
+                "pictures": [
+                    {"img_src": "//i0.hdslb.com/bfs/a.jpg"},
+                    {"img_src": "https://i0.hdslb.com/bfs/a.jpg"},
+                    {"src": "https://i0.hdslb.com/bfs/b.png"},
+                ],
+                "emote": {"[笑哭]": {"url": "https://i0.hdslb.com/bfs/emote/x.png"}},
+            }
+        )
+        self.assertEqual(
+            urls,
+            [
+                "https://i0.hdslb.com/bfs/a.jpg",
+                "https://i0.hdslb.com/bfs/b.png",
+            ],
+        )
+
+    def test_comment_row_includes_pictures(self) -> None:
+        from bili.client import BiliClient
+
+        client = BiliClient.__new__(BiliClient)
+        row = BiliClient._comment_row(
+            client,
+            {
+                "rpid": 123,
+                "member": {"mid": 1, "uname": "u", "level_info": {"current_level": 2}, "sex": "保密"},
+                "content": {
+                    "message": "配图",
+                    "pictures": [{"img_src": "https://i0.hdslb.com/bfs/c.jpg"}],
+                },
+                "like": 3,
+                "rcount": 0,
+                "ctime": 1,
+                "reply_control": {},
+            },
+            oid="99",
+            ctype=1,
+            parent="",
+        )
+        self.assertEqual(row["picture_count"], 1)
+        self.assertEqual(row["pictures"], ["https://i0.hdslb.com/bfs/c.jpg"])
+        self.assertEqual(row["picture_files"], [])
 
 
 if __name__ == "__main__":

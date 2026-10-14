@@ -1230,14 +1230,28 @@ def _bootstrap_collect(
     model: str,
     emit: LogFn,
 ) -> int:
-    emit("正在安装 faster-whisper / OCR（第一次会几分钟）…", "info")
+    emit("正在检查远端依赖（命中则跳过 pip，几秒就过）…", "info")
     quoted_dir = shlex.quote(remote_dir)
-    _run(
-        client,
-        f"cd {quoted_dir} && {shlex.quote(python)} -m pip install -r requirements-ai.txt",
-        emit,
-        timeout=1800,
+    probe_imports = (
+        f"cd {quoted_dir} && {shlex.quote(python)} -c "
+        + shlex.quote(
+            "import importlib.util as u; "
+            "need=[m for m in ('faster_whisper','av','rapidocr_onnxruntime','onnxruntime') "
+            "if u.find_spec(m) is None]; "
+            "print('DEPS_OK' if not need else 'DEPS_MISSING:'+','.join(need))"
+        )
     )
+    probe = _run(client, probe_imports, emit, timeout=30, check=False, chatter=False, get_pty=False)
+    if "DEPS_OK" in probe:
+        emit("远端依赖已齐（faster-whisper/av/rapidocr/onnxruntime），跳过 pip install。", "ok")
+    else:
+        emit(f"远端缺依赖 {probe.strip()[-80:]}，正在安装 requirements-ai.txt（已 pin 版本，走缓存）…", "info")
+        _run(
+            client,
+            f"cd {quoted_dir} && {shlex.quote(python)} -m pip install --prefer-binary -r requirements-ai.txt",
+            emit,
+            timeout=1800,
+        )
     emit("正在检查 PyAV 是否兼容 faster-whisper…", "info")
     _ensure_pyav_for_whisper(client, python, remote_dir, emit)
     emit("正在安装 CUDA 12 运行库（ctranslate2 需要 libcublas.so.12；CUDA 13 镜像也适用）…", "info")

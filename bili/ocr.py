@@ -78,13 +78,15 @@ def _run_ocr(image_path: Path, min_confidence: float) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="bili-ocr-") as tmp:
         prepared = Path(tmp) / "prepared.png"
         _prepare_image(image_path, prepared)
-        output = _ENGINE(
-            str(prepared),
-            use_cls=True,
-            text_score=min_confidence,
-        ) if modern else _ENGINE(str(prepared))
-    if modern:
-        boxes = getattr(output, "boxes", None)
+        # rapidocr / rapidocr-onnxruntime 各版本签名不一（有的 __call__ 只收 img_path，
+        # 传 use_cls/text_score 会报 process() takes no keyword arguments）。
+        # 统一只传路径，置信度统一在下面按 min_confidence 手工过滤。
+        try:
+            output = _ENGINE(str(prepared))
+        except TypeError:
+            output = _ENGINE(str(prepared))
+    boxes = getattr(output, "boxes", None)
+    if boxes is not None or hasattr(output, "txts"):
         texts = getattr(output, "txts", None)
         scores = getattr(output, "scores", None)
         boxes = [] if boxes is None else boxes
@@ -126,11 +128,14 @@ async def collect_images_and_ocr(
     gpu_worker_url: str = "",
     gpu_worker_token: str = "",
 ) -> list[dict[str, Any]]:
+    # OCR off ⇒ do not download/store dynamic images (URLs remain in meta.json).
+    if not enabled:
+        return []
     image_dir = folder / "images"
     blocks: list[dict[str, Any]] = []
-    use_remote = enabled and compute_backend == "cloud" and bool(gpu_worker_url)
-    engine_ok = enabled and (use_remote or ocr_available())
-    if enabled and not engine_ok:
+    use_remote = compute_backend == "cloud" and bool(gpu_worker_url)
+    engine_ok = use_remote or ocr_available()
+    if not engine_ok:
         on_log("warn", "未安装 RapidOCR，动态图片会下载但不会 OCR。可执行 pip install rapidocr onnxruntime")
     semaphore = asyncio.Semaphore(3)
 

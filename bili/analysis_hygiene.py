@@ -139,6 +139,15 @@ def ensure_analysis_columns(conn: sqlite3.Connection) -> list[str]:
     if "noise_reason" not in comment_cols:
         conn.execute("ALTER TABLE comments ADD COLUMN noise_reason TEXT")
         applied.append("comments.noise_reason")
+    if "picture_count" not in comment_cols:
+        conn.execute("ALTER TABLE comments ADD COLUMN picture_count INTEGER DEFAULT 0")
+        applied.append("comments.picture_count")
+    if "picture_urls" not in comment_cols:
+        conn.execute("ALTER TABLE comments ADD COLUMN picture_urls TEXT")
+        applied.append("comments.picture_urls")
+    if "picture_files" not in comment_cols:
+        conn.execute("ALTER TABLE comments ADD COLUMN picture_files TEXT")
+        applied.append("comments.picture_files")
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_videos_analysis_exclude ON videos(analysis_exclude)"

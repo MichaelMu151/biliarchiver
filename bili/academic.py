@@ -10,6 +10,7 @@ from bili.client import RISK_CODES, BiliClient, BiliError
 from bili.corpus import Corpus, FrontierItem
 from bili.crawler import Crawler, JobConfig
 from bili.export import account_dir
+from bili.labor_lexicon import match_labor
 from bili.paths import LIBRARY_DIR
 from bili.settings import AppSettings
 from bili.store import Store
@@ -17,7 +18,11 @@ from bili.util import cutoff_ts, parse_bvids, parse_uids, pick
 
 BV_STRIP = re.compile(r"BV[0-9A-Za-z]{10}")
 DEFAULT_DENY = "游戏,动画,番剧,国创,音乐,舞蹈,影视,娱乐,鬼畜,运动,汽车,时尚,美食"
-DEFAULT_TAGS = "就业,学历,失业,薪资,找工作,文凭,体制内,内卷,大厂,职场"
+# Labor / workplace only — no 育儿/生育/婚姻. Gate also runs match_labor().
+DEFAULT_TAGS = (
+    "就业,失业,薪资,工资,找工作,体制内,内卷,大厂,职场,加班,打工人,"
+    "996,双休,裁员,劳动法,社畜,牛马,工厂,流水线"
+)
 CIRCUIT_LIMIT = 5
 
 
@@ -37,6 +42,7 @@ class AcademicConfig:
     category_deny: str = DEFAULT_DENY
     tag_terms: str = DEFAULT_TAGS
     keyword: str = ""
+    require_labor_lexicon: bool = True  # labor-only snowball; family/repro hard-excluded
     time_range: str = "1y"
     seeds_per_uid: int = 8
     crawl_comments: bool = True
@@ -128,10 +134,20 @@ def evaluate_gate(
             return False, "engagement", checks
 
     needles = split_terms(config.tag_terms)
+    haystack = " ".join(tag_list + [title, desc])
     if needles:
-        haystack = " ".join(tag_list + [title, desc]).lower()
-        if not any(term.lower() in haystack for term in needles):
+        low = haystack.lower()
+        if not any(term.lower() in low for term in needles):
             return False, "tags", checks
+
+    # Labor-only: workplace lexicon must hit; family/fertility/marriage hard-excluded.
+    if bool(getattr(config, "require_labor_lexicon", True)):
+        labor = match_labor(haystack)
+        checks["labor_tier"] = labor.tier
+        checks["labor_terms"] = list(labor.terms[:8])
+        if not labor.hit:
+            reason = "excluded_family" if labor.tier == "excluded_family" else "labor_lexicon"
+            return False, reason, checks
 
     needle = (config.keyword or "").strip()
     if needle and needle.lower() not in title.lower() and needle.lower() not in desc.lower():

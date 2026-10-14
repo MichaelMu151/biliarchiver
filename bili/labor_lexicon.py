@@ -118,6 +118,25 @@ PHRASE_PATTERNS: tuple[str, ...] = (
     r"还原.{0,12}打工人",
 )
 
+# Family / fertility / marriage — hard exclude for labor-only snowball & scout.
+# If any of these appear, the text is NOT treated as labor-relevant (even with
+# co-occurring workplace tokens like 打工人 on an 育儿补贴 video).
+FAMILY_EXCLUDE_TERMS: tuple[str, ...] = (
+    # marriage / dating
+    "结婚", "相亲", "彩礼", "婚姻", "离婚", "恋爱", "婚恋", "领证", "嫁妆",
+    "彩礼钱", "催婚", "女朋友", "男朋友", "对象", "剩女", "剩男", "适龄",
+    "相亲角", "丈母娘", "婆婆", "婆媳", "彩礼焦虑", "婚房", "闪婚", "再婚",
+    "未婚夫", "未婚妻", "新郎", "新娘", "婚礼", "订婚",
+    # fertility / parenting
+    "生育", "怀孕", "生娃", "生孩子", "三胎", "二胎", "一胎",
+    "育儿", "育儿补贴", "带娃", "养娃", "奶娃", "母婴", "托育", "催生",
+    "全职妈妈", "全职奶爸", "不婚", "不育", "丁克", "绝育", "传宗接代",
+    "断后", "后代", "最后一代", "软肋", "伪娘", "孕妇", "月子", "产假",
+    "哺乳", "幼儿园", "早教", "学区房",
+    # cross labor×repro slogans still count as family-topic for seed gating
+    "婚育", "生不起", "结不起", "养不起", "彩礼打工", "结婚打工", "结婚加班",
+)
+
 # Alone these are too noisy — only count when another labor signal co-occurs.
 WEAK_ALONE: frozenset[str] = frozenset({
     # generic / lifestyle
@@ -144,6 +163,13 @@ _FP_STRIP: tuple[tuple[str, str], ...] = (
     ("娇滴滴", ""),  # else "滴滴" matches
 )
 
+# Years like 2007 contain "007" as a substring — neutralize before term scan.
+_YEAR_RE = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
+_FAMILY_RE = re.compile(
+    "|".join(re.escape(t) for t in sorted(FAMILY_EXCLUDE_TERMS, key=len, reverse=True)),
+    re.I,
+)
+
 
 def _compile() -> tuple[re.Pattern[str], re.Pattern[str], list[re.Pattern[str]]]:
     strong = re.compile("|".join(re.escape(t) for t in STRONG_TERMS), re.I)
@@ -158,7 +184,7 @@ _STRONG_RE, _MODERATE_RE, _PHRASE_RES = _compile()
 @dataclass(frozen=True)
 class LaborMatch:
     hit: bool
-    tier: str  # strong | moderate | phrase | none
+    tier: str  # strong | moderate | phrase | excluded_family | none
     terms: tuple[str, ...]
 
 
@@ -166,7 +192,15 @@ def _normalize_for_terms(text: str) -> str:
     out = text or ""
     for src, dst in _FP_STRIP:
         out = out.replace(src, dst)
+    # Drop calendar years so "2007年" does not fire the "007" strong term.
+    out = _YEAR_RE.sub(" ", out)
     return out
+
+
+def _family_hits(text: str) -> list[str]:
+    if not text:
+        return []
+    return list(dict.fromkeys(_FAMILY_RE.findall(text)))[:12]
 
 
 def _find_terms(text: str, pool: tuple[str, ...]) -> list[str]:
@@ -187,6 +221,7 @@ def match_labor(text: str) -> LaborMatch:
     """Return whether text is labor-relevant and which terms fired.
 
     Rules (tight):
+    - Family / fertility / marriage terms → hard exclude (labor-only gate).
     - Phrase patterns → keep (high precision).
     - Any non-WEAK_ALONE term → keep (tier strong if from STRONG else moderate).
     - Only WEAK_ALONE terms → keep only if ≥2 distinct weak signals.
@@ -195,6 +230,10 @@ def match_labor(text: str) -> LaborMatch:
     raw = text or ""
     if not raw.strip():
         return LaborMatch(False, "none", ())
+
+    family = _family_hits(raw)
+    if family:
+        return LaborMatch(False, "excluded_family", tuple(family))
 
     phrase_hits: list[str] = []
     for pat in _PHRASE_RES:

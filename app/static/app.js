@@ -694,6 +694,8 @@ $("save-settings").addEventListener("click", async () => {
       max_interval: Number($("max-interval").value),
       max_retries: Number($("max-retries").value),
       comment_max_pages: Number($("comment-pages").value),
+      comment_min_likes: Number($("comment-min-likes")?.value || 0),
+      comment_images_enabled: Boolean($("comment-images-enabled")?.checked),
       whisper_model: $("whisper-model").value,
       whisper_language: $("whisper-language").value,
       whisper_device: $("whisper-device").value,
@@ -891,6 +893,8 @@ async function loadSettings() {
   $("max-interval").value = s.max_interval;
   $("max-retries").value = s.max_retries;
   $("comment-pages").value = s.comment_max_pages;
+  if ($("comment-min-likes")) $("comment-min-likes").value = s.comment_min_likes ?? 5;
+  if ($("comment-images-enabled")) $("comment-images-enabled").checked = Boolean(s.comment_images_enabled);
   $("whisper-model").value = s.whisper_model;
   $("whisper-language").value = s.whisper_language || "auto";
   $("whisper-device").value = s.whisper_device || "auto";

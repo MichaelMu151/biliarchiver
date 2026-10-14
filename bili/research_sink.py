@@ -111,6 +111,14 @@ class ResearchSink:
             )
             """
         )
+        comment_cols = {row[1] for row in conn.execute("PRAGMA table_info(comments)")}
+        if comment_cols:
+            if "picture_count" not in comment_cols:
+                conn.execute("ALTER TABLE comments ADD COLUMN picture_count INTEGER DEFAULT 0")
+            if "picture_urls" not in comment_cols:
+                conn.execute("ALTER TABLE comments ADD COLUMN picture_urls TEXT")
+            if "picture_files" not in comment_cols:
+                conn.execute("ALTER TABLE comments ADD COLUMN picture_files TEXT")
 
     def _ensure_batch(
         self,
@@ -302,7 +310,8 @@ class ResearchSink:
             "rpid", "target_kind", "target_id", "oid", "comment_type", "bvid", "aid",
             "root_rpid", "parent_rpid", "hierarchy_level", "user_mid", "user_name",
             "user_level", "user_sex", "ip_location", "content", "text_length",
-            "like_count", "reply_count", "pub_ts", "pub_time_iso", "captured_at",
+            "like_count", "reply_count", "pub_ts", "pub_time_iso",
+            "picture_count", "picture_urls", "picture_files", "captured_at",
         )
         rows = []
         for payload in payloads:
