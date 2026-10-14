@@ -223,8 +223,33 @@ def _get_whisper_model(model_size: str, device: str = "auto", compute_type: str 
     cache_key = f"{model_size}:{resolved_device}:{resolved_compute}"
     with _MODEL_LOCK:
         if _MODEL is None or _MODEL_KEY != cache_key:
+            # 本地快照优先（ModelScope 已下好就不再走网络，3GB 秒加载）。
+            model_id = model_size
+            if "/" not in model_size:
+                candidates = [
+                    f"/root/autodl-tmp/huggingface/modelscope/models/Systran--faster-whisper-{model_size}/snapshots/master",
+                    f"/root/autodl-tmp/huggingface/hub/models--Systran--faster-whisper-{model_size}/snapshots",
+                ]
+                for cand in candidates:
+                    try:
+                        import os as _os
+
+                        if _os.path.isdir(cand):
+                            if _os.path.isfile(_os.path.join(cand, "model.bin")):
+                                model_id = cand
+                                break
+                            # HF hub 布局：snapshots/<rev>/
+                            for rev in sorted(_os.listdir(cand)):
+                                full = _os.path.join(cand, rev)
+                                if _os.path.isfile(_os.path.join(full, "model.bin")):
+                                    model_id = full
+                                    break
+                            if model_id != model_size:
+                                break
+                    except OSError:
+                        continue
             try:
-                _MODEL = WhisperModel(model_size, device=resolved_device, compute_type=resolved_compute)
+                _MODEL = WhisperModel(model_id, device=resolved_device, compute_type=resolved_compute)
             except Exception as exc:
                 if _is_hub_error(exc):
                     raise RuntimeError(_hub_error_message(model_size, exc)) from exc
@@ -233,7 +258,7 @@ def _get_whisper_model(model_size: str, device: str = "auto", compute_type: str 
                 resolved_device, resolved_compute, note = "cpu", "int8", "GPU 加载失败，已回退 CPU"
                 cache_key = f"{model_size}:cpu:int8"
                 try:
-                    _MODEL = WhisperModel(model_size, device="cpu", compute_type="int8")
+                    _MODEL = WhisperModel(model_id, device="cpu", compute_type="int8")
                 except Exception as nested:
                     if _is_hub_error(nested):
                         raise RuntimeError(_hub_error_message(model_size, nested)) from nested
