@@ -861,7 +861,9 @@ def _upload(sftp: Any, remote_dir: str, log: LogFn, role: str = "collect") -> in
         skip = False
         try:
             remote_stat = sftp.stat(remote_path)
-            if remote_stat.st_size == path.stat().st_size:
+            # 大小相同还不够（1.3.5→1.4.4 同字节数会被误跳过）：本地更新就传。
+            if (remote_stat.st_size == path.stat().st_size
+                    and int(getattr(remote_stat, "st_mtime", 0) or 0) >= int(path.stat().st_mtime)):
                 skip = True
         except OSError:
             skip = False
