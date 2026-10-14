@@ -5,7 +5,8 @@ faster-whisper==1.2.1
 av>=12.0.0,<19
 rapidocr-onnxruntime==1.4.4
 onnxruntime==1.20.1
-# huggingface_hub 2.x 的 httpx 解码器要调 zstd decompress(output_buffer_limit=…)，
-# zstandard<0.23 没有这个 kwarg，会报 process() takes no keyword arguments，
-# 连带 Whisper 模型下载/转写全挂。必须 >=0.23。
-zstandard>=0.23.0
+# huggingface_hub 2.x 自带的 httpx2 用 brotli 解 response，
+# brotli<1.1 的 Decompressor.process 不收 output_buffer_limit，
+# 会报 process() takes no keyword arguments，连带 Whisper 下载/转写全挂。
+brotli>=1.1.0
+brotlicffi>=1.1.0.0

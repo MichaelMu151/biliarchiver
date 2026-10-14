@@ -1273,7 +1273,7 @@ def _bootstrap_collect(
         f"cd {quoted_dir} && {shlex.quote(python)} -c "
         + shlex.quote(
             "import importlib.util as u; "
-            "need=[m for m in ('faster_whisper','av','rapidocr_onnxruntime','onnxruntime','zstandard') "
+            "need=[m for m in ('faster_whisper','av','rapidocr_onnxruntime','onnxruntime','brotli') "
             "if u.find_spec(m) is None]; "
             "print('DEPS_OK' if not need else 'DEPS_MISSING:'+','.join(need))"
         )
