@@ -21,6 +21,24 @@ def prepare_process() -> None:
     register_cuda_dlls()
 
 
+def _torch_lib_dirs() -> list[Path]:
+    """torch wheels bundle libcublas.so.12 / cuDNN. If present, ctranslate2 can reuse
+    them instead of us pip-installing the 300-500MB CUDA 12 runtime."""
+    dirs: list[Path] = []
+    try:
+        import importlib.util as _u
+
+        spec = _u.find_spec("torch")
+        if spec and spec.submodule_search_locations:
+            for loc in spec.submodule_search_locations:
+                lib = Path(loc) / "lib"
+                if lib.is_dir():
+                    dirs.append(lib)
+    except Exception:
+        pass
+    return dirs
+
+
 def _nvidia_package_roots() -> list[Path]:
     """``nvidia`` is often a namespace package: ``__file__`` is None, ``__path__`` is set."""
     roots: list[Path] = []
@@ -83,6 +101,7 @@ def cuda_library_dirs() -> list[str]:
         dirs.extend(nvidia_root.glob("*/bin"))
         dirs.extend(nvidia_root.glob("*/lib"))
         dirs.extend(nvidia_root.glob("*/lib64"))
+    dirs.extend(_torch_lib_dirs())
     ordered: list[str] = []
     seen: set[str] = set()
     for path in dirs:
