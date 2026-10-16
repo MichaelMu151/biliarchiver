@@ -195,7 +195,9 @@ async def run_list(bvids: list[str], *, apply: bool, force: bool, run_id: str) -
             summary[status] = summary.get(status, 0) + 1
             if status == "ok":
                 summary["rows"] += count
-            print(f"[{idx}/{len(bvids)}] {bvid} {status} · {count} 条")
+            print(f"[{idx}/{len(bvids)}] {bvid} {status} · {count} 条", flush=True)
+            # 弹幕接口同样走请求间隔：视频之间多睡 1.5s，避免触发 B 站风控。
+            await asyncio.sleep(1.5)
     finally:
         await client.close()
     return summary
